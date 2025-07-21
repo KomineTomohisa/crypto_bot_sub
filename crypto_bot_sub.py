@@ -2929,6 +2929,8 @@ class CryptoTradingBot:
             df_5min.loc[df_5min['ADX'] < 20, 'sell_signal'] = False
 
             df_5min.loc[df_5min['atr_score_short'] > 0.70, 'sell_signal'] = False
+            df_5min.loc[df_5min['adx_score_short'] < 0.1, 'sell_signal'] = False
+
 
         #5分足データのMAフィルターを適用（修正：各時点の1つ前のレコードのMA25を使用）
         if 'EMA_long' in df_5min.columns and len(df_5min) > 1:  # 少なくとも2レコード必要
