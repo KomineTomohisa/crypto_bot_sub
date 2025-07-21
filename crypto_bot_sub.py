@@ -2894,28 +2894,41 @@ class CryptoTradingBot:
         df_5min['buy_signal'] = df_5min['buy_score_scaled'] >= buy_signal_threshold
         df_5min['sell_signal'] = df_5min['sell_score_scaled'] >= sell_signal_threshold
 
-        df_5min.loc[df_5min['ADX'] < 20, 'buy_signal'] = False
-        df_5min.loc[df_5min['ADX'] < 20, 'sell_signal'] = False
+        if symbol == 'bcc_jpy':
+            df_5min.loc[df_5min['ADX'] < 20, 'buy_signal'] = False
+            df_5min.loc[df_5min['ADX'] < 20, 'sell_signal'] = False
 
-        # if symbol == 'bcc_jpy':
-        #     df_5min.loc[df_5min['adx_score_long'] < 0.15, 'buy_signal'] = False
-        #     df_5min.loc[df_5min['adx_score_short'] < 0.15, 'sell_signal'] = False
+            df_5min.loc[df_5min['macd_score_long'] == 0, 'buy_signal'] = False
+            df_5min.loc[df_5min['macd_score_short'] == 0, 'sell_signal'] = False
 
-        # # ada_jpy 特有の損失パターン除外フィルター
-        # if symbol == 'ada_jpy':
-        #     # トレンドが極めて弱い場面を除外
-        #     df_5min.loc[df_5min['adx_score_long'] < 0.15, 'buy_signal'] = False
+        if symbol == 'doge_jpy':
+            df_5min.loc[df_5min['ADX'] < 20, 'buy_signal'] = False
+            df_5min.loc[df_5min['ADX'] < 20, 'sell_signal'] = False
 
-        #     # 移動平均とほぼ乖離していない（方向性なし）
-        #     df_5min.loc[df_5min['ma_score_long'] < 0.1, 'buy_signal'] = False
+        if symbol == 'sol_jpy':
+            df_5min.loc[df_5min['ADX'] < 20, 'buy_signal'] = False
+            df_5min.loc[df_5min['ADX'] < 20, 'sell_signal'] = False
 
-            # # RSIが中立ゾーン（トレンド方向曖昧）
-            # df_5min.loc[(df_5min['RSI'] >= 45) & (df_5min['RSI'] <= 55), 'buy_signal'] = False
+        if symbol == 'ada_jpy':
+            df_5min.loc[df_5min['ADX'] < 20, 'buy_signal'] = False
+            df_5min.loc[df_5min['ADX'] < 20, 'sell_signal'] = False
 
-            # # CCIが±20以内（買い圧・売り圧が乏しい）
-            # df_5min.loc[(df_5min['CCI'] >= -20) & (df_5min['CCI'] <= 20), 'buy_signal'] = False
+            df_5min.loc[df_5min['atr_score_long'] > 0.65, 'buy_signal'] = False
+            df_5min.loc[df_5min['atr_score_short'] > 0.65, 'sell_signal'] = False
 
+        if symbol == 'ltc_jpy':
+            df_5min.loc[df_5min['ADX'] < 20, 'buy_signal'] = False
+            df_5min.loc[df_5min['ADX'] < 20, 'sell_signal'] = False
 
+        if symbol == 'eth_jpy':
+            df_5min.loc[df_5min['ADX'] < 20, 'buy_signal'] = False
+            df_5min.loc[df_5min['ADX'] < 20, 'sell_signal'] = False
+
+        if symbol == 'xrp_jpy':
+            df_5min.loc[df_5min['ADX'] < 20, 'buy_signal'] = False
+            df_5min.loc[df_5min['ADX'] < 20, 'sell_signal'] = False
+
+            df_5min.loc[df_5min['atr_score_short'] > 0.70, 'sell_signal'] = False
 
         #5分足データのMAフィルターを適用（修正：各時点の1つ前のレコードのMA25を使用）
         if 'EMA_long' in df_5min.columns and len(df_5min) > 1:  # 少なくとも2レコード必要
