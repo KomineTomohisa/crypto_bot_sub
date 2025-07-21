@@ -2304,6 +2304,38 @@ class CryptoTradingBot:
                 # ゼロ除算防止
                 safe_mid = df['BB_mid'].replace(0, 1e-10)
                 df['BB_width'] = (df['BB_upper'] - df['BB_lower']) / safe_mid
+
+            # MACD計算（改良版）
+            if 'close' in df.columns:
+                try:
+                    # MACD設定
+                    fast_period = 12
+                    slow_period = 26
+                    signal_period = 9
+                    
+                    # 短期EMAと長期EMAを計算
+                    ema_fast = df['close'].ewm(span=fast_period, adjust=False).mean()
+                    ema_slow = df['close'].ewm(span=slow_period, adjust=False).mean()
+                    
+                    # MACDライン（短期EMA - 長期EMA）
+                    df['MACD'] = ema_fast - ema_slow
+                    
+                    # シグナルライン（MACDの9期間EMA）
+                    df['MACD_signal'] = df['MACD'].ewm(span=signal_period, adjust=False).mean()
+                    
+                    # MACDヒストグラム（MACD - シグナル）
+                    df['MACD_histogram'] = df['MACD'] - df['MACD_signal']
+                    
+                    # NaN値の処理
+                    df['MACD'] = df['MACD'].fillna(0)
+                    df['MACD_signal'] = df['MACD_signal'].fillna(0)
+                    df['MACD_histogram'] = df['MACD_histogram'].fillna(0)
+                    
+                except Exception as e:
+                    self.logger.error(f"MACD計算エラー: {e}")
+                    df['MACD'] = 0
+                    df['MACD_signal'] = 0
+                    df['MACD_histogram'] = 0
             
             # NaN値の処理 (すべての計算が終わった後)
             for col in df.columns:
@@ -2338,6 +2370,7 @@ class CryptoTradingBot:
             self.logger.debug(f"特徴量計算結果: {debug_info}")
             
             return df
+
         except Exception as e:
             self.logger.error(f"特徴量計算エラー: {e}", exc_info=True)
             # エラー時のフォールバック処理（基本機能確保）
@@ -3333,8 +3366,6 @@ class CryptoTradingBot:
                                     'entry_time': entry_time,
                                     'entry_rsi': entry_rsi,
                                     'entry_cci': entry_cci,
-                                    'entry_atr': row.get('ATR', 0),
-                                    'entry_adx': row.get('ADX', 0),
                                     'buy_score': row.get('buy_score_scaled', 0),  # 修正: buy_score_scaled を使用
                                     'sell_score': row.get('sell_score_scaled', 0),  # 修正: sell_score_scaled を使用
                                     'entry_reason': entry_reason,
@@ -3365,6 +3396,10 @@ class CryptoTradingBot:
                                     'adx_score_short': row.get('adx_score_short', 0),
                                     'mfi_score_long': row.get('mfi_score_long', 0),
                                     'mfi_score_short': row.get('mfi_score_short', 0),
+                                    'atr_score_long': row.get('atr_score_long', 0),
+                                    'atr_score_short': row.get('atr_score_short', 0),
+                                    'macd_score_long': row.get('macd_score_long', 0),
+                                    'macd_score_short': row.get('macd_score_short', 0),
                                     'ema_deviation': row.get('ema_deviation', 0)
                                 }
                                 trade_logs.append(trade_data)
@@ -3424,8 +3459,6 @@ class CryptoTradingBot:
                                     'entry_time': entry_time,
                                     'entry_rsi': entry_rsi,
                                     'entry_cci': entry_cci,
-                                    'entry_atr': row.get('ATR', 0),
-                                    'entry_adx': row.get('ADX', 0),
                                     'buy_score': row.get('buy_score_scaled', 0),  # 修正: buy_score_scaled を使用
                                     'sell_score': row.get('sell_score_scaled', 0),  # 修正: sell_score_scaled を使用
                                     'entry_reason': entry_reason,
@@ -3456,6 +3489,10 @@ class CryptoTradingBot:
                                     'adx_score_short': row.get('adx_score_short', 0),
                                     'mfi_score_long': row.get('mfi_score_long', 0),
                                     'mfi_score_short': row.get('mfi_score_short', 0),
+                                    'atr_score_long': row.get('atr_score_long', 0), 
+                                    'atr_score_short': row.get('atr_score_short', 0), 
+                                    'macd_score_long': row.get('macd_score_long', 0),
+                                    'macd_score_short': row.get('macd_score_short', 0),
                                     'ema_deviation': row.get('ema_deviation', 0)  # EMA乖離を追加
                                 }
                                 trade_logs.append(trade_data)
@@ -3588,13 +3625,12 @@ class CryptoTradingBot:
         if 'symbol' not in df_trades.columns:
             raise ValueError("'symbol' 列が見つかりません。")
 
-        # カラムの順序を整理（残高情報を追加）
         desired_columns = [
-            'symbol', 'type', 'entry_price', 'entry_time', 'entry_rsi', 'entry_cci', 'entry_atr', 'entry_adx',
-            'ema_deviation',  # EMA乖離を追加
+            'symbol', 'type', 'entry_price', 'entry_time', 'entry_rsi', 'entry_cci', 
+            'ema_deviation',
             'exit_price', 'exit_time', 'size', 
             'profit', 'profit_pct', 'exit_reason', 'holding_hours', 
-            'buy_score', 'sell_score',  # スコア情報
+            'buy_score', 'sell_score',
             # 追加スコア情報
             'rsi_score_long', 'rsi_score_short',
             'cci_score_long', 'cci_score_short',
@@ -3602,7 +3638,9 @@ class CryptoTradingBot:
             'bb_score_long', 'bb_score_short',
             'ma_score_long', 'ma_score_short',
             'adx_score_long', 'adx_score_short',
-            'mfi_score_long', 'mfi_score_short'
+            'mfi_score_long', 'mfi_score_short',
+            'atr_score_long', 'atr_score_short',
+            'macd_score_long', 'macd_score_short'
         ]
         
         # 必要な列が存在しない場合は追加
@@ -5037,9 +5075,11 @@ class CryptoTradingBot:
                 'adx_score_short': signal_data.get('adx_score_short', 0),
                 'mfi_score_long': signal_data.get('mfi_score_long', 0),
                 'mfi_score_short': signal_data.get('mfi_score_short', 0),
-                'ema_deviation': ema_deviation,  # EMA乖離を保存
-                'atr': entry_atr,
-                'adx': entry_adx 
+                'atr_score_long': signal_data.get('atr_score_long', 0),
+                'atr_score_short': signal_data.get('atr_score_short', 0),
+                'macd_score_long': signal_data.get('macd_score_long', 0), 
+                'macd_score_short': signal_data.get('macd_score_short', 0),
+                'ema_deviation': ema_deviation
             }
             
             # 取引ログを記録する部分で、スコア情報を追加
@@ -5053,8 +5093,6 @@ class CryptoTradingBot:
                 'time': datetime.now(),
                 'rsi': entry_rsi,
                 'cci': entry_cci,
-                'atr': entry_atr,
-                'adx': entry_adx,
                 'ema_deviation': ema_deviation,
                 'reason': entry_reason,
                 'sentiment': entry_sentiment,
@@ -5073,7 +5111,11 @@ class CryptoTradingBot:
                 'adx_score_long': signal_data.get('adx_score_long', 0),
                 'adx_score_short': signal_data.get('adx_score_short', 0),
                 'mfi_score_long': signal_data.get('mfi_score_long', 0),
-                'mfi_score_short': signal_data.get('mfi_score_short', 0)
+                'mfi_score_short': signal_data.get('mfi_score_short', 0),
+                'atr_score_long': signal_data.get('atr_score_long', 0),
+                'atr_score_short': signal_data.get('atr_score_short', 0),
+                'macd_score_long': signal_data.get('macd_score_long', 0), 
+                'macd_score_short': signal_data.get('macd_score_short', 0) 
             }
             trade_logs.append(trade_log_entry)
             
@@ -5351,8 +5393,6 @@ class CryptoTradingBot:
                     'entry_price': entry_price,
                     'entry_time': entry_time,
                     'exit_price': current_price,
-                    'entry_atr': saved_scores.get('atr', 0),
-                    'entry_adx': saved_scores.get('adx', 0),
                     'exit_time': datetime.now(),
                     'size': entry_size,
                     'profit': profit,
@@ -5372,7 +5412,11 @@ class CryptoTradingBot:
                     'adx_score_long': saved_scores.get('adx_score_long', 0),
                     'adx_score_short': saved_scores.get('adx_score_short', 0),
                     'mfi_score_long': saved_scores.get('mfi_score_long', 0),
-                    'mfi_score_short': saved_scores.get('mfi_score_short', 0)
+                    'mfi_score_short': saved_scores.get('mfi_score_short', 0),
+                    'atr_score_long': saved_scores.get('atr_score_long', 0),
+                    'atr_score_short': saved_scores.get('atr_score_short', 0),
+                    'macd_score_long': saved_scores.get('macd_score_long', 0),
+                    'macd_score_short': saved_scores.get('macd_score_short', 0) 
                 }
                 trade_logs.append(trade_log_exit)
                 
