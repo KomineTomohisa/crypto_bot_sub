@@ -2552,31 +2552,31 @@ class CryptoTradingBot:
         Returns:
         pandas.DataFrame: シグナルを追加したデータフレーム
         """
-        # 通貨ペアごとの指標重み付け辞書 - ADXを追加
+
+        # 通貨ペアごとの指標重み付け辞書 - MACDを追加
         indicator_weights_long = {
-            'doge_jpy': {'bb': 0.05, 'cci': 0.25, 'rsi': 0.15, 'mfi': 0.05, 'adx': 0.45, 'volume': 0.00, 'ma': 0.05},
-            'sol_jpy':  {'bb': 0.05, 'cci': 0.25, 'rsi': 0.15, 'mfi': 0.05, 'adx': 0.45, 'volume': 0.00, 'ma': 0.05},
-            'xrp_jpy':  {'bb': 0.05, 'cci': 0.25, 'rsi': 0.15, 'mfi': 0.05, 'adx': 0.45, 'volume': 0.00, 'ma': 0.05},
+            'doge_jpy': {'bb': 0.05, 'cci': 0.25, 'rsi': 0.15, 'mfi': 0.05, 'adx': 0.45, 'volume': 0.00, 'ma': 0.05, 'atr': 0.0, 'macd': 0.0},
+            'sol_jpy':  {'bb': 0.05, 'cci': 0.25, 'rsi': 0.15, 'mfi': 0.05, 'adx': 0.45, 'volume': 0.00, 'ma': 0.05, 'atr': 0.0, 'macd': 0.0},
+            'xrp_jpy':  {'bb': 0.05, 'cci': 0.25, 'rsi': 0.15, 'mfi': 0.05, 'adx': 0.45, 'volume': 0.00, 'ma': 0.05, 'atr': 0.0, 'macd': 0.0},
 
-            'ltc_jpy':  {'bb': 0.05, 'cci': 0.25, 'rsi': 0.15, 'mfi': 0.05, 'adx': 0.40, 'volume': 0.00, 'ma': 0.10},
-            'ada_jpy':  {'bb': 0.05, 'cci': 0.25, 'rsi': 0.15, 'mfi': 0.05, 'adx': 0.40, 'volume': 0.00, 'ma': 0.10},
+            'ltc_jpy':  {'bb': 0.05, 'cci': 0.25, 'rsi': 0.15, 'mfi': 0.05, 'adx': 0.40, 'volume': 0.00, 'ma': 0.10, 'atr': 0.0, 'macd': 0.0},
+            'ada_jpy':  {'bb': 0.05, 'cci': 0.25, 'rsi': 0.15, 'mfi': 0.05, 'adx': 0.40, 'volume': 0.00, 'ma': 0.10, 'atr': 0.0, 'macd': 0.0},
 
-            'eth_jpy':  {'bb': 0.00, 'cci': 0.25, 'rsi': 0.15, 'mfi': 0.05, 'adx': 0.45, 'volume': 0.00, 'ma': 0.10},
-            'bcc_jpy':  {'bb': 0.00, 'cci': 0.25, 'rsi': 0.15, 'mfi': 0.05, 'adx': 0.45, 'volume': 0.00, 'ma': 0.10},
+            'eth_jpy':  {'bb': 0.00, 'cci': 0.25, 'rsi': 0.15, 'mfi': 0.05, 'adx': 0.45, 'volume': 0.00, 'ma': 0.10, 'atr': 0.0, 'macd': 0.0},
+            'bcc_jpy':  {'bb': 0.00, 'cci': 0.25, 'rsi': 0.15, 'mfi': 0.05, 'adx': 0.45, 'volume': 0.00, 'ma': 0.10, 'atr': 0.0, 'macd': 0.0},
         }
 
         indicator_weights_short = {
-            'doge_jpy': {'adx': 0.25, 'cci': 0.30, 'rsi': 0.15, 'bb': 0.20, 'mfi': 0.05, 'volume': 0.05, 'ma': 0.00},
-            'sol_jpy':  {'adx': 0.25, 'cci': 0.30, 'rsi': 0.15, 'bb': 0.20, 'mfi': 0.05, 'volume': 0.05, 'ma': 0.00},
-            'xrp_jpy':  {'adx': 0.25, 'cci': 0.30, 'rsi': 0.15, 'bb': 0.20, 'mfi': 0.05, 'volume': 0.05, 'ma': 0.00},
+            'doge_jpy': {'adx': 0.25, 'cci': 0.30, 'rsi': 0.15, 'bb': 0.20, 'mfi': 0.05, 'volume': 0.05, 'ma': 0.00, 'atr': 0.0, 'macd': 0.0},
+            'sol_jpy':  {'adx': 0.25, 'cci': 0.30, 'rsi': 0.15, 'bb': 0.20, 'mfi': 0.05, 'volume': 0.05, 'ma': 0.00, 'atr': 0.0, 'macd': 0.0},
+            'xrp_jpy':  {'adx': 0.25, 'cci': 0.30, 'rsi': 0.15, 'bb': 0.20, 'mfi': 0.05, 'volume': 0.05, 'ma': 0.00, 'atr': 0.0, 'macd': 0.0},
 
-            'ltc_jpy':  {'adx': 0.25, 'cci': 0.30, 'rsi': 0.15, 'bb': 0.20, 'mfi': 0.05, 'volume': 0.05, 'ma': 0.00},
-            'ada_jpy':  {'adx': 0.25, 'cci': 0.30, 'rsi': 0.15, 'bb': 0.20, 'mfi': 0.05, 'volume': 0.05, 'ma': 0.00},
+            'ltc_jpy':  {'adx': 0.25, 'cci': 0.30, 'rsi': 0.15, 'bb': 0.20, 'mfi': 0.05, 'volume': 0.05, 'ma': 0.00, 'atr': 0.0, 'macd': 0.0},
+            'ada_jpy':  {'adx': 0.25, 'cci': 0.30, 'rsi': 0.15, 'bb': 0.20, 'mfi': 0.05, 'volume': 0.05, 'ma': 0.00, 'atr': 0.0, 'macd': 0.0},
 
-            'eth_jpy':  {'adx': 0.25, 'cci': 0.30, 'rsi': 0.15, 'bb': 0.20, 'mfi': 0.05, 'volume': 0.05, 'ma': 0.00},
-            'bcc_jpy':  {'adx': 0.25, 'cci': 0.30, 'rsi': 0.15, 'bb': 0.20, 'mfi': 0.05, 'volume': 0.05, 'ma': 0.00},
+            'eth_jpy':  {'adx': 0.25, 'cci': 0.30, 'rsi': 0.15, 'bb': 0.20, 'mfi': 0.05, 'volume': 0.05, 'ma': 0.00, 'atr': 0.0, 'macd': 0.0},
+            'bcc_jpy':  {'adx': 0.25, 'cci': 0.30, 'rsi': 0.15, 'bb': 0.20, 'mfi': 0.05, 'volume': 0.05, 'ma': 0.00, 'atr': 0.0, 'macd': 0.0},
         }
-
         signal_thresholds = {
             'doge_jpy': {'buy': 0.51, 'sell': 0.51},
             'sol_jpy':  {'buy': 0.51, 'sell': 0.51},
@@ -2599,10 +2599,10 @@ class CryptoTradingBot:
             self.logger.warning(f"{symbol}の5分足データが空です")
             return pd.DataFrame({'buy_signal': [], 'sell_signal': []})
 
-        # 必要なカラムがあるか確認 - ADXと関連指標を追加
-        # 必要なカラムを確認する部分に'MFI'を追加
+        # 必要なカラムがあるか確認 - MACDを追加
         required_columns = ['close', 'RSI', 'EMA_short', 'EMA_long', 'MA25', 'volume', 'vol_avg', 'CCI', 'ATR', 
-                            'BB_upper', 'BB_lower', 'BB_mid', 'BB_width', 'ADX', 'plus_di14', 'minus_di14', 'MFI']
+                            'BB_upper', 'BB_lower', 'BB_mid', 'BB_width', 'ADX', 'plus_di14', 'minus_di14', 'MFI',
+                            'MACD', 'MACD_signal', 'MACD_histogram']
         missing_columns = [col for col in required_columns if col not in df_5min.columns]
 
         if missing_columns:
@@ -2633,6 +2633,8 @@ class CryptoTradingBot:
                     df_5min[col] = 25  # 中間値
                 elif col == 'MFI':
                     df_5min[col] = 50  # 中間値
+                elif col in ['MACD', 'MACD_signal', 'MACD_histogram']:
+                    df_5min[col] = 0  # デフォルト値
                 else:
                     df_5min[col] = 0
         
@@ -2755,6 +2757,12 @@ class CryptoTradingBot:
         # MFIスコア（過売り/過買いの判断に使用）
         mfi_score_long = calc_score(df_5min['MFI'], 0, 100, reverse=True)
         mfi_score_short = calc_score(df_5min['MFI'], 0, 100)
+
+        # ATRスコア（ボラティリティ指標として使用）
+        # ATRが高い = ボラティリティが高い = エントリーリスクが高い
+        # 一般的に、ATRが低い時の方がエントリーに適している
+        atr_score_long = calc_score(df_5min['ATR'], df_5min['ATR'].quantile(0.8), df_5min['ATR'].quantile(0.2), reverse=True)
+        atr_score_short = calc_score(df_5min['ATR'], df_5min['ATR'].quantile(0.8), df_5min['ATR'].quantile(0.2), reverse=True)
         
         # +DIと-DIの差から方向性の強さを判断
         # +DIが-DIよりも大きい場合、上昇トレンドの可能性が高い
@@ -2770,13 +2778,28 @@ class CryptoTradingBot:
         adx_score_long = adx_trend_strength * uptrend_strength
         adx_score_short = adx_trend_strength * downtrend_strength
 
-        # 重み付け辞書から現在の通貨ペアの重みを取得
+        # MACDスコア（トレンド転換と勢いを判断）
+        # MACDヒストグラムを主に使用（勢いの変化を捉える）
+        # ヒストグラムが正の値 = 上昇の勢い、負の値 = 下降の勢い
+        macd_score_long = calc_score(df_5min['MACD_histogram'], df_5min['MACD_histogram'].quantile(0.2), df_5min['MACD_histogram'].quantile(0.8))
+        macd_score_short = calc_score(df_5min['MACD_histogram'], df_5min['MACD_histogram'].quantile(0.8), df_5min['MACD_histogram'].quantile(0.2))
+
+        # MACDラインとシグナルラインのクロスオーバーも考慮
+        # MACD > シグナル = 買いシグナル、MACD < シグナル = 売りシグナル
+        macd_crossover = df_5min['MACD'] - df_5min['MACD_signal']
+        macd_crossover_score_long = calc_score(macd_crossover, macd_crossover.quantile(0.2), macd_crossover.quantile(0.8))
+        macd_crossover_score_short = calc_score(macd_crossover, macd_crossover.quantile(0.8), macd_crossover.quantile(0.2))
+
+        # ヒストグラムとクロスオーバーを組み合わせたMACDスコア
+        macd_score_long = (macd_score_long * 0.7 + macd_crossover_score_long * 0.3)
+        macd_score_short = (macd_score_short * 0.7 + macd_crossover_score_short * 0.3)
+
         # 該当通貨ペアのロング/ショートの重みを取得（デフォルトあり）
         weights_long = indicator_weights_long.get(symbol, {
-            'rsi': 0.15, 'cci': 0.15, 'volume': 0.15, 'bb': 0.15, 'ma': 0.15, 'adx': 0.15, 'mfi': 0.10
+            'rsi': 0.15, 'cci': 0.15, 'volume': 0.15, 'bb': 0.15, 'ma': 0.15, 'adx': 0.15, 'mfi': 0.10, 'atr': 0.0, 'macd': 0.0
         })
         weights_short = indicator_weights_short.get(symbol, {
-            'rsi': 0.15, 'cci': 0.15, 'volume': 0.15, 'bb': 0.15, 'ma': 0.15, 'adx': 0.15, 'mfi': 0.10
+            'rsi': 0.15, 'cci': 0.15, 'volume': 0.15, 'bb': 0.15, 'ma': 0.15, 'adx': 0.15, 'mfi': 0.10, 'atr': 0.0, 'macd': 0.0
         })
         
         # 各スコアをdf_5minに追加
@@ -2793,10 +2816,14 @@ class CryptoTradingBot:
         df_5min['adx_score_short'] = adx_score_short
         df_5min['mfi_score_long'] = mfi_score_long
         df_5min['mfi_score_short'] = mfi_score_short
+        df_5min['atr_score_long'] = atr_score_long
+        df_5min['atr_score_short'] = atr_score_short
+        df_5min['macd_score_long'] = macd_score_long
+        df_5min['macd_score_short'] = macd_score_short
 
         #volume_score = calculate_volume_score(df_5min)
 
-        # 重み付き買いシグナルスコアにMFIを追加
+        # 重み付き買いシグナルスコアにMACDを追加
         df_5min['buy_score'] = (
             rsi_score_long * weights_long['rsi'] +
             cci_score_long * weights_long['cci'] +
@@ -2804,7 +2831,9 @@ class CryptoTradingBot:
             bb_score_long * weights_long['bb'] +
             ma_score_long * weights_long['ma'] +
             adx_score_long * weights_long['adx'] +
-            mfi_score_long * weights_long['mfi']
+            mfi_score_long * weights_long['mfi'] +
+            atr_score_long * weights_long['atr'] +
+            macd_score_long * weights_long['macd']  # 追加
         )
 
         # ショートスコア（売り）
@@ -2815,7 +2844,9 @@ class CryptoTradingBot:
             bb_score_short * weights_short['bb'] +
             ma_score_short * weights_short['ma'] +
             adx_score_short * weights_short['adx'] +
-            mfi_score_short * weights_short['mfi']
+            mfi_score_short * weights_short['mfi'] +
+            atr_score_short * weights_short['atr'] +
+            macd_score_short * weights_short['macd']  # 追加
         )
 
         df_5min['buy_score_scaled'] = rolling_minmax_scaler(df_5min['buy_score'], window=50)
@@ -2829,12 +2860,13 @@ class CryptoTradingBot:
         # 閾値判定（既存のコードを置き換え）
         df_5min['buy_signal'] = df_5min['buy_score_scaled'] >= buy_signal_threshold
         df_5min['sell_signal'] = df_5min['sell_score_scaled'] >= sell_signal_threshold
-        
+
         if symbol == 'bcc_jpy':
             df_5min.loc[df_5min['ADX'] < 20, 'buy_signal'] = False
             df_5min.loc[df_5min['ADX'] < 20, 'sell_signal'] = False
 
-            df_5min.loc[df_5min['adx_score_long'] < 0.15, 'buy_signal'] = False
+            df_5min.loc[df_5min['macd_score_long'] == 0, 'buy_signal'] = False
+            df_5min.loc[df_5min['macd_score_short'] == 0, 'sell_signal'] = False
 
         if symbol == 'doge_jpy':
             df_5min.loc[df_5min['ADX'] < 20, 'buy_signal'] = False
@@ -2848,6 +2880,9 @@ class CryptoTradingBot:
             df_5min.loc[df_5min['ADX'] < 20, 'buy_signal'] = False
             df_5min.loc[df_5min['ADX'] < 20, 'sell_signal'] = False
 
+            df_5min.loc[df_5min['atr_score_long'] > 0.65, 'buy_signal'] = False
+            df_5min.loc[df_5min['atr_score_short'] > 0.65, 'sell_signal'] = False
+
         if symbol == 'ltc_jpy':
             df_5min.loc[df_5min['ADX'] < 20, 'buy_signal'] = False
             df_5min.loc[df_5min['ADX'] < 20, 'sell_signal'] = False
@@ -2860,11 +2895,8 @@ class CryptoTradingBot:
             df_5min.loc[df_5min['ADX'] < 20, 'buy_signal'] = False
             df_5min.loc[df_5min['ADX'] < 20, 'sell_signal'] = False
 
-        
-
-        # df_5min.loc[df_5min['adx_score_long'] < 0.15, 'buy_signal'] = False
-        # df_5min.loc[df_5min['adx_score_short'] < 0.15, 'sell_signal'] = False
-
+            df_5min.loc[df_5min['atr_score_short'] > 0.70, 'sell_signal'] = False
+            df_5min.loc[df_5min['adx_score_short'] < 0.1, 'sell_signal'] = False
 
 
         #5分足データのMAフィルターを適用（修正：各時点の1つ前のレコードのMA25を使用）
