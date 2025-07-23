@@ -3330,7 +3330,6 @@ class CryptoTradingBot:
                                 # 取引結果の計算
                                 exit_price = exit_levels['take_profit_price'] if price >= exit_levels['take_profit_price'] else exit_levels['stop_loss_price']
                                 profit = (exit_price - entry_price) / entry_price * self.TRADE_SIZE
-                                profit *= 0.9976  # 手数料
                                 profit_pct = (exit_price - entry_price) / entry_price * 100
                                 
                                 # 修正5: エントリー時の金額と決済時の金額を明確に
@@ -3424,7 +3423,6 @@ class CryptoTradingBot:
                                 # 取引結果の計算（ショートの場合は反転）
                                 exit_price = exit_levels['take_profit_price'] if price <= exit_levels['take_profit_price'] else exit_levels['stop_loss_price']
                                 profit = (entry_price - exit_price) / entry_price * self.TRADE_SIZE
-                                profit *= 0.9976  # 手数料
                                 profit_pct = (entry_price - exit_price) / entry_price * 100
                                 
                                 # 修正5: エントリー時の金額を明確に
