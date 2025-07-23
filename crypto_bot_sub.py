@@ -3040,7 +3040,6 @@ class CryptoTradingBot:
             if 'sell_signal' in df_5min.columns and pd.isna(df_5min['sell_signal']).any():
                 df_5min['sell_signal'] = df_5min['sell_signal'].fillna(False)
 
-
             return df_5min
         
         except Exception as e:
@@ -3225,7 +3224,7 @@ class CryptoTradingBot:
                     
 
                     # 通貨ペアごとの利確・損切り設定
-                    profit_loss_settings = self._get_dynamic_profit_loss_settings(symbol)
+                    profit_loss_settings = self._get_dynamic_profit_loss_settings(symbol, df_5min)
                     long_profit_take = profit_loss_settings['long_profit_take']
                     long_stop_loss = profit_loss_settings['long_stop_loss']
                     short_profit_take = profit_loss_settings['short_profit_take']
@@ -3288,7 +3287,7 @@ class CryptoTradingBot:
                                     entry_reason = self._get_entry_reason(symbol, row, 'long')
 
                                     # エントリーログの出力
-                                    self.log_entry(symbol, 'long', entry_price, entry_time, entry_rsi, entry_cci, entry_reason, entry_sentiment)
+                                    self.log_entry(symbol, 'long', entry_price, entry_time, entry_rsi, entry_cci, row.get('ATR', 0), row.get('ADX', 0), entry_reason, entry_sentiment)
 
                                 # 売りシグナルが現在と前の足で両方Trueの場合のみエントリー
                                 elif row['sell_signal'] and previous_row['sell_signal']:
@@ -3319,15 +3318,18 @@ class CryptoTradingBot:
                                     entry_reason = self._get_entry_reason(symbol, row, 'short')
 
                                     # エントリーログの出力
-                                    self.log_entry(symbol, 'short', entry_price, entry_time, entry_rsi, entry_cci, entry_reason, entry_sentiment)
+                                    self.log_entry(symbol, 'short', entry_price, entry_time, entry_rsi, entry_cci, row.get('ATR', 0), row.get('ADX', 0), entry_reason, entry_sentiment)
 
                         # ポジションがある場合のイグジット判断
                         elif position == 'long':
-                            if price >= entry_price * long_profit_take or price <= entry_price * long_stop_loss:
+                            # 動的なエグジットレベルを計算
+                            exit_levels = self.calculate_dynamic_exit_levels(symbol, df_5min, 'long', entry_price)
+                            
+                            # 計算された価格を使用
+                            if price >= exit_levels['take_profit_price'] or price <= exit_levels['stop_loss_price']:
                                 # 取引結果の計算
-                                exit_price = entry_price * long_profit_take if price >= entry_price * long_profit_take else entry_price * long_stop_loss
+                                exit_price = exit_levels['take_profit_price'] if price >= exit_levels['take_profit_price'] else exit_levels['stop_loss_price']
                                 profit = (exit_price - entry_price) / entry_price * self.TRADE_SIZE
-                                profit *= 0.9976  # 手数料
                                 profit_pct = (exit_price - entry_price) / entry_price * 100
                                 
                                 # 修正5: エントリー時の金額と決済時の金額を明確に
@@ -3347,7 +3349,10 @@ class CryptoTradingBot:
                                     hours = 0  # タイムスタンプが不適切な場合
 
                                 # 決済理由の判定
-                                exit_reason = "利益確定" if price >= entry_price * long_profit_take else "損切り"
+                                if profit > 0:
+                                    exit_reason = "利益確定"
+                                else:
+                                    exit_reason = "損切り"
 
                                 # 詳細ログ出力
                                 self.log_exit(symbol, 'long', exit_price, entry_price, timestamp, profit, profit_pct, exit_reason, hours, entry_sentiment)
@@ -3410,11 +3415,14 @@ class CryptoTradingBot:
 
                         # ショートポジションのイグジット
                         elif position == 'short':
-                            if price <= entry_price * short_profit_take or price >= entry_price * short_stop_loss:
+                            # 動的なエグジットレベルを計算
+                            exit_levels = self.calculate_dynamic_exit_levels(symbol, df_5min, 'short', entry_price)
+                            
+                            # 計算された価格を使用
+                            if price <= exit_levels['take_profit_price'] or price >= exit_levels['stop_loss_price']:
                                 # 取引結果の計算（ショートの場合は反転）
-                                exit_price = entry_price * short_profit_take if price <= entry_price * short_profit_take else entry_price * short_stop_loss
+                                exit_price = exit_levels['take_profit_price'] if price <= exit_levels['take_profit_price'] else exit_levels['stop_loss_price']
                                 profit = (entry_price - exit_price) / entry_price * self.TRADE_SIZE
-                                profit *= 0.9976  # 手数料
                                 profit_pct = (entry_price - exit_price) / entry_price * 100
                                 
                                 # 修正5: エントリー時の金額を明確に
@@ -3433,7 +3441,10 @@ class CryptoTradingBot:
                                     hours = 0
 
                                 # 決済理由の判定
-                                exit_reason = "利益確定" if price <= entry_price * short_profit_take else "損切り"
+                                if profit > 0:
+                                    exit_reason = "利益確定"
+                                else:
+                                    exit_reason = "損切り"
 
                                 # 詳細ログ出力
                                 self.log_exit(symbol, 'short', exit_price, entry_price, timestamp, profit, profit_pct, exit_reason, hours, entry_sentiment)
@@ -3561,12 +3572,18 @@ class CryptoTradingBot:
 
         return results
 
-    def log_entry(self, symbol, position_type, entry_price, entry_time, entry_rsi, entry_cci, entry_reason, entry_sentiment):
+    def log_entry(self, symbol, position_type, entry_price, entry_time, entry_rsi, entry_cci, entry_atr, entry_adx, entry_reason, entry_sentiment):
         """エントリー情報のログ出力"""
+        # None値のチェックを追加
+        rsi_str = f"{entry_rsi:.1f}" if entry_rsi is not None else "N/A"
+        cci_str = f"{entry_cci:.1f}" if entry_cci is not None else "N/A"
+        atr_str = f"{entry_atr:.2f}" if entry_atr is not None else "N/A"
+        adx_str = f"{entry_adx:.1f}" if entry_adx is not None else "N/A"  # ADXを追加
+        
         self.logger.info(f"[エントリー] {symbol} {'ロング' if position_type == 'long' else 'ショート'} @ {entry_price:.2f}円 (時刻: {entry_time})")
-        self.logger.info(f"  → RSI: {entry_rsi:.1f}, CCI: {entry_cci:.1f}")
+        self.logger.info(f"  → RSI: {rsi_str}, CCI: {cci_str}, ATR: {atr_str}, ADX: {adx_str}")  # ADXを追加
         self.logger.info(f"  → 理由: {entry_reason}")
-        self.logger.info(f"  → センチメント: 強気 {entry_sentiment['bullish']:.1f}%, 弱気 {entry_sentiment['bearish']:.1f}%, ボラティリティ {entry_sentiment['volatility']:.1f}%")
+        self.logger.info(f"  → センチメント: 強気 {entry_sentiment.get('bullish', 0):.1f}%, 弱気 {entry_sentiment.get('bearish', 0):.1f}%, ボラティリティ {entry_sentiment.get('volatility', 0):.1f}%")
 
     def log_exit(self, symbol, position_type, exit_price, entry_price, exit_time, profit, profit_pct, exit_reason, hours, entry_sentiment):
         """イグジット情報のログ出力"""
@@ -4636,7 +4653,7 @@ class CryptoTradingBot:
                             
                             # ポジションがある場合のイグジット判断
                             elif position is not None:
-                                self._check_exit_conditions(symbol, stats, trade_logs)
+                                self._check_exit_conditions(symbol, stats, trade_logs, df_5min)
                             
                             # DataFrameの参照を削除（バックテストと同様）
                             if hasattr(self, 'df_5min'):
@@ -4939,6 +4956,8 @@ class CryptoTradingBot:
         # テクニカル指標値の取得
         entry_rsi = signal_data.get('RSI', None)
         entry_cci = signal_data.get('CCI', None)
+        entry_atr = signal_data.get('ATR', None)
+        entry_adx = signal_data.get('ADX', None)
 
         # スコア情報の取得（新規追加）
         buy_score = signal_data.get('buy_score', 0)
@@ -5012,13 +5031,15 @@ class CryptoTradingBot:
             entry_sentiment = self.sentiment.copy() if hasattr(self, 'sentiment') else {}
             
             # backtest関数と同様のログ出力
-            self.log_entry(symbol, position_type, current_price, datetime.now(), entry_rsi, entry_cci, entry_reason, entry_sentiment)
+            self.log_entry(symbol, position_type, current_price, datetime.now(), entry_rsi, entry_cci, entry_atr, entry_adx, entry_reason, entry_sentiment)
             
             # 通知送信（修正箇所）
             if self.notification_settings['send_on_entry']:
                 # RSI/CCIの値をフォーマット
                 rsi_str = f"{entry_rsi:.1f}" if entry_rsi is not None else "N/A"
                 cci_str = f"{entry_cci:.1f}" if entry_cci is not None else "N/A"
+                atr_str = f"{entry_atr:.2f}" if entry_atr is not None else "N/A"
+                adx_str = f"{entry_adx:.1f}" if entry_adx is not None else "N/A"
                 
                 notification_body = (
                     f"価格: {current_price:.2f}円\n"
@@ -5026,6 +5047,8 @@ class CryptoTradingBot:
                     f"金額: {final_order_amount:.0f}円\n"
                     f"RSI: {rsi_str}\n"
                     f"CCI: {cci_str}\n"
+                    f"ATR: {atr_str}\n"
+                    f"ADX: {adx_str}\n"  # この行を追加
                     f"理由: {entry_reason}"
                 )
                 
@@ -5102,7 +5125,7 @@ class CryptoTradingBot:
             self.logger.error(f" {symbol}の{position_type}エントリー注文が失敗しました: {error_message}")
 
 
-    def _check_exit_conditions(self, symbol, stats, trade_logs):
+    def _check_exit_conditions(self, symbol, stats, trade_logs, df_5min):
         """イグジット条件をチェックし、必要に応じて決済を実行する（backtest関数と整合性あり）
         
         Parameters:
@@ -5121,11 +5144,13 @@ class CryptoTradingBot:
         hours = holding_time.total_seconds() / 3600
         
         # 利確・損切りの設定を取得
-        settings = self._get_dynamic_profit_loss_settings(symbol)
+        settings = self._get_dynamic_profit_loss_settings(symbol, df_5min)
         
         # イグジット条件の計算
         exit_condition = False
         exit_reason = ""
+
+        exit_levels = self.calculate_dynamic_exit_levels(symbol, df_5min, position, entry_price)
 
         current_price = self.get_current_price(symbol)
         
@@ -5137,16 +5162,15 @@ class CryptoTradingBot:
             # イグジット条件（バックテストと同じ条件）
             if current_price >= entry_price * long_profit_take:
                 exit_condition = True
-                exit_reason = "利益確定"
+                # 修正: 実際の損益を計算してから理由を決定
+                profit_temp = (current_price - entry_price) * entry_size
+                exit_reason = "利益確定" if profit_temp > 0 else "損切り"
             elif current_price <= entry_price * long_stop_loss:
                 exit_condition = True
-                exit_reason = "損切り"
-            # 12時間経過条件の追加（新規）
-            # elif hours >= 12 and (profit_pct >= 0 or profit_pct >= -0.1):
-            #     self.logger.info(f"ポジションをイグジットします:")
-            #     exit_condition = True
-            #     exit_reason = f"12時間経過（損益: {profit_pct:.2f}%）"
-                
+                # 修正: 実際の損益を計算してから理由を決定
+                profit_temp = (current_price - entry_price) * entry_size
+                exit_reason = "損切り" if profit_temp <= 0 else "利益確定"
+                           
         else:  # 'short'
             # ショートポジションのイグジット判定
             short_profit_take = settings['short_profit_take']
@@ -5155,19 +5179,14 @@ class CryptoTradingBot:
             # イグジット条件（バックテストと同じ条件）
             if current_price <= entry_price * short_profit_take:
                 exit_condition = True
-                exit_reason = "利益確定"
+                # 修正: 実際の損益を計算してから理由を決定
+                profit_temp = (entry_price - current_price) * entry_size
+                exit_reason = "利益確定" if profit_temp > 0 else "損切り"
             elif current_price >= entry_price * short_stop_loss:
                 exit_condition = True
-                exit_reason = "損切り"
-            # 12時間経過条件の追加（新規）
-            # elif hours >= 12 and (profit_pct >= 0 or profit_pct >= -0.1):
-            #     self.logger.info(f"ポジションをイグジットします:")
-            #     exit_condition = True
-            #     exit_reason = f"12時間経過（損益: {profit_pct:.2f}%）"
-            #強制exit
-            # if symbol == 'doge_jpy':
-            #     exit_condition = True
-            #     exit_reason = "利益確定"
+                # 修正: 実際の損益を計算してから理由を決定
+                profit_temp = (entry_price - current_price) * entry_size
+                exit_reason = "損切り" if profit_temp <= 0 else "利益確定"
         
         # 長時間保有の処理（48時間以上で警告、72時間以上で強制決済）- これはlive固有の機能
         if hours >= 72:
@@ -5702,7 +5721,7 @@ class CryptoTradingBot:
         except Exception as e:
             self.logger.error(f"エラーログの保存中にエラーが発生: {str(e)}")
 
-    def _get_dynamic_profit_loss_settings(self, symbol, is_active_hours=False):
+    def _get_dynamic_profit_loss_settings(self, symbol, df_5min, is_active_hours=False):
         """通貨ペアとマーケット状況に応じた動的な利確・損切り設定を取得
         
         Parameters:
@@ -5715,46 +5734,46 @@ class CryptoTradingBot:
         # 通貨ペアごとの基本設定
         base_settings = {
             "ltc_jpy": {
-                "long_profit_take": 1.027,   # 2.5%の利益確定
-                "long_stop_loss": 0.977,     # 2.0%の損切り
-                "short_profit_take": 0.973,  # 2.5%の利益確定
-                "short_stop_loss": 1.023     # 2.0%の損切り
+                "long_profit_take": 1.022,   # 2.5%の利益確定
+                "long_stop_loss": 0.972,     # 2.0%の損切り
+                "short_profit_take": 0.978,  # 2.5%の利益確定
+                "short_stop_loss": 1.028     # 2.0%の損切り
             },
             "xrp_jpy": {    
-                "long_profit_take": 1.027,   # 2.5%の利益確定
-                "long_stop_loss": 0.977,     # 2.0%の損切り
-                "short_profit_take": 0.973,  # 2.5%の利益確定
-                "short_stop_loss": 1.023     # 2.0%の損切り
+                "long_profit_take": 1.022,   # 2.5%の利益確定
+                "long_stop_loss": 0.972,     # 2.0%の損切り
+                "short_profit_take": 0.978,  # 2.5%の利益確定
+                "short_stop_loss": 1.028     # 2.0%の損切り
             },
             "eth_jpy": {
-                "long_profit_take": 1.027,   # 2.5%の利益確定
-                "long_stop_loss": 0.975,     # 2.0%の損切り
-                "short_profit_take": 0.973,  # 2.5%の利益確定
-                "short_stop_loss": 1.025     # 2.0%の損切り
+                "long_profit_take": 1.022,   # 2.5%の利益確定
+                "long_stop_loss": 0.970,     # 2.0%の損切り
+                "short_profit_take": 0.978,  # 2.5%の利益確定
+                "short_stop_loss": 1.030     # 2.0%の損切り
             },
             "sol_jpy": {
-                "long_profit_take": 1.030,   # 3.0%の利益確定
-                "long_stop_loss": 0.975,     # 2.5%の損切り
-                "short_profit_take": 0.970,  # 3.0%の利益確定
-                "short_stop_loss": 1.025     # 2.5%の損切り
+                "long_profit_take": 1.025,   # 3.0%の利益確定
+                "long_stop_loss": 0.970,     # 2.5%の損切り
+                "short_profit_take": 0.975,  # 3.0%の利益確定
+                "short_stop_loss": 1.030     # 2.5%の損切り
             },
             "doge_jpy": {
-                "long_profit_take": 1.027,   # 2.5%の利益確定
-                "long_stop_loss": 0.975,     # 2.0%の損切り
-                "short_profit_take": 0.973,  # 2.5%の利益確定
-                "short_stop_loss": 1.025     # 2.0%の損切り
+                "long_profit_take": 1.022,   # 2.5%の利益確定
+                "long_stop_loss": 0.970,     # 2.0%の損切り
+                "short_profit_take": 0.978,  # 2.5%の利益確定
+                "short_stop_loss": 1.030     # 2.0%の損切り
             },
             "bcc_jpy": {  # 新規追加
-                "long_profit_take": 1.027,   # 2.5%の利益確定
-                "long_stop_loss": 0.977,     # 2.0%の損切り
-                "short_profit_take": 0.973,  # 2.5%の利益確定
-                "short_stop_loss": 1.023     # 2.0%の損切り
+                "long_profit_take": 1.022,   # 2.5%の利益確定
+                "long_stop_loss": 0.972,     # 2.0%の損切り
+                "short_profit_take": 0.978,  # 2.5%の利益確定
+                "short_stop_loss": 1.028     # 2.0%の損切り
             },
             "ada_jpy": {  # 新規追加
-                "long_profit_take": 1.027,   # 2.5%の利益確定
-                "long_stop_loss": 0.977,     # 2.0%の損切り
-                "short_profit_take": 0.973,  # 2.5%の利益確定
-                "short_stop_loss": 1.023     # 2.0%の損切り
+                "long_profit_take": 1.022,   # 2.5%の利益確定
+                "long_stop_loss": 0.972,     # 2.0%の損切り
+                "short_profit_take": 0.978,  # 2.5%の利益確定
+                "short_stop_loss": 1.028     # 2.0%の損切り
             }
         }
 
@@ -5769,30 +5788,136 @@ class CryptoTradingBot:
         # 通貨ペアの設定を取得
         settings = base_settings.get(symbol, default_settings).copy()
         
-        # 市場ボラティリティに基づく調整
-        # if hasattr(self, 'sentiment') and 'volatility' in self.sentiment:
-        #     volatility = self.sentiment['volatility']
-            
-        #     # 高ボラティリティ時は利確レベルを上げる（利益を大きく取る）
-        #     if volatility > 70:  # 非常に高いボラティリティ
-        #         settings['long_profit_take'] += 0.010  # +1.0%
-        #         #settings['short_profit_take'] -= 0.010  # +1.0%
-        #         self.logger.debug(f"高ボラティリティ({volatility:.1f}%)により利確レベルを上げました")
-        #     elif volatility > 60:  # 高いボラティリティ
-        #         settings['long_profit_take'] += 0.005  # +0.5%
-        #         #settings['short_profit_take'] -= 0.005  # +0.5%
-        #         self.logger.debug(f"やや高ボラティリティ({volatility:.1f}%)により利確レベルを調整しました")
-        
-        # 時間帯に基づく調整
-        if not is_active_hours:
-            # 非アクティブ時間帯ではよりタイトな利益確定と緩めの損切り
-            settings['long_profit_take'] -= 0.005  # -0.5%（早めに利益確定）
-            settings['long_stop_loss'] -= 0.005  # -0.5%（損切りを緩く）
-            settings['short_profit_take'] += 0.005  # -0.5%（早めに利益確定）
-            settings['short_stop_loss'] += 0.005  # -0.5%（損切りを緩く）
-            self.logger.debug(f"非アクティブ時間帯のため利確・損切り条件を調整しました")
-        
         return settings
+
+    def calculate_dynamic_exit_levels(self, symbol, df_5min, position_type, entry_price):
+        """
+        通貨ペア・ポジションタイプ別のATR & ADXに応じて、利確・損切レベルを調整
+        """
+        try:
+            # 最新ATRの取得
+            atr_series = df_5min['ATR'].dropna()
+            if atr_series.empty:
+                raise ValueError("ATRデータが存在しません。")
+            atr = atr_series.iloc[-2]
+
+            # 最新ADXの取得
+            adx_series = df_5min['ADX'].dropna()
+            adx = adx_series.iloc[-2] if not adx_series.empty else None
+
+            # ベースのTP/SL設定取得
+            base = self._get_dynamic_profit_loss_settings(symbol, df_5min)
+            if position_type == 'long':
+                tp_ratio = base['long_profit_take']
+                sl_ratio = base['long_stop_loss']
+            else:
+                tp_ratio = base['short_profit_take']
+                sl_ratio = base['short_stop_loss']
+
+            base_tp_pct = abs(tp_ratio - 1.0)
+            base_sl_pct = abs(sl_ratio - 1.0)
+
+            # 通貨ペア別ATR倍率設定
+            atr_thresholds = {
+                'ltc_jpy': {'low': 60, 'high': 75, 'low_mult': 0.90, 'high_mult_long': 1.10, 'high_mult_short': 1.10},
+                'ada_jpy': {'low': 0.50, 'high': 0.57, 'low_mult': 0.90, 'high_mult_long': 1.10, 'high_mult_short': 1.07},
+                'xrp_jpy': {'low': 1.5, 'high': 2.1, 'low_mult': 1.00, 'high_mult_long': 1.00, 'high_mult_short': 0.90},
+                'eth_jpy': {'low': 2000, 'high': 2500, 'low_mult': 0.95, 'high_mult_long': 1.00, 'high_mult_short': 1.10},
+                'sol_jpy': {'low': 100, 'high': 140, 'low_mult': 0.95, 'high_mult_long': 1.10, 'high_mult_short': 1.03},
+                'doge_jpy': {'low': 0.20, 'high': 0.24, 'low_mult': 0.95, 'high_mult_long': 0.95, 'high_mult_short': 1.00},
+                'bcc_jpy': {'low': 310, 'high': 350, 'low_mult': 0.90, 'high_mult_long': 1.15, 'high_mult_short': 1.10}
+            }
+            default_setting = {'low': 0.5, 'high': 2.0, 'low_mult': 0.9, 'high_mult_long': 1.1, 'high_mult_short': 1.1}
+            config = atr_thresholds.get(symbol, default_setting)
+
+            # adx_thresholds = {
+            #     'ltc_jpy':   {'low': 20, 'high': 28, 'low_mult': 0.85, 'high_mult': 1.20},
+            #     'ada_jpy':   {'low': 22, 'high': 48, 'low_mult': 0.85, 'high_mult': 1.15},
+            #     'xrp_jpy':   {'low': 20, 'high': 30, 'low_mult': 0.90, 'high_mult': 1.15},
+            #     'eth_jpy':   {'low': 22, 'high': 30, 'low_mult': 0.85, 'high_mult': 1.15},
+            #     'sol_jpy':   {'low': 17, 'high': 32, 'low_mult': 0.85, 'high_mult': 1.15},
+            #     'doge_jpy':  {'low': 20, 'high': 35, 'low_mult': 0.90, 'high_mult': 0.95},
+            #     'bcc_jpy':   {'low': 22, 'high': 32, 'low_mult': 0.90, 'high_mult': 1.10}
+            # }
+            adx_thresholds = {
+                'ltc_jpy':   {'low': 20, 'high': 50, 'low_mult': 0.85, 'high_mult': 1.15},
+                'ada_jpy':   {'low': 22, 'high': 48, 'low_mult': 0.85, 'high_mult': 1.15},
+                'xrp_jpy':   {'low': 20, 'high': 50, 'low_mult': 0.80, 'high_mult': 1.20},
+                'eth_jpy':   {'low': 20, 'high': 50, 'low_mult': 0.85, 'high_mult': 1.15},
+                'sol_jpy':   {'low': 20, 'high': 50, 'low_mult': 0.85, 'high_mult': 1.15},
+                'doge_jpy':  {'low': 20, 'high': 50, 'low_mult': 0.80, 'high_mult': 1.20},
+                'bcc_jpy':   {'low': 22, 'high': 32, 'low_mult': 0.85, 'high_mult': 1.15}
+            }
+            default_adx_setting = {'low': 20, 'high': 50, 'low_mult': 0.90, 'high_mult': 1.10}
+            adx_config = adx_thresholds.get(symbol, default_adx_setting)
+
+            # ATRベース調整
+            tp_pct = base_tp_pct
+            sl_pct = base_sl_pct
+            if atr < config['low']:
+                tp_pct *= config['low_mult']
+                sl_pct *= config['low_mult']
+            elif atr > config['high']:
+                if position_type == 'long':
+                    tp_pct *= config['high_mult_long']
+                    sl_pct *= config['high_mult_long']
+                else:
+                    tp_pct *= config['high_mult_short']
+                    sl_pct *= config['high_mult_short']
+
+            # ADXベース調整（弱→狭め、強→広げ）
+            if adx is not None:
+                if adx < adx_config['low']:
+                    tp_pct *= adx_config['low_mult']
+                    sl_pct *= adx_config['low_mult']
+                elif adx > adx_config['high']:
+                    tp_pct *= adx_config['high_mult']
+                    sl_pct *= adx_config['high_mult']
+
+            # エグジット価格計算
+            if position_type == 'long':
+                take_profit_price = entry_price * (1 + tp_pct)
+                stop_loss_price = entry_price * (1 - sl_pct)
+                take_profit_ratio = 1 + tp_pct
+                stop_loss_ratio = 1 - sl_pct
+            else:
+                take_profit_price = entry_price * (1 - tp_pct)
+                stop_loss_price = entry_price * (1 + sl_pct)
+                take_profit_ratio = 1 - tp_pct
+                stop_loss_ratio = 1 + sl_pct
+
+            risk_reward_ratio = tp_pct / sl_pct
+
+            return {
+                'take_profit_price': take_profit_price,
+                'stop_loss_price': stop_loss_price,
+                'take_profit_ratio': take_profit_ratio,
+                'stop_loss_ratio': stop_loss_ratio,
+                'atr_value': atr,
+                'risk_reward_ratio': risk_reward_ratio
+            }
+
+        except Exception as e:
+            self.logger.error(f"{symbol}のATR利確損切計算中にエラー: {str(e)}", exc_info=True)
+            default_settings = self._get_dynamic_profit_loss_settings(symbol, df_5min)
+            if position_type == 'long':
+                return {
+                    'take_profit_price': entry_price * default_settings['long_profit_take'],
+                    'stop_loss_price': entry_price * default_settings['long_stop_loss'],
+                    'take_profit_ratio': default_settings['long_profit_take'],
+                    'stop_loss_ratio': default_settings['long_stop_loss'],
+                    'atr_value': 0,
+                    'risk_reward_ratio': 2.0
+                }
+            else:
+                return {
+                    'take_profit_price': entry_price * default_settings['short_profit_take'],
+                    'stop_loss_price': entry_price * default_settings['short_stop_loss'],
+                    'take_profit_ratio': default_settings['short_profit_take'],
+                    'stop_loss_ratio': default_settings['short_stop_loss'],
+                    'atr_value': 0,
+                    'risk_reward_ratio': 2.0
+                }
 
 
 # メイン実行部分
