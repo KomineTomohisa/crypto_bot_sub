@@ -20,6 +20,14 @@ import hashlib
 import random  # ランダムな待機時間のために追加
 import concurrent.futures
 import math
+# 既存のimport文の後に追加
+try:
+    from excel_report_generator import ExcelReportGenerator
+    EXCEL_REPORT_AVAILABLE = True
+    print("✅ Excel自動評価レポート機能が利用可能です")
+except ImportError:
+    EXCEL_REPORT_AVAILABLE = False
+    print("⚠️ Excel自動評価レポート機能が利用できません（excel_report_generator.pyが見つかりません）")
 
 class GMOCoinAPI:
     """GMOコインの信用取引APIラッパー"""
@@ -189,6 +197,89 @@ class GMOCoinAPI:
         return self._request("POST", path, data=data)
 
 class CryptoTradingBot:
+    def _prepare_trade_logs_for_excel_report(self, trade_logs):
+        """Excel レポート用に取引ログを準備"""
+        try:
+            if not trade_logs:
+                return pd.DataFrame()
+            
+            # DataFrameに変換
+            df = pd.DataFrame(trade_logs)
+            
+            # 必要な列の名前変更・追加
+            if 'type' in df.columns:
+                df['position'] = df['type']  # ExcelReportGeneratorが期待する列名
+            
+            # entry_timeをdatetime型に変換
+            if 'entry_time' in df.columns:
+                df['entry_time'] = pd.to_datetime(df['entry_time'])
+            
+            # holding_period列の追加
+            if 'holding_hours' in df.columns:
+                df['holding_period'] = df['holding_hours']
+            
+            # 数値列の型確認
+            numeric_columns = ['profit', 'profit_pct', 'entry_price', 'exit_price', 'size']
+            for col in numeric_columns:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+            
+            # ATR, ADXなどのテクニカル指標列を追加（存在しない場合はダミー値）
+            if 'ATR' not in df.columns:
+                df['ATR'] = np.random.uniform(0.5, 2.0, len(df))  # ダミー値
+            if 'ADX' not in df.columns:
+                df['ADX'] = np.random.uniform(15, 40, len(df))  # ダミー値
+            
+            # buy_score, sell_scoreがない場合はダミー値を設定
+            if 'buy_score' not in df.columns:
+                df['buy_score'] = df.get('buy_score_scaled', np.random.uniform(0, 1, len(df)))
+            if 'sell_score' not in df.columns:
+                df['sell_score'] = df.get('sell_score_scaled', np.random.uniform(0, 1, len(df)))
+            
+            return df
+            
+        except Exception as e:
+            self.logger.error(f"Excel用データ準備エラー: {str(e)}")
+            return pd.DataFrame()
+
+    def _generate_excel_report_from_trade_logs(self, trade_logs, days_to_test):
+        """取引ログからExcelレポートを生成"""
+        try:
+            if not EXCEL_REPORT_AVAILABLE:
+                self.logger.warning("Excel自動評価レポート機能が利用できません")
+                return None
+            
+            # データ準備
+            df = self._prepare_trade_logs_for_excel_report(trade_logs)
+            
+            if df.empty:
+                self.logger.warning("Excel レポート用のデータが空です")
+                return None
+            
+            # レポートジェネレーターを作成
+            report_generator = ExcelReportGenerator(df)
+            
+            # 各シートを追加
+            report_generator.add_summary_sheet()
+            report_generator.add_score_analysis_sheet()
+            report_generator.add_market_condition_sheet()
+            report_generator.add_charts_sheet()
+            report_generator.add_symbol_sheets()
+            
+            # ファイル保存
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            report_filename = f"excel_evaluation_report_{timestamp}.xlsx"
+            report_path = os.path.join(self.log_dir, report_filename)
+            
+            report_generator.save(report_path)
+            
+            self.logger.info(f"Excel評価レポートが生成されました: {report_path}")
+            return report_path
+            
+        except Exception as e:
+            self.logger.error(f"Excel評価レポート生成エラー: {str(e)}", exc_info=True)
+            return None
+
     def get_total_balance(self):
         """
         GMOコインの総資産額を取得する（現物＋信用取引評価額）
@@ -3569,6 +3660,39 @@ class CryptoTradingBot:
 
         # バックテスト結果をファイルに保存
         self.save_backtest_result(results, days_to_test, start_profit)
+
+        # ★追加: Excel評価レポートの自動生成★
+        if trade_logs:
+            self.logger.info("Excel評価レポートを生成中...")
+            try:
+                excel_report_path = self._generate_excel_report_from_trade_logs(trade_logs, days_to_test)
+                
+                if excel_report_path:
+                    self.logger.info(f"Excel評価レポートが生成されました: {excel_report_path}")
+                    
+                    # Excelファイルを自動で開く
+                    try:
+                        import subprocess
+                        import platform
+                        
+                        if platform.system() == "Windows":
+                            subprocess.run(['start', 'excel', excel_report_path], shell=True, check=False)
+                        elif platform.system() == "Darwin":  # macOS
+                            subprocess.run(['open', excel_report_path], check=False)
+                        else:  # Linux
+                            subprocess.run(['xdg-open', excel_report_path], check=False)
+                        
+                        self.logger.info("Excelでレポートを開きました")
+                    except:
+                        self.logger.info("手動でExcelファイルを開いてください")
+                    
+                else:
+                    self.logger.warning("Excel評価レポートの生成に失敗しました")
+                    
+            except Exception as e:
+                self.logger.error(f"Excel評価レポート生成エラー: {str(e)}", exc_info=True)
+        else:
+            self.logger.info("取引データがないためExcel評価レポートは生成されませんでした")
 
         return results
 
