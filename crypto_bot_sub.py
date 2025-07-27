@@ -2212,7 +2212,7 @@ class CryptoTradingBot:
                     # DIの差の絶対値
                     df['di_diff'] = abs(df['plus_di14'] - df['minus_di14'])
                     df['di_sum'] = df['plus_di14'] + df['minus_di14']
-                    
+
                     # DXの計算
                     df['dx'] = 100 * (df['di_diff'] / df['di_sum'].replace(0, 1e-10))
                     
@@ -3934,6 +3934,25 @@ class CryptoTradingBot:
         except Exception as e:
             self.logger.error(f"総合タイムライングラフ作成エラー: {e}", exc_info=True)
 
+    def save_backtest_result(self, results, days_to_test, start_profit):
+        """バックテスト結果をJSONファイルに保存"""
+        backtest_profit = self.total_profit - start_profit
+        backtest_result_file = os.path.join(self.log_dir, f'backtest_result_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json')
+        try:
+            with open(backtest_result_file, 'w') as f:
+                json.dump({
+                    'start_date': (datetime.now() - timedelta(days=days_to_test)).strftime("%Y-%m-%d"),
+                    'end_date': datetime.now().strftime("%Y-%m-%d"),
+                    'days_tested': days_to_test,
+                    'total_profit': backtest_profit,
+                    'results': {k: {kk: float(vv) if isinstance(vv, (int, float)) else vv 
+                                for kk, vv in v.items()} 
+                            for k, v in results.items()}
+                }, f, indent=4)
+            self.logger.info(f"バックテスト結果を保存しました: {backtest_result_file}")
+        except Exception as e:
+            self.logger.error(f"バックテスト結果保存エラー: {e}")
+
     def run_live(self):
         """
         リアルタイムトレーディングモード（backtest関数との整合性が取れた本番環境最適化版）
@@ -5250,9 +5269,10 @@ class CryptoTradingBot:
                 raise ValueError("ATRデータが存在しません。")
             atr = atr_series.iloc[-2]
 
-            # 最新ADXの取得
-            adx_series = df_5min['ADX'].dropna()
-            adx = adx_series.iloc[-2] if not adx_series.empty else None
+            # 最新ADX, DI+, DI-
+            adx = df_5min['ADX'].dropna().iloc[-2] if 'ADX' in df_5min.columns and not df_5min['ADX'].dropna().empty else None
+            plus_di = df_5min['DI+'].dropna().iloc[-2] if 'DI+' in df_5min.columns else None
+            minus_di = df_5min['DI-'].dropna().iloc[-2] if 'DI-' in df_5min.columns else None
 
             # ベースのTP/SL設定取得
             base = self._get_dynamic_profit_loss_settings(symbol, df_5min)
@@ -5267,7 +5287,7 @@ class CryptoTradingBot:
             base_sl_pct = abs(sl_ratio - 1.0)
 
             # 通貨ペア別ATR倍率設定
-            atr_thresholds = {
+            atr_config = {
                 'ltc_jpy': {'low': 60, 'high': 75, 'low_mult': 0.90, 'high_mult_long': 1.10, 'high_mult_short': 1.10},
                 'ada_jpy': {'low': 0.50, 'high': 0.57, 'low_mult': 0.90, 'high_mult_long': 1.10, 'high_mult_short': 1.07},
                 'xrp_jpy': {'low': 1.5, 'high': 2.1, 'low_mult': 1.00, 'high_mult_long': 1.00, 'high_mult_short': 0.90},
@@ -5288,7 +5308,7 @@ class CryptoTradingBot:
             #     'doge_jpy':  {'low': 20, 'high': 35, 'low_mult': 0.90, 'high_mult': 0.95},
             #     'bcc_jpy':   {'low': 22, 'high': 32, 'low_mult': 0.90, 'high_mult': 1.10}
             # }
-            adx_thresholds = {
+            adx_config = {
                 'ltc_jpy':   {'low': 20, 'high': 50, 'low_mult': 0.85, 'high_mult': 1.15},
                 'ada_jpy':   {'low': 22, 'high': 48, 'low_mult': 0.85, 'high_mult': 1.15},
                 'xrp_jpy':   {'low': 20, 'high': 50, 'low_mult': 0.80, 'high_mult': 1.20},
@@ -5323,6 +5343,15 @@ class CryptoTradingBot:
                     tp_pct *= adx_config['high_mult']
                     sl_pct *= adx_config['high_mult']
 
+            # トレンド方向と一致しているかを+DI / -DIで判定
+            if plus_di is not None and minus_di is not None:
+                if position_type == 'long' and plus_di < minus_di:
+                    tp_pct *= 0.90  # トレンド逆行時は利確を保守的に
+                    sl_pct *= 0.95
+                elif position_type == 'short' and minus_di < plus_di:
+                    tp_pct *= 0.90
+                    sl_pct *= 0.95
+
             # エグジット価格計算
             if position_type == 'long':
                 take_profit_price = entry_price * (1 + tp_pct)
@@ -5335,7 +5364,7 @@ class CryptoTradingBot:
                 take_profit_ratio = 1 - tp_pct
                 stop_loss_ratio = 1 + sl_pct
 
-            risk_reward_ratio = tp_pct / sl_pct
+            risk_reward_ratio = tp_pct / sl_pct if sl_pct != 0 else float('inf')
 
             return {
                 'take_profit_price': take_profit_price,
