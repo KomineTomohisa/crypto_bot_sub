@@ -1316,21 +1316,6 @@ class CryptoTradingBot:
         except Exception as e:
             self.logger.error(f"ポジション決済エラー: {str(e)}", exc_info=True)
             return {'success': False, 'error': str(e)}
-        
-    def reset_positions(self):
-        """すべてのポジション情報をリセットする（緊急時用）"""
-        self.logger.warning("すべてのポジション情報をリセットします")
-        
-        # すべてのポジションをクリア
-        for symbol in self.symbols:
-            self.positions[symbol] = None
-            self.entry_prices[symbol] = 0
-            self.entry_times[symbol] = None
-            self.entry_sizes[symbol] = 0
-        
-        # 保存
-        self.save_positions()
-        self.logger.info("ポジション情報のリセットが完了しました")
 
     def adjust_order_size(self, symbol, base_size):
         """取引所の最小注文量を考慮して注文サイズを調整する
@@ -1831,15 +1816,6 @@ class CryptoTradingBot:
         # 全ての試行が失敗
         self.logger.error(f"すべての試行が失敗しました: {symbol} {order_type} {size}")
         return {'success': False, 'error': "最大試行回数を超えました", 'executed_size': 0}
-
-    def clear_cache(self):
-        """キャッシュデータを全てクリアする"""
-        self.logger.info("キャッシュデータをクリアします...")
-        if os.path.exists(self.cache_dir):
-            for file in os.listdir(self.cache_dir):
-                if file.endswith('.json'):
-                    os.remove(os.path.join(self.cache_dir, file))
-        self.logger.info("キャッシュデータのクリアが完了しました")
 
     def find_valid_date(self, symbol, timeframe, max_days_back=5):
         """有効なデータが存在する日付を検索し、複数日のデータを組み合わせて必要なデータポイント数を確保する
@@ -2484,71 +2460,6 @@ class CryptoTradingBot:
                 
                 self.logger.warning("エラー発生のためフォールバック指標を使用します")
             return df
-            
-    def debug_technical_indicators(self, symbol):
-        """特定の通貨ペアのテクニカル指標値をデバッグ表示"""
-        self.logger.info(f"{symbol}のテクニカル指標をデバッグ表示します")
-        
-        # 最新の有効な日付を取得
-        valid_date = self.find_valid_date(symbol, '5min')
-        if not valid_date:
-            self.logger.warning(f"{symbol}の有効な日付が見つかりませんでした")
-            return
-        
-        # 5分足データの取得
-        df_5min = self.get_cached_data(symbol, '5min', valid_date)
-        if df_5min.empty:
-            self.logger.warning(f"{symbol}のデータを取得できませんでした")
-            return
-        
-        # データフレームの基本情報表示
-        self.logger.info(f"データサイズ: {len(df_5min)}行 x {len(df_5min.columns)}列")
-        self.logger.info(f"カラム: {df_5min.columns.tolist()}")
-        
-        # データ型の確認
-        self.logger.info("データ型:")
-        for col in ['open', 'high', 'low', 'close', 'volume']:
-            if col in df_5min.columns:
-                self.logger.info(f"- {col}: {df_5min[col].dtype}")
-        
-        # 最初の5行を表示
-        self.logger.info("最初の5行のデータ:")
-        for i in range(min(5, len(df_5min))):
-            row = df_5min.iloc[i]
-            self.logger.info(f"行 {i}: open={row.get('open', 'N/A')}, high={row.get('high', 'N/A')}, "
-                            f"low={row.get('low', 'N/A')}, close={row.get('close', 'N/A')}, "
-                            f"volume={row.get('volume', 'N/A')}")
-        
-        # 特徴量計算前のNaN値を確認
-        nan_counts = {col: df_5min[col].isna().sum() for col in df_5min.columns 
-                     if col in ['open', 'high', 'low', 'close', 'volume']}
-        self.logger.info(f"特徴量計算前のNaN値: {nan_counts}")
-        
-        # 特徴量計算
-        df_with_features = self.build_features(df_5min.copy())
-        
-        # 特徴量計算後の結果確認
-        if 'RSI' in df_with_features.columns:
-            rsi_values = df_with_features['RSI'].tail(5).values
-            self.logger.info(f"RSI (最後の5件): {rsi_values}")
-        
-        if 'CCI' in df_with_features.columns:
-            cci_values = df_with_features['CCI'].tail(5).values
-            self.logger.info(f"CCI (最後の5件): {cci_values}")
-        
-        # 指標の統計情報
-        for indicator in ['RSI', 'CCI', 'EMA_short', 'EMA_long', 'ATR']:
-            if indicator in df_with_features.columns:
-                stats = {
-                    'min': df_with_features[indicator].min(),
-                    'max': df_with_features[indicator].max(),
-                    'mean': df_with_features[indicator].mean(),
-                    'null_count': df_with_features[indicator].isna().sum()
-                }
-                self.logger.info(f"{indicator} 統計: {stats}")
-        
-        self.logger.info(f"{symbol}のテクニカル指標デバッグ表示を完了しました")
-
 
     def generate_signals(self, symbol, df_5min, df_hourly):
         """ロングとショート両方のシグナル生成関数（ADX指標を追加）
@@ -3163,7 +3074,7 @@ class CryptoTradingBot:
                     # 時間足データの特徴量も計算
                     df_hourly = self.build_features(df_hourly)
 
-                    # 処理中のDataFrameを一時的に保存（_get_entry_reasonで参照するため）
+                    # 処理中のDataFrameを一時的に保存
                     self.df_5min = df_5min_full  # 結合された全データを保存
                     
                     # ★修正：シグナル生成を先に行う（結合後の全データで実行）★
@@ -3218,7 +3129,6 @@ class CryptoTradingBot:
                     entry_time = None
                     entry_rsi = None
                     entry_cci = None
-                    entry_reason = ""
                     entry_sentiment = {}
                     self.last_sentiment_time = None
 
@@ -3265,11 +3175,8 @@ class CryptoTradingBot:
                                     total_balance -= entry_amount
                                     balance_after_entry = total_balance
 
-                                    # エントリー理由の判定
-                                    entry_reason = self._get_entry_reason(symbol, row, 'long')
-
                                     # エントリーログの出力
-                                    self.log_entry(symbol, 'long', entry_price, entry_time, entry_rsi, entry_cci, row.get('ATR', 0), row.get('ADX', 0), entry_reason, entry_sentiment)
+                                    self.log_entry(symbol, 'long', entry_price, entry_time, entry_rsi, entry_cci, row.get('ATR', 0), row.get('ADX', 0), entry_sentiment)
 
                                 # 売りシグナルが現在と前の足で両方Trueの場合のみエントリー
                                 elif row['sell_signal'] and previous_row['sell_signal']:
@@ -3296,11 +3203,8 @@ class CryptoTradingBot:
                                     total_balance -= entry_amount
                                     balance_after_entry = total_balance
 
-                                    # エントリー理由の判定
-                                    entry_reason = self._get_entry_reason(symbol, row, 'short')
-
                                     # エントリーログの出力
-                                    self.log_entry(symbol, 'short', entry_price, entry_time, entry_rsi, entry_cci, row.get('ATR', 0), row.get('ADX', 0), entry_reason, entry_sentiment)
+                                    self.log_entry(symbol, 'short', entry_price, entry_time, entry_rsi, entry_cci, row.get('ATR', 0), row.get('ADX', 0), entry_sentiment)
 
                         # ポジションがある場合のイグジット判断
                         elif position == 'long':
@@ -3349,7 +3253,6 @@ class CryptoTradingBot:
                                     'entry_cci': entry_cci,
                                     'buy_score': row.get('buy_score_scaled', 0),  # 修正: buy_score_scaled を使用
                                     'sell_score': row.get('sell_score_scaled', 0),  # 修正: sell_score_scaled を使用
-                                    'entry_reason': entry_reason,
                                     'exit_price': exit_price,
                                     'exit_time': timestamp,
                                     'size': self.entry_sizes[symbol],
@@ -3441,7 +3344,6 @@ class CryptoTradingBot:
                                     'entry_cci': entry_cci,
                                     'buy_score': row.get('buy_score_scaled', 0),  # 修正: buy_score_scaled を使用
                                     'sell_score': row.get('sell_score_scaled', 0),  # 修正: sell_score_scaled を使用
-                                    'entry_reason': entry_reason,
                                     'exit_price': exit_price,
                                     'exit_time': timestamp,
                                     'size': self.entry_sizes[symbol],
@@ -3587,7 +3489,7 @@ class CryptoTradingBot:
 
         return results
 
-    def log_entry(self, symbol, position_type, entry_price, entry_time, entry_rsi, entry_cci, entry_atr, entry_adx, entry_reason, entry_sentiment):
+    def log_entry(self, symbol, position_type, entry_price, entry_time, entry_rsi, entry_cci, entry_atr, entry_adx, entry_sentiment):
         """エントリー情報のログ出力"""
         # None値のチェックを追加
         rsi_str = f"{entry_rsi:.1f}" if entry_rsi is not None else "N/A"
@@ -3597,7 +3499,6 @@ class CryptoTradingBot:
         
         self.logger.info(f"[エントリー] {symbol} {'ロング' if position_type == 'long' else 'ショート'} @ {entry_price:.2f}円 (時刻: {entry_time})")
         self.logger.info(f"  → RSI: {rsi_str}, CCI: {cci_str}, ATR: {atr_str}, ADX: {adx_str}")  # ADXを追加
-        self.logger.info(f"  → 理由: {entry_reason}")
         self.logger.info(f"  → センチメント: 強気 {entry_sentiment.get('bullish', 0):.1f}%, 弱気 {entry_sentiment.get('bearish', 0):.1f}%, ボラティリティ {entry_sentiment.get('volatility', 0):.1f}%")
 
     def log_exit(self, symbol, position_type, exit_price, entry_price, exit_time, profit, profit_pct, exit_reason, hours, entry_sentiment):
@@ -3617,7 +3518,6 @@ class CryptoTradingBot:
             self.logger.info(f"  決済: {trade['exit_price']:.2f}円 ({trade['exit_time']})")
             self.logger.info(f"  損益: {trade['profit']:.2f}円 ({trade['profit_pct']:.2f}%)")
             self.logger.info(f"  保有時間: {trade['holding_hours']:.1f}時間")
-            self.logger.info(f"  理由: {trade['entry_reason']} → {trade['exit_reason']}")
             self.logger.info("")
 
     def save_trade_logs_to_excel(self, trade_logs):
@@ -4034,467 +3934,6 @@ class CryptoTradingBot:
         except Exception as e:
             self.logger.error(f"総合タイムライングラフ作成エラー: {e}", exc_info=True)
 
-    def _create_overall_timeline_chart(self, workbook, timeline_sheet, position_data, min_time, max_time):
-        """
-        全通貨ペアのポジション保有状況を一つのタイムラインで表示
-        
-        Parameters:
-        workbook: xlsxwriter workbook オブジェクト
-        timeline_sheet: タイムラインシート
-        position_data: ポジションデータのリスト
-        min_time: 最小時刻
-        max_time: 最大時刻
-        """
-        try:
-            # 総合タイムラインシートを作成
-            overall_sheet = workbook.add_worksheet('総合タイムライン')
-            
-            # 通貨ペアリストを取得
-            symbols = sorted(list(set([p['symbol'] for p in position_data])))
-            symbol_to_row = {symbol: i + 1 for i, symbol in enumerate(symbols)}
-            
-            # ヘッダー設定
-            headers = ['通貨ペア'] + [f'時間{i}' for i in range(int((max_time - min_time).total_seconds() // 3600) + 1)]
-            for col, header in enumerate(headers):
-                overall_sheet.write(0, col, header)
-            
-            # 通貨ペア名を書き込み
-            for i, symbol in enumerate(symbols):
-                overall_sheet.write(i + 1, 0, symbol)
-            
-            # 時間軸データを準備（1時間単位）
-            total_hours = int((max_time - min_time).total_seconds() // 3600) + 1
-            
-            # 各ポジションの保有状況をマッピング
-            position_matrix = {}
-            for symbol in symbols:
-                position_matrix[symbol] = [0] * total_hours  # 0: ポジションなし, 1: ロング, -1: ショート
-            
-            # ポジションデータを時間軸にマッピング
-            for pos in position_data:
-                symbol = pos['symbol']
-                start_hour = int(pos['entry_hours'])
-                end_hour = int(pos['entry_hours'] + pos['duration_hours'])
-                
-                value = 1 if pos['type'] == 'long' else -1
-                
-                for hour in range(start_hour, min(end_hour + 1, total_hours)):
-                    if hour >= 0 and hour < total_hours:
-                        position_matrix[symbol][hour] = value
-            
-            # データをシートに書き込み
-            for i, symbol in enumerate(symbols):
-                for hour in range(min(total_hours, 100)):  # 最大100時間まで表示（Excel制限対策）
-                    overall_sheet.write(i + 1, hour + 1, position_matrix[symbol][hour])
-            
-            # 条件付き書式を追加
-            # ロングポジション（正の値）を緑色に
-            long_format = workbook.add_format({
-                'bg_color': '#90EE90',  # ライトグリーン
-                'font_color': '#006400',  # ダークグリーン
-                'align': 'center'
-            })
-            
-            # ショートポジション（負の値）を赤色に
-            short_format = workbook.add_format({
-                'bg_color': '#FFB6C1',  # ライトピンク
-                'font_color': '#8B0000',  # ダークレッド
-                'align': 'center'
-            })
-            
-            # ポジションなし（0）をグレーに
-            no_position_format = workbook.add_format({
-                'bg_color': '#F5F5F5',  # ライトグレー
-                'align': 'center'
-            })
-            
-            # 条件付き書式を適用
-            data_range = f'B2:{chr(ord("A") + min(total_hours, 100))}{len(symbols) + 1}'
-            
-            # 条件付き書式を設定
-            overall_sheet.conditional_format(data_range, {
-                'type': 'cell',
-                'criteria': '>',
-                'value': 0,
-                'format': long_format
-            })
-            
-            overall_sheet.conditional_format(data_range, {
-                'type': 'cell',
-                'criteria': '<',
-                'value': 0,
-                'format': short_format
-            })
-            
-            overall_sheet.conditional_format(data_range, {
-                'type': 'cell',
-                'criteria': '==',
-                'value': 0,
-                'format': no_position_format
-            })
-            
-            # カラム幅を調整
-            overall_sheet.set_column('A:A', 15)  # 通貨ペア列
-            overall_sheet.set_column('B:CV', 3)  # 時間列（狭くして多くの時間を表示）
-            
-            # 説明テキストを追加
-            overall_sheet.write(len(symbols) + 3, 0, '凡例:')
-            overall_sheet.write(len(symbols) + 4, 0, '緑色 = ロングポジション')
-            overall_sheet.write(len(symbols) + 5, 0, 'ピンク = ショートポジション')
-            overall_sheet.write(len(symbols) + 6, 0, 'グレー = ポジションなし')
-            
-            # 時間範囲の説明
-            overall_sheet.write(len(symbols) + 8, 0, f'期間: {min_time.strftime("%Y-%m-%d %H:%M")} ～ {max_time.strftime("%Y-%m-%d %H:%M")}')
-            overall_sheet.write(len(symbols) + 9, 0, f'総時間: {total_hours}時間')
-            
-            self.logger.info("総合タイムライングラフを作成しました")
-            
-        except Exception as e:
-            self.logger.error(f"総合タイムライングラフ作成エラー: {e}", exc_info=True)
-    
-
-    def save_backtest_result(self, results, days_to_test, start_profit):
-        """バックテスト結果をJSONファイルに保存"""
-        backtest_profit = self.total_profit - start_profit
-        backtest_result_file = os.path.join(self.log_dir, f'backtest_result_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json')
-        try:
-            with open(backtest_result_file, 'w') as f:
-                json.dump({
-                    'start_date': (datetime.now() - timedelta(days=days_to_test)).strftime("%Y-%m-%d"),
-                    'end_date': datetime.now().strftime("%Y-%m-%d"),
-                    'days_tested': days_to_test,
-                    'total_profit': backtest_profit,
-                    'results': {k: {kk: float(vv) if isinstance(vv, (int, float)) else vv 
-                                for kk, vv in v.items()} 
-                            for k, v in results.items()}
-                }, f, indent=4)
-            self.logger.info(f"バックテスト結果を保存しました: {backtest_result_file}")
-        except Exception as e:
-            self.logger.error(f"バックテスト結果保存エラー: {e}")
-
-    def _get_entry_reason(self, symbol, row, position_type):
-        """エントリー理由を判定する補助メソッド（修正版）"""
-        reasons = []
-
-        def fmt(val, digits=1):
-            return f"{val:.{digits}f}"
-
-        # rowがSeriesの場合の値取得を修正
-        def get_safe_value(data, key, default=0):
-            """Seriesまたは辞書から安全に値を取得"""
-            try:
-                if hasattr(data, 'get'):
-                    value = data.get(key, default)
-                else:
-                    value = getattr(data, key, default)
-                
-                # Seriesの場合は最初の値を取得
-                if hasattr(value, 'iloc'):
-                    return value.iloc[0] if len(value) > 0 else default
-                elif hasattr(value, 'item'):
-                    return value.item()
-                else:
-                    return value
-            except:
-                return default
-
-        if symbol == "ltc_jpy":
-            if position_type == 'long':
-                reasons.append("常時ロング戦略")
-            else:  # short
-                if get_safe_value(row, 'is_range_bound', False):
-                    reasons.append("レンジ相場")
-                
-                rsi_val = get_safe_value(row, 'RSI', 0)
-                if rsi_val > 65:
-                    reasons.append(f"RSI過買い({fmt(rsi_val)})")
-                
-                # 前の価格との比較部分を修正
-                if hasattr(row, 'name') and hasattr(self, 'df_5min') and row.name > 0:
-                    try:
-                        prev_close = self.df_5min.at[row.name - 1, 'close']
-                        current_close = get_safe_value(row, 'close', 0)
-                        if current_close < prev_close:
-                            reasons.append(f"直近下落傾向（prev={fmt(prev_close)}, now={fmt(current_close)}）")
-                    except:
-                        pass  # エラーが発生した場合はスキップ
-
-        elif symbol == "xrp_jpy":
-            if position_type == 'long':
-                rsi_val = get_safe_value(row, 'RSI', 0)
-                if 50 < rsi_val < 70:
-                    reasons.append(f"RSI適正レンジ({fmt(rsi_val)})")
-                
-                volume_val = get_safe_value(row, 'volume', 0)
-                vol_avg_val = get_safe_value(row, 'vol_avg', 0)
-                if volume_val > vol_avg_val * 1.1:
-                    reasons.append(f"出来高増加（vol={fmt(volume_val)}, avg={fmt(vol_avg_val)}）")
-
-                close_val = get_safe_value(row, 'close', 0)
-                open_val = get_safe_value(row, 'open', 0)
-                if close_val > 0 and open_val > 0:
-                    body = close_val - open_val
-                    if body > 0:
-                        reasons.append(f"陽線（open={fmt(open_val)}, close={fmt(close_val)}）")
-                        high_val = get_safe_value(row, 'high', 0)
-                        if high_val > 0:
-                            upper_wick = high_val - max(close_val, open_val)
-                            if upper_wick < body * 0.3:
-                                reasons.append(f"小さな上ヒゲ（wick={fmt(upper_wick)}, body={fmt(body)}）")
-            else:  # short
-                rsi_val = get_safe_value(row, 'RSI', 0)
-                if rsi_val > 75:
-                    reasons.append(f"RSI過買い({fmt(rsi_val)})")
-                
-                close_val = get_safe_value(row, 'close', 0)
-                ema_short_val = get_safe_value(row, 'EMA_short', 0)
-                if close_val < ema_short_val:
-                    reasons.append(f"短期EMA下抜け（close={fmt(close_val)}, EMA_short={fmt(ema_short_val)}）")
-                
-                volume_val = get_safe_value(row, 'volume', 0)
-                vol_avg_val = get_safe_value(row, 'vol_avg', 0)
-                if volume_val > vol_avg_val * 1.2:
-                    reasons.append(f"出来高増加（vol={fmt(volume_val)}, avg={fmt(vol_avg_val)}）")
-
-        elif symbol == "eth_jpy":
-            if position_type == 'long':
-                rsi_val = get_safe_value(row, 'RSI', 0)
-                if rsi_val < 40:
-                    reasons.append(f"RSI過売り({fmt(rsi_val)})")
-                
-                cci_val = get_safe_value(row, 'CCI', 0)
-                if cci_val < -100:
-                    reasons.append(f"CCI過売り({fmt(cci_val)})")
-                
-                volume_val = get_safe_value(row, 'volume', 0)
-                vol_avg_val = get_safe_value(row, 'vol_avg', 0)
-                if volume_val > vol_avg_val * 1.2:
-                    reasons.append(f"出来高20%増加（vol={fmt(volume_val)}, avg={fmt(vol_avg_val)}）")
-            else:  # short
-                rsi_val = get_safe_value(row, 'RSI', 0)
-                if rsi_val > 70:
-                    reasons.append(f"RSI過買い({fmt(rsi_val)})")
-                
-                # 前の価格との比較部分を修正
-                if hasattr(row, 'name') and hasattr(self, 'df_5min') and row.name > 0:
-                    try:
-                        prev_close = self.df_5min.at[row.name - 1, 'close']
-                        current_close = get_safe_value(row, 'close', 0)
-                        if current_close < prev_close:
-                            reasons.append(f"直近下落（prev={fmt(prev_close)}, now={fmt(current_close)}）")
-                    except:
-                        pass
-                
-                fib_level = get_safe_value(row, 'fib_level', 0)
-                close_val = get_safe_value(row, 'close', 0)
-                if fib_level > 0 and close_val < fib_level:
-                    reasons.append(f"フィボナッチ0.618下抜け（close={fmt(close_val)}, fib={fmt(fib_level)}）")
-                
-                highest_high = get_safe_value(row, 'highest_high', 0)
-                high_val = get_safe_value(row, 'high', 0)
-                if highest_high > 0 and high_val > highest_high * 0.95:
-                    reasons.append(f"ダブルトップ圏（high={fmt(high_val)}, hist_high={fmt(highest_high)}）")
-
-        elif symbol == "sol_jpy":
-            current_hour = (datetime.now() + timedelta(hours=9)).hour
-            if position_type == 'long':
-                rsi_val = get_safe_value(row, 'RSI', 0)
-                if rsi_val < 40:
-                    reasons.append(f"RSI過売り({fmt(rsi_val)})")
-                
-                cci_val = get_safe_value(row, 'CCI', 0)
-                if cci_val < -100:
-                    reasons.append(f"CCI過売り({fmt(cci_val)})")
-                
-                if 10 <= current_hour <= 15:
-                    reasons.append("日本活発取引時間帯（日中）")
-                elif 19 <= current_hour <= 23:
-                    reasons.append("日本活発取引時間帯（夜間）")
-                
-                if current_hour < 10 or current_hour > 23:
-                    if rsi_val < 35:
-                        reasons.append(f"非活発時間帯・強い過売り（RSI={fmt(rsi_val)}）")
-                    volume_val = get_safe_value(row, 'volume', 0)
-                    vol_avg_val = get_safe_value(row, 'vol_avg', 0)
-                    if volume_val > vol_avg_val * 1.2:
-                        reasons.append(f"出来高増加（vol={fmt(volume_val)}, avg={fmt(vol_avg_val)}）")
-            else:  # short
-                rsi_val = get_safe_value(row, 'RSI', 0)
-                if rsi_val > 68:
-                    reasons.append(f"RSI過買い({fmt(rsi_val)})")
-                
-                cci_val = get_safe_value(row, 'CCI', 0)
-                if cci_val > 120:
-                    reasons.append(f"CCI過買い({fmt(cci_val)})")
-                
-                volume_val = get_safe_value(row, 'volume', 0)
-                vol_avg_val = get_safe_value(row, 'vol_avg', 0)
-                if volume_val > vol_avg_val * 1.1:
-                    reasons.append(f"出来高増加（vol={fmt(volume_val)}, avg={fmt(vol_avg_val)}）")
-                
-                if 21 <= current_hour or current_hour < 2:
-                    reasons.append("夜間セッション（21:00-2:00）")
-                    if rsi_val > 68:
-                        reasons.append(f"夜間の弱いショート条件（RSI={fmt(rsi_val)}）")
-                else:
-                    if rsi_val > 78:
-                        reasons.append(f"日中の強いショート条件（RSI={fmt(rsi_val)}）")
-                    close_val = get_safe_value(row, 'close', 0)
-                    ema_short_val = get_safe_value(row, 'EMA_short', 0)
-                    if close_val < ema_short_val:
-                        reasons.append(f"短期EMA下抜け（close={fmt(close_val)}, EMA_short={fmt(ema_short_val)}）")
-
-        elif symbol == "doge_jpy":
-            if position_type == 'long':
-                rsi_val = get_safe_value(row, 'RSI', 0)
-                if rsi_val < 40:
-                    reasons.append(f"RSI過売り({fmt(rsi_val)})")
-                
-                cci_val = get_safe_value(row, 'CCI', 0)
-                if cci_val < -100:
-                    reasons.append(f"CCI過売り({fmt(cci_val)})")
-                
-                close_val = get_safe_value(row, 'close', 0)
-                ma25_val = get_safe_value(row, 'MA25', 0)
-                if close_val > ma25_val:
-                    reasons.append(f"25MA上抜け（close={fmt(close_val)}, MA25={fmt(ma25_val)}）")
-                
-                if 50 <= rsi_val <= 80:
-                    reasons.append(f"RSI適正モメンタム({fmt(rsi_val)})")
-                
-                if cci_val > 50:
-                    reasons.append(f"CCIモメンタム上昇({fmt(cci_val)})")
-                
-                volume_val = get_safe_value(row, 'volume', 0)
-                vol_avg_val = get_safe_value(row, 'vol_avg', 0)
-                if volume_val > vol_avg_val:
-                    reasons.append(f"出来高平均以上（vol={fmt(volume_val)}, avg={fmt(vol_avg_val)}）")
-            else:  # short
-                if get_safe_value(row, 'downtrend', False):
-                    reasons.append("下降トレンド確立")
-                
-                rsi_val = get_safe_value(row, 'RSI', 0)
-                if rsi_val > 50:
-                    reasons.append(f"一時反発（RSI={fmt(rsi_val)}）")
-                
-                close_val = get_safe_value(row, 'close', 0)
-                ema_long_val = get_safe_value(row, 'EMA_long', 0)
-                if close_val < ema_long_val:
-                    reasons.append(f"長期EMA下抜け（close={fmt(close_val)}, EMA_long={fmt(ema_long_val)}）")
-                
-                cci_val = get_safe_value(row, 'CCI', 0)
-                if cci_val > 0:
-                    reasons.append(f"CCI反発の兆候({fmt(cci_val)})")
-                
-                volume_val = get_safe_value(row, 'volume', 0)
-                vol_avg_val = get_safe_value(row, 'vol_avg', 0)
-                if volume_val > vol_avg_val:
-                    reasons.append(f"出来高平均以上（vol={fmt(volume_val)}, avg={fmt(vol_avg_val)}）")
-                
-                trend_strength = get_safe_value(row, 'trend_strength', 0)
-                if trend_strength > 0.7:
-                    reasons.append(f"強いトレンド({fmt(trend_strength, 2)})")
-
-        elif symbol == "bcc_jpy":  # 新規追加
-            if position_type == 'long':
-                rsi_val = get_safe_value(row, 'RSI', 0)
-                if rsi_val < 35:
-                    reasons.append(f"RSI過売り({fmt(rsi_val)})")
-                
-                cci_val = get_safe_value(row, 'CCI', 0)
-                if cci_val < -100:
-                    reasons.append(f"CCI過売り({fmt(cci_val)})")
-                
-                volume_val = get_safe_value(row, 'volume', 0)
-                vol_avg_val = get_safe_value(row, 'vol_avg', 0)
-                if volume_val > vol_avg_val * 1.15:
-                    reasons.append(f"出来高15%増加（vol={fmt(volume_val)}, avg={fmt(vol_avg_val)}）")
-                
-                close_val = get_safe_value(row, 'close', 0)
-                ma25_val = get_safe_value(row, 'MA25', 0)
-                if close_val > ma25_val:
-                    reasons.append(f"25MA上抜け（close={fmt(close_val)}, MA25={fmt(ma25_val)}）")
-            else:  # short
-                rsi_val = get_safe_value(row, 'RSI', 0)
-                if rsi_val > 70:
-                    reasons.append(f"RSI過買い({fmt(rsi_val)})")
-                
-                cci_val = get_safe_value(row, 'CCI', 0)
-                if cci_val > 100:
-                    reasons.append(f"CCI過買い({fmt(cci_val)})")
-                
-                close_val = get_safe_value(row, 'close', 0)
-                ema_short_val = get_safe_value(row, 'EMA_short', 0)
-                if close_val < ema_short_val:
-                    reasons.append(f"短期EMA下抜け（close={fmt(close_val)}, EMA_short={fmt(ema_short_val)}）")
-                
-                volume_val = get_safe_value(row, 'volume', 0)
-                vol_avg_val = get_safe_value(row, 'vol_avg', 0)
-                if volume_val > vol_avg_val * 1.1:
-                    reasons.append(f"出来高増加（vol={fmt(volume_val)}, avg={fmt(vol_avg_val)}）")
-
-        elif symbol == "ada_jpy":
-            if position_type == 'long':
-                rsi_val = get_safe_value(row, 'RSI', 0)
-                if rsi_val < 35:
-                    reasons.append(f"RSI過売り({fmt(rsi_val)})")
-                
-                cci_val = get_safe_value(row, 'CCI', 0)
-                if cci_val < -100:
-                    reasons.append(f"CCI過売り({fmt(cci_val)})")
-                
-                volume_val = get_safe_value(row, 'volume', 0)
-                vol_avg_val = get_safe_value(row, 'vol_avg', 0)
-                if volume_val > vol_avg_val * 1.15:
-                    reasons.append(f"出来高15%増加（vol={fmt(volume_val)}, avg={fmt(vol_avg_val)}）")
-                
-                close_val = get_safe_value(row, 'close', 0)
-                ma25_val = get_safe_value(row, 'MA25', 0)
-                if close_val > ma25_val:
-                    reasons.append(f"25MA上抜け（close={fmt(close_val)}, MA25={fmt(ma25_val)}）")
-                
-                ema_short_val = get_safe_value(row, 'EMA_short', 0)
-                ema_long_val = get_safe_value(row, 'EMA_long', 0)
-                if ema_short_val > 0 and ema_long_val > 0:
-                    if ema_short_val > ema_long_val:
-                        reasons.append(f"EMAゴールデンクロス（EMA_short={fmt(ema_short_val)}, EMA_long={fmt(ema_long_val)}）")
-            else:  # short
-                rsi_val = get_safe_value(row, 'RSI', 0)
-                if rsi_val > 70:
-                    reasons.append(f"RSI過買い({fmt(rsi_val)})")
-                
-                cci_val = get_safe_value(row, 'CCI', 0)
-                if cci_val > 100:
-                    reasons.append(f"CCI過買い({fmt(cci_val)})")
-                
-                close_val = get_safe_value(row, 'close', 0)
-                ema_short_val = get_safe_value(row, 'EMA_short', 0)
-                if close_val < ema_short_val:
-                    reasons.append(f"短期EMA下抜け（close={fmt(close_val)}, EMA_short={fmt(ema_short_val)}）")
-                
-                volume_val = get_safe_value(row, 'volume', 0)
-                vol_avg_val = get_safe_value(row, 'vol_avg', 0)
-                if volume_val > vol_avg_val * 1.1:
-                    reasons.append(f"出来高増加（vol={fmt(volume_val)}, avg={fmt(vol_avg_val)}）")
-
-        # センチメント要因
-        if hasattr(self, 'sentiment'):
-            bullish_val = self.sentiment.get('bullish', 50)
-            bearish_val = self.sentiment.get('bearish', 50)
-            if position_type == 'long' and bullish_val > 60:
-                reasons.append(f"強気センチメント優勢（bullish={bullish_val}）")
-            elif position_type == 'short' and bearish_val > 60:
-                reasons.append(f"弱気センチメント優勢（bearish={bearish_val}）")
-
-            vol = self.sentiment.get('volatility', 50)
-            if vol > 70:
-                reasons.append(f"高ボラティリティ環境（vol={vol}）")
-            elif vol < 30:
-                reasons.append(f"低ボラティリティ環境（vol={vol}）")
-
-        return " + ".join(reasons) if reasons else "シグナル検出"
-
-
     def run_live(self):
         """
         リアルタイムトレーディングモード（backtest関数との整合性が取れた本番環境最適化版）
@@ -4627,7 +4066,7 @@ class CryptoTradingBot:
                             df_5min = self.build_features(df_5min)
                             df_hourly = self.build_features(df_hourly)
                             
-                            # 処理中のDataFrameを一時的に保存（_get_entry_reasonで参照するため）- バックテストと同様
+                            # 処理中のDataFrameを一時的に保存 - バックテストと同様
                             self.df_5min = df_5min
                             
                             # シグナル生成（センチメント考慮版）
@@ -4980,9 +4419,6 @@ class CryptoTradingBot:
 
         # EMA乖離率の取得（新規追加）
         ema_deviation = signal_data.get('ema_deviation', 0)
-        
-        # エントリーの詳細をログに記録
-        entry_reason = self._get_entry_reason(symbol, signal_data, position_type)
 
         current_price = self.get_current_price(symbol)
         
@@ -5046,7 +4482,7 @@ class CryptoTradingBot:
             entry_sentiment = self.sentiment.copy() if hasattr(self, 'sentiment') else {}
             
             # backtest関数と同様のログ出力
-            self.log_entry(symbol, position_type, current_price, datetime.now(), entry_rsi, entry_cci, entry_atr, entry_adx, entry_reason, entry_sentiment)
+            self.log_entry(symbol, position_type, current_price, datetime.now(), entry_rsi, entry_cci, entry_atr, entry_adx, entry_sentiment)
             
             # 通知送信（修正箇所）
             if self.notification_settings['send_on_entry']:
@@ -5064,7 +4500,6 @@ class CryptoTradingBot:
                     f"CCI: {cci_str}\n"
                     f"ATR: {atr_str}\n"
                     f"ADX: {adx_str}\n"  # この行を追加
-                    f"理由: {entry_reason}"
                 )
                 
                 self.send_notification(
@@ -5107,7 +4542,6 @@ class CryptoTradingBot:
                 'rsi': entry_rsi,
                 'cci': entry_cci,
                 'ema_deviation': ema_deviation,
-                'reason': entry_reason,
                 'sentiment': entry_sentiment,
                 'buy_score': buy_score,  # これで buy_score_scaled が記録される
                 'sell_score': sell_score,  # これで sell_score_scaled が記録される
@@ -5972,16 +5406,6 @@ if __name__ == "__main__":
         bot.exchange_settings_gmo['api_key'] = args.api_key
         bot.exchange_settings_gmo['api_secret'] = args.api_secret
         bot.logger.info("API認証情報を設定しました")
-    
-    # キャッシュクリア
-    if args.clear_cache:
-        bot.clear_cache()
-        bot.logger.info("キャッシュをクリアしました")
-    
-    # ポジションリセット
-    if args.reset:
-        bot.reset_positions()
-        bot.logger.info("ポジション情報をリセットしました")
     
     # 実行モード
     if args.mode == "backtest":
