@@ -5269,8 +5269,10 @@ class CryptoTradingBot:
                 raise ValueError("ATRデータが存在しません。")
             atr = atr_series.iloc[-2]
 
-            # 最新ADX, DI+, DI-
-            adx = df_5min['ADX'].dropna().iloc[-2] if 'ADX' in df_5min.columns and not df_5min['ADX'].dropna().empty else None
+            # 最新ADXの取得
+            adx_series = df_5min['ADX'].dropna()
+            adx = adx_series.iloc[-2] if not adx_series.empty else None
+
             plus_di = df_5min['DI+'].dropna().iloc[-2] if 'DI+' in df_5min.columns else None
             minus_di = df_5min['DI-'].dropna().iloc[-2] if 'DI-' in df_5min.columns else None
 
@@ -5287,7 +5289,7 @@ class CryptoTradingBot:
             base_sl_pct = abs(sl_ratio - 1.0)
 
             # 通貨ペア別ATR倍率設定
-            atr_config = {
+            atr_thresholds = {
                 'ltc_jpy': {'low': 60, 'high': 75, 'low_mult': 0.90, 'high_mult_long': 1.10, 'high_mult_short': 1.10},
                 'ada_jpy': {'low': 0.50, 'high': 0.57, 'low_mult': 0.90, 'high_mult_long': 1.10, 'high_mult_short': 1.07},
                 'xrp_jpy': {'low': 1.5, 'high': 2.1, 'low_mult': 1.00, 'high_mult_long': 1.00, 'high_mult_short': 0.90},
@@ -5308,7 +5310,7 @@ class CryptoTradingBot:
             #     'doge_jpy':  {'low': 20, 'high': 35, 'low_mult': 0.90, 'high_mult': 0.95},
             #     'bcc_jpy':   {'low': 22, 'high': 32, 'low_mult': 0.90, 'high_mult': 1.10}
             # }
-            adx_config = {
+            adx_thresholds = {
                 'ltc_jpy':   {'low': 20, 'high': 50, 'low_mult': 0.85, 'high_mult': 1.15},
                 'ada_jpy':   {'low': 22, 'high': 48, 'low_mult': 0.85, 'high_mult': 1.15},
                 'xrp_jpy':   {'low': 20, 'high': 50, 'low_mult': 0.80, 'high_mult': 1.20},
