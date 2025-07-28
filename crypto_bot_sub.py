@@ -4132,7 +4132,7 @@ class CryptoTradingBot:
                     
                     # メインループサイクル間のスリープ（5分間隔）
                     elapsed_time = (datetime.now() - loop_start_time).total_seconds()
-                    sleep_time = max(70 - elapsed_time, 10)  # 少なくとも10秒は待機
+                    sleep_time = max(50 - elapsed_time, 10)  # 少なくとも10秒は待機
                     self.logger.info(f"次のサイクルまで{sleep_time:.1f}秒待機します")
                     
                     # 成功したのでエラーカウンターをリセット
