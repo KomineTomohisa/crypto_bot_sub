@@ -2782,8 +2782,8 @@ class CryptoTradingBot:
         df_5min['sell_signal'] = df_5min['sell_score_scaled'] >= sell_signal_threshold
 
         if symbol == 'bcc_jpy':
-            df_5min.loc[df_5min['ADX'] < 20, 'buy_signal'] = False
-            df_5min.loc[df_5min['ADX'] < 20, 'sell_signal'] = False
+            # df_5min.loc[df_5min['ADX'] < 20, 'buy_signal'] = False
+            # df_5min.loc[df_5min['ADX'] < 20, 'sell_signal'] = False
 
             df_5min.loc[df_5min['macd_score_long'] == 0, 'buy_signal'] = False
             df_5min.loc[df_5min['macd_score_short'] == 0, 'sell_signal'] = False
@@ -2794,32 +2794,32 @@ class CryptoTradingBot:
 
             df_5min.loc[df_5min['mfi_score_short'] < 0.1, 'buy_signal'] = False
 
-        if symbol == 'doge_jpy':
-            df_5min.loc[df_5min['ADX'] < 20, 'buy_signal'] = False
-            df_5min.loc[df_5min['ADX'] < 20, 'sell_signal'] = False
+        # if symbol == 'doge_jpy':
+        #     df_5min.loc[df_5min['ADX'] < 20, 'buy_signal'] = False
+        #     df_5min.loc[df_5min['ADX'] < 20, 'sell_signal'] = False
 
-        if symbol == 'sol_jpy':
-            df_5min.loc[df_5min['ADX'] < 20, 'buy_signal'] = False
-            df_5min.loc[df_5min['ADX'] < 20, 'sell_signal'] = False
+        # if symbol == 'sol_jpy':
+        #     df_5min.loc[df_5min['ADX'] < 20, 'buy_signal'] = False
+        #     df_5min.loc[df_5min['ADX'] < 20, 'sell_signal'] = False
 
         if symbol == 'ada_jpy':
-            df_5min.loc[df_5min['ADX'] < 20, 'buy_signal'] = False
-            df_5min.loc[df_5min['ADX'] < 20, 'sell_signal'] = False
+            # df_5min.loc[df_5min['ADX'] < 20, 'buy_signal'] = False
+            # df_5min.loc[df_5min['ADX'] < 20, 'sell_signal'] = False
 
             df_5min.loc[df_5min['atr_score_long'] > 0.65, 'buy_signal'] = False
             df_5min.loc[df_5min['atr_score_short'] > 0.65, 'sell_signal'] = False
 
-        if symbol == 'ltc_jpy':
-            df_5min.loc[df_5min['ADX'] < 20, 'buy_signal'] = False
-            df_5min.loc[df_5min['ADX'] < 20, 'sell_signal'] = False
+        # if symbol == 'ltc_jpy':
+            # df_5min.loc[df_5min['ADX'] < 20, 'buy_signal'] = False
+            # df_5min.loc[df_5min['ADX'] < 20, 'sell_signal'] = False
 
-        if symbol == 'eth_jpy':
-            df_5min.loc[df_5min['ADX'] < 20, 'buy_signal'] = False
-            df_5min.loc[df_5min['ADX'] < 20, 'sell_signal'] = False
+        # if symbol == 'eth_jpy':
+            # df_5min.loc[df_5min['ADX'] < 20, 'buy_signal'] = False
+            # df_5min.loc[df_5min['ADX'] < 20, 'sell_signal'] = False
 
         if symbol == 'xrp_jpy':
-            df_5min.loc[df_5min['ADX'] < 20, 'buy_signal'] = False
-            df_5min.loc[df_5min['ADX'] < 20, 'sell_signal'] = False
+            # df_5min.loc[df_5min['ADX'] < 20, 'buy_signal'] = False
+            # df_5min.loc[df_5min['ADX'] < 20, 'sell_signal'] = False
 
             df_5min.loc[df_5min['atr_score_short'] > 0.70, 'sell_signal'] = False
             df_5min.loc[df_5min['adx_score_short'] < 0.1, 'sell_signal'] = False
