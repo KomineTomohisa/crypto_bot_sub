@@ -2781,18 +2781,18 @@ class CryptoTradingBot:
         df_5min['buy_signal'] = df_5min['buy_score_scaled'] >= buy_signal_threshold
         df_5min['sell_signal'] = df_5min['sell_score_scaled'] >= sell_signal_threshold
 
-        if symbol == 'bcc_jpy':
+        # if symbol == 'bcc_jpy':
             # df_5min.loc[df_5min['ADX'] < 20, 'buy_signal'] = False
             # df_5min.loc[df_5min['ADX'] < 20, 'sell_signal'] = False
 
-            df_5min.loc[df_5min['macd_score_long'] == 0, 'buy_signal'] = False
-            df_5min.loc[df_5min['macd_score_short'] == 0, 'sell_signal'] = False
+            # df_5min.loc[df_5min['macd_score_long'] == 0, 'buy_signal'] = False
+            # df_5min.loc[df_5min['macd_score_short'] == 0, 'sell_signal'] = False
 
-            df_5min.loc[df_5min['rsi_score_short'] < 0.1, 'buy_signal'] = False
+            # df_5min.loc[df_5min['rsi_score_short'] < 0.1, 'buy_signal'] = False
 
-            df_5min.loc[df_5min['bb_score_short'] < 0.1, 'buy_signal'] = False
+            # df_5min.loc[df_5min['bb_score_short'] < 0.1, 'buy_signal'] = False
 
-            df_5min.loc[df_5min['mfi_score_short'] < 0.1, 'buy_signal'] = False
+            # df_5min.loc[df_5min['mfi_score_short'] < 0.1, 'buy_signal'] = False
 
         # if symbol == 'doge_jpy':
         #     df_5min.loc[df_5min['ADX'] < 20, 'buy_signal'] = False
@@ -3115,13 +3115,6 @@ class CryptoTradingBot:
                         
                     self.logger.info(f"データ抽出完了: {symbol}, 最終データ数: {len(df_5min)}")
                     
-
-                    # 通貨ペアごとの利確・損切り設定
-                    profit_loss_settings = self._get_dynamic_profit_loss_settings(symbol, df_5min)
-                    long_profit_take = profit_loss_settings['long_profit_take']
-                    long_stop_loss = profit_loss_settings['long_stop_loss']
-                    short_profit_take = profit_loss_settings['short_profit_take']
-                    short_stop_loss = profit_loss_settings['short_stop_loss']
 
                     # バックテスト処理
                     position = None
@@ -4611,50 +4604,35 @@ class CryptoTradingBot:
         holding_time = datetime.now() - entry_time
         hours = holding_time.total_seconds() / 3600
         
-        # 利確・損切りの設定を取得
-        settings = self._get_dynamic_profit_loss_settings(symbol, df_5min)
-        
         # イグジット条件の計算
         exit_condition = False
         exit_reason = ""
 
         exit_levels = self.calculate_dynamic_exit_levels(symbol, df_5min, position, entry_price)
+        take_profit_price = exit_levels['take_profit_price']
+        stop_loss_price = exit_levels['stop_loss_price']
 
         current_price = self.get_current_price(symbol)
         
         if position == 'long':
-            # ロングポジションのイグジット判定
-            long_profit_take = settings['long_profit_take']
-            long_stop_loss = settings['long_stop_loss']
-            
-            # イグジット条件（バックテストと同じ条件）
-            if current_price >= entry_price * long_profit_take:
+            if current_price >= take_profit_price:
                 exit_condition = True
-                # 修正: 実際の損益を計算してから理由を決定
                 profit_temp = (current_price - entry_price) * entry_size
                 exit_reason = "利益確定" if profit_temp > 0 else "損切り"
-            elif current_price <= entry_price * long_stop_loss:
+            elif current_price <= stop_loss_price:
                 exit_condition = True
-                # 修正: 実際の損益を計算してから理由を決定
                 profit_temp = (current_price - entry_price) * entry_size
                 exit_reason = "損切り" if profit_temp <= 0 else "利益確定"
-                           
-        else:  # 'short'
-            # ショートポジションのイグジット判定
-            short_profit_take = settings['short_profit_take']
-            short_stop_loss = settings['short_stop_loss']
-            
-            # イグジット条件（バックテストと同じ条件）
-            if current_price <= entry_price * short_profit_take:
+        else:  # short
+            if current_price <= take_profit_price:
                 exit_condition = True
-                # 修正: 実際の損益を計算してから理由を決定
                 profit_temp = (entry_price - current_price) * entry_size
                 exit_reason = "利益確定" if profit_temp > 0 else "損切り"
-            elif current_price >= entry_price * short_stop_loss:
+            elif current_price >= stop_loss_price:
                 exit_condition = True
-                # 修正: 実際の損益を計算してから理由を決定
                 profit_temp = (entry_price - current_price) * entry_size
                 exit_reason = "損切り" if profit_temp <= 0 else "利益確定"
+
         
         # 長時間保有の処理（48時間以上で警告、72時間以上で強制決済）- これはlive固有の機能
         if hours >= 72:
