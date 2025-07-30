@@ -5246,6 +5246,8 @@ class CryptoTradingBot:
             if atr_series.empty:
                 raise ValueError("ATRデータが存在しません。")
             atr = atr_series.iloc[-2]
+            atr_prev = atr_series.iloc[-4]
+            atr_change_rate = (atr - atr_prev) / atr_prev if atr_prev != 0 else 0
 
             # 最新ADXの取得
             adx_series = df_5min['ADX'].dropna()
@@ -5268,34 +5270,25 @@ class CryptoTradingBot:
 
             # 通貨ペア別ATR倍率設定
             atr_thresholds = {
-                'ltc_jpy': {'low': 60, 'high': 75, 'low_mult': 0.90, 'high_mult_long': 1.10, 'high_mult_short': 1.10},
-                'ada_jpy': {'low': 0.50, 'high': 0.57, 'low_mult': 0.90, 'high_mult_long': 1.10, 'high_mult_short': 1.07},
-                'xrp_jpy': {'low': 1.5, 'high': 2.1, 'low_mult': 1.00, 'high_mult_long': 1.00, 'high_mult_short': 0.90},
-                'eth_jpy': {'low': 2000, 'high': 2500, 'low_mult': 0.95, 'high_mult_long': 1.00, 'high_mult_short': 1.10},
-                'sol_jpy': {'low': 100, 'high': 140, 'low_mult': 0.95, 'high_mult_long': 1.10, 'high_mult_short': 1.03},
-                'doge_jpy': {'low': 0.20, 'high': 0.24, 'low_mult': 0.95, 'high_mult_long': 0.95, 'high_mult_short': 1.00},
-                'bcc_jpy': {'low': 310, 'high': 350, 'low_mult': 0.90, 'high_mult_long': 1.15, 'high_mult_short': 1.10}
+                'ltc_jpy': {'low': 60, 'high': 75, 'low_mult': 0.88, 'high_mult_long': 1.10, 'high_mult_short': 1.10},
+                'ada_jpy': {'low': 0.50, 'high': 0.57, 'low_mult': 0.88, 'high_mult_long': 1.10, 'high_mult_short': 1.07},
+                'xrp_jpy': {'low': 1.5, 'high': 2.1, 'low_mult': 0.95, 'high_mult_long': 1.00, 'high_mult_short': 0.90},
+                'eth_jpy': {'low': 2000, 'high': 2500, 'low_mult': 0.92, 'high_mult_long': 1.00, 'high_mult_short': 1.10},
+                'sol_jpy': {'low': 100, 'high': 140, 'low_mult': 0.88, 'high_mult_long': 1.10, 'high_mult_short': 1.03},
+                'doge_jpy': {'low': 0.20, 'high': 0.24, 'low_mult': 0.93, 'high_mult_long': 0.95, 'high_mult_short': 1.00},
+                'bcc_jpy': {'low': 310, 'high': 350, 'low_mult': 0.88, 'high_mult_long': 1.10, 'high_mult_short': 1.10}
             }
             default_setting = {'low': 0.5, 'high': 2.0, 'low_mult': 0.9, 'high_mult_long': 1.1, 'high_mult_short': 1.1}
             config = atr_thresholds.get(symbol, default_setting)
 
-            # adx_thresholds = {
-            #     'ltc_jpy':   {'low': 20, 'high': 28, 'low_mult': 0.85, 'high_mult': 1.20},
-            #     'ada_jpy':   {'low': 22, 'high': 48, 'low_mult': 0.85, 'high_mult': 1.15},
-            #     'xrp_jpy':   {'low': 20, 'high': 30, 'low_mult': 0.90, 'high_mult': 1.15},
-            #     'eth_jpy':   {'low': 22, 'high': 30, 'low_mult': 0.85, 'high_mult': 1.15},
-            #     'sol_jpy':   {'low': 17, 'high': 32, 'low_mult': 0.85, 'high_mult': 1.15},
-            #     'doge_jpy':  {'low': 20, 'high': 35, 'low_mult': 0.90, 'high_mult': 0.95},
-            #     'bcc_jpy':   {'low': 22, 'high': 32, 'low_mult': 0.90, 'high_mult': 1.10}
-            # }
             adx_thresholds = {
-                'ltc_jpy':   {'low': 20, 'high': 50, 'low_mult': 0.85, 'high_mult': 1.15},
-                'ada_jpy':   {'low': 22, 'high': 48, 'low_mult': 0.85, 'high_mult': 1.15},
+                'ltc_jpy':   {'low': 20, 'high': 50, 'low_mult': 0.83, 'high_mult': 1.15},
+                'ada_jpy':   {'low': 22, 'high': 48, 'low_mult': 0.83, 'high_mult': 1.15},
                 'xrp_jpy':   {'low': 20, 'high': 50, 'low_mult': 0.80, 'high_mult': 1.20},
                 'eth_jpy':   {'low': 20, 'high': 50, 'low_mult': 0.85, 'high_mult': 1.15},
                 'sol_jpy':   {'low': 20, 'high': 50, 'low_mult': 0.85, 'high_mult': 1.15},
                 'doge_jpy':  {'low': 20, 'high': 50, 'low_mult': 0.80, 'high_mult': 1.20},
-                'bcc_jpy':   {'low': 22, 'high': 32, 'low_mult': 0.85, 'high_mult': 1.15}
+                'bcc_jpy':   {'low': 22, 'high': 32, 'low_mult': 0.83, 'high_mult': 1.15}
             }
             default_adx_setting = {'low': 20, 'high': 50, 'low_mult': 0.90, 'high_mult': 1.10}
             adx_config = adx_thresholds.get(symbol, default_adx_setting)
@@ -5322,6 +5315,7 @@ class CryptoTradingBot:
                 elif adx > adx_config['high']:
                     tp_pct *= adx_config['high_mult']
                     sl_pct *= adx_config['high_mult']
+
 
             # トレンド方向と一致しているかを+DI / -DIで判定
             if plus_di is not None and minus_di is not None:
