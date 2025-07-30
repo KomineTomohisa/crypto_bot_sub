@@ -2191,10 +2191,10 @@ class CryptoTradingBot:
         }
         signal_thresholds = {
             'doge_jpy': {'buy': 0.51, 'sell': 0.51},
-            'sol_jpy':  {'buy': 0.51, 'sell': 0.51},
+            'sol_jpy':  {'buy': 0.45, 'sell': 0.45},
             'xrp_jpy':  {'buy': 0.51, 'sell': 0.51},
-            'ltc_jpy':  {'buy': 0.51, 'sell': 0.51},
-            'ada_jpy':  {'buy': 0.51, 'sell': 0.51},
+            'ltc_jpy':  {'buy': 0.55, 'sell': 0.55},
+            'ada_jpy':  {'buy': 0.45, 'sell': 0.45},
             'eth_jpy':  {'buy': 0.51, 'sell': 0.51},
             'bcc_jpy':  {'buy': 0.51, 'sell': 0.51},
         }
