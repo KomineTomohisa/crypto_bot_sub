@@ -292,7 +292,6 @@ class CryptoTradingBot:
                         if symbol == "jpy":
                             available = float(asset.get("available", 0))
                             total_balance += available
-                            self.logger.debug(f"JPY現物残高: {available:,.0f}円")
                         else:
                             # 暗号資産現物
                             available = float(asset.get("available", 0))
@@ -302,7 +301,6 @@ class CryptoTradingBot:
                                 if current_price > 0:
                                     asset_value = available * current_price
                                     total_balance += asset_value
-                                    self.logger.debug(f"{symbol.upper()}現物: {available:.6f} ({asset_value:,.0f}円)")
             
             # 2. 個別のポジション情報を取得（詳細ログ用）
             try:
@@ -334,9 +332,6 @@ class CryptoTradingBot:
                                 else:  # SELL
                                     profit = (price - current_price) * size
                                 
-                                self.logger.debug(f"建玉 {position_id}: {symbol} {side} "
-                                                f"サイズ: {size}, エントリー価格: {price}, "
-                                                f"現在価格: {current_price}, 評価損益: {profit:,.0f}円")
             except Exception as e:
                 self.logger.debug(f"個別ポジション情報取得時のエラー（無視）: {e}")
             
@@ -771,7 +766,6 @@ class CryptoTradingBot:
                 time.sleep(sleep_time)
             
             # リクエスト実行
-            self.logger.debug(f"GMOコイン価格取得: {url}")
             response = requests.get(url, headers=headers, timeout=10)
             self.last_api_call = time.time()
             
@@ -795,7 +789,6 @@ class CryptoTradingBot:
                 else:
                     # リストでない場合（単一オブジェクトの場合）
                     last_price = float(ticker_data.get('last', 0))
-                    self.logger.debug(f"{symbol} 現在価格: {last_price}")
                     return last_price
             else:
                 error_msg = data.get('messages', [{"message_string": "不明なエラー"}])[0].get("message_string", "不明なエラー") if data.get('messages') else "不明なエラー"
@@ -818,11 +811,9 @@ class CryptoTradingBot:
                         for item in ticker_data:
                             if item.get('symbol') == gmo_symbol:
                                 last_price = float(item.get('last', 0))
-                                self.logger.debug(f"{symbol} 現在価格（リトライ成功）: {last_price}")
                                 return last_price
                     else:
                         last_price = float(ticker_data.get('last', 0))
-                        self.logger.debug(f"{symbol} 現在価格（リトライ成功）: {last_price}")
                         return last_price
             except Exception:
                 pass
@@ -1010,18 +1001,10 @@ class CryptoTradingBot:
             
             symbol = f"{coin}_jpy"
             gmo_symbol = self.symbol_mapping.get(symbol, symbol.upper().replace('_', ''))
-            self.logger.debug(f"Searching for symbol: {gmo_symbol}")
             # 信用取引の建玉情報を取得（symbolパラメータは使わない）
             margin_response = self.gmo_api.get_margin_positions(gmo_symbol)
-
-            # デバッグ：レスポンス全体を表示
-            self.logger.debug(f"=== get_balance margin_response ===")
-            self.logger.debug(f"Type: {type(margin_response)}")
-            self.logger.debug(f"Content: {margin_response}")
-            
             # ステータスコードを確認
             status = margin_response.get("status")
-            self.logger.debug(f"API status: {status}")
             
             if status == 0:
                 # データ形式を確認
@@ -1040,8 +1023,6 @@ class CryptoTradingBot:
                 symbol = f"{coin}_jpy"
                 gmo_symbol = self.symbol_mapping.get(symbol, symbol.upper().replace('_', ''))
                 
-                self.logger.debug(f"Searching for symbol: {gmo_symbol}")
-                
                 for position in positions:
                     if position.get("symbol") == gmo_symbol:
                         size = float(position.get("size", 0))
@@ -1052,12 +1033,9 @@ class CryptoTradingBot:
                             total_position_size += size
                         else:  # SELL
                             total_position_size -= size
-                        
-                        self.logger.debug(f"{gmo_symbol} {side}建玉: {size}")
                 
                 # 絶対値を返す
                 result = abs(total_position_size)
-                self.logger.debug(f"{coin}の建玉合計: {result}")
                 return result
             else:
                 error_messages = margin_response.get("messages", [])
@@ -1745,7 +1723,6 @@ class CryptoTradingBot:
                         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
                     }
                     
-                    self.logger.debug(f"APIデータを取得: {url}")
                     response = requests.get(url, headers=headers, timeout=15)  # タイムアウト増加
                     
                     # レート制限を遵守するための遅延
@@ -1759,7 +1736,6 @@ class CryptoTradingBot:
                             try:
                                 with open(cache_file, 'w') as f:
                                     json.dump(data, f)
-                                self.logger.debug(f"APIデータをキャッシュに保存: {cache_file}")
                                 break  # 成功したらループ終了
                             except Exception as e:
                                 self.logger.error(f"キャッシュ保存エラー: {e}")
@@ -1864,8 +1840,6 @@ class CryptoTradingBot:
             return df
         
         try:
-            # デバッグ情報を出力
-            self.logger.debug(f"特徴量計算: データサイズ={len(df)}, カラム={df.columns.tolist()}")
             
             # 必要なカラムが存在するか確認
             required_columns = ['open', 'high', 'low', 'close', 'volume', 'timestamp']
@@ -2127,7 +2101,6 @@ class CryptoTradingBot:
             # NaN値の処理 (すべての計算が終わった後)
             for col in df.columns:
                 if col not in ['timestamp', 'time', 'date'] and df[col].isna().any():
-                    self.logger.debug(f"{col}にNaN値があります。デフォルト値で埋めます。")
                     # カラムに応じて適切なデフォルト値を設定
                     if col == 'RSI':
                         df[col] = df[col].fillna(50)
@@ -2154,7 +2127,6 @@ class CryptoTradingBot:
                 'CCI': {'min': df['CCI'].min(), 'max': df['CCI'].max(), 'mean': df['CCI'].mean()} if 'CCI' in df.columns else {},
                 'データ行数': len(df)
             }
-            self.logger.debug(f"特徴量計算結果: {debug_info}")
             
             return df
 
@@ -4055,13 +4027,11 @@ class CryptoTradingBot:
                 check_date = current_date - timedelta(days=day_offset)
                 check_date_str = check_date.strftime('%Y%m%d')
                 
-                self.logger.debug(f"{symbol}の{check_date_str}の15分足データを確認中")
                 df_day = self.get_cached_data(symbol, '15min', check_date_str)
                 
                 if not df_day.empty:
                     # データの行数（ローソク足の数）を取得
                     day_candles = len(df_day)
-                    self.logger.debug(f"{check_date_str}の15分足データ: {day_candles}本")
                     
                     # 最新日のデータ結合方法
                     if day_offset == 0:
@@ -4101,7 +4071,6 @@ class CryptoTradingBot:
                 # 最新の48本（24時間分）だけを使用
                 if len(df_30min) > required_candles:
                     df_30min = df_30min.iloc[-required_candles:]
-                    self.logger.debug(f"{symbol}の15分足データを最新{required_candles}本に制限しました")
             else:
                 self.logger.warning(f"{symbol}の15分足データを取得できませんでした")
                 df_30min = pd.DataFrame()  # 空のデータフレーム
@@ -4117,7 +4086,6 @@ class CryptoTradingBot:
             # 時間足データの結合
             if hourly_candles:
                 df_hourly = pd.concat(hourly_candles).sort_values('timestamp')
-                self.logger.debug(f"{symbol}の時間足データ: {len(df_hourly)}本")
             else:
                 self.logger.warning(f"{symbol}の時間足データを取得できませんでした")
                 df_hourly = pd.DataFrame()  # 空のデータフレーム
@@ -4665,7 +4633,6 @@ class CryptoTradingBot:
                         if now - os.path.getmtime(file_path) > 5 * 24 * 3600:  # 5日以上前
                             try:
                                 os.remove(file_path)
-                                self.logger.debug(f"古いキャッシュファイルを削除: {f}")
                             except Exception as e:
                                 self.logger.error(f"キャッシュファイル削除エラー: {str(e)}")
             
