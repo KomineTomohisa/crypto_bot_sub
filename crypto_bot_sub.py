@@ -124,44 +124,9 @@ class GMOCoinAPI:
         
         return self._request("POST", path, data=data)
     
-    def get_margin_leverage(self, symbol):
-        """レバレッジ情報を取得"""
-        path = "/v1/account/margin"
-        response = self._request("GET", path)
-        
-        if response.get("status") == 0:
-            for item in response.get("data", []):
-                if item.get("symbol") == symbol:
-                    return item.get("leverage", 2)  # デフォルト2倍
-        return 2
-    
     def get_balance(self):
         """資産情報を取得"""
         path = "/v1/account/assets"
-        return self._request("GET", path)
-
-    def get_order_status(self, order_id):
-        """注文状態を取得"""
-        path = "/v1/orders"
-        params = {"orderId": order_id}
-        return self._request("GET", path, params=params)
-
-    def get_closed_orders(self, symbol, date=None):
-        """約定済み注文履歴を取得"""
-        path = "/v1/closedOrders"
-        params = {"symbol": symbol}
-        if date:
-            params["date"] = date
-        return self._request("GET", path, params=params)
-
-    def get_margin_info(self):
-        """信用取引の証拠金情報を取得"""
-        path = "/v1/account/margin"
-        return self._request("GET", path)
-    
-    def get_account_summary(self):
-        """総合的な口座情報を取得"""
-        path = "/v1/account/summary"
         return self._request("GET", path)
 
     def close_position(self, symbol, position_id, size, side, position_type="limit", price=None):
@@ -926,51 +891,6 @@ class CryptoTradingBot:
         if time.time() - self.last_backup_time > self.backup_interval:
             return self.create_backup()
         return False
-    
-    def api_call(self, url):
-        """API制限を考慮したリクエスト関数
-        
-        Parameters:
-        url (str): リクエストURL
-        
-        Returns:
-        dict: JSONレスポンス
-        """
-        # API制限を守るための遅延
-        elapsed = time.time() - self.last_api_call
-        if elapsed < self.rate_limit_delay:
-            sleep_time = self.rate_limit_delay - elapsed
-            time.sleep(sleep_time)
-            
-        # リクエスト実行
-        try:
-            self.logger.debug(f"APIリクエスト: {url}")
-            response = requests.get(url, timeout=10)  # タイムアウト設定を追加
-            self.last_api_call = time.time()
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            self.logger.error(f"APIリクエストエラー: {e}")
-            # リトライを数回試みる
-            for retry in range(3):
-                self.logger.info(f"リトライ中... ({retry+1}/3)")
-                time.sleep(2)  # リトライ間隔を長めに
-                try:
-                    response = requests.get(url, timeout=10)
-                    self.last_api_call = time.time()
-                    return response.json()
-                except Exception as retry_e:
-                    self.logger.error(f"リトライ失敗: {retry_e}")
-            
-            # 全てのリトライが失敗した場合
-            return {'success': 0, 'data': {'code': -1}}
-        except ValueError as e:
-            # JSON解析エラー
-            self.logger.error(f"JSONパースエラー: {e}")
-            return {'success': 0, 'data': {'code': -2}}
-        except Exception as e:
-            # その他の予期しないエラー
-            self.logger.error(f"APIリクエスト未知のエラー: {e}")
-            return {'success': 0, 'data': {'code': -3}}
         
     def verify_positions(self):
         """GMOコインの信用取引建玉を使用してポジションを検証する"""
@@ -1817,118 +1737,6 @@ class CryptoTradingBot:
         self.logger.error(f"すべての試行が失敗しました: {symbol} {order_type} {size}")
         return {'success': False, 'error': "最大試行回数を超えました", 'executed_size': 0}
 
-    def find_valid_date(self, symbol, timeframe, max_days_back=5):
-        """有効なデータが存在する日付を検索し、複数日のデータを組み合わせて必要なデータポイント数を確保する
-        
-        Parameters:
-        symbol (str): 通貨ペア
-        timeframe (str): 時間枠
-        max_days_back (int): 何日前まで検索するか
-        
-        Returns:
-        tuple: (str, list) 最新の有効な日付文字列（YYYYMMDD）とデータを補完するための追加日付リスト、両方Noneの場合はデータ不足
-        """
-        # 必要なデータポイント数を取得
-        required_data_points = self.get_required_data_points(timeframe)
-        self.logger.info(f"{symbol} {timeframe}の必要データポイント数: {required_data_points}")
-        
-        # 結果格納用変数の初期化
-        valid_dates = []
-        total_data_points = 0
-        
-        # キャッシュキー
-        cache_key = f"{symbol}_{timeframe}"
-        
-        # キャッシュされた情報があるか確認
-        if cache_key in self.valid_dates:
-            last_valid_date = self.valid_dates[cache_key]
-            last_check_time = self.valid_dates.get(f"{cache_key}_time", 0)
-            
-            # 1時間以内のキャッシュなら再利用
-            if time.time() - last_check_time < 3600:
-                # キャッシュされたデータを取得
-                cached_data = self.get_cached_data(symbol, timeframe, last_valid_date)
-                
-                if not cached_data.empty:
-                    total_data_points += len(cached_data)
-                    valid_dates.append(last_valid_date)
-                    
-                    # キャッシュだけで必要データポイント数を満たしている場合
-                    if total_data_points >= required_data_points:
-                        self.logger.info(f"キャッシュされた有効な日付とデータを使用: {last_valid_date}")
-                        return last_valid_date, []
-                    
-                    self.logger.info(f"キャッシュされたデータ({last_valid_date})のポイント数: {len(cached_data)}")
-        
-        # 現在日から過去に遡って必要なデータポイント数を確保する
-        dates_checked = []
-        for days_back in range(max_days_back):
-            test_date = (datetime.now() - timedelta(days=days_back)).strftime('%Y%m%d')
-            
-            # すでにチェック済みの日付はスキップ
-            if test_date in dates_checked or test_date in valid_dates:
-                continue
-                
-            dates_checked.append(test_date)
-            
-            # APIからデータを取得
-            df = self.get_cached_data(symbol, timeframe, test_date)
-            
-            if not df.empty:
-                points_in_date = 24
-                self.logger.info(f"{test_date}のデータポイント数: {points_in_date}")
-                
-                # 日付とデータポイント数を記録
-                valid_dates.append(test_date)
-                total_data_points += points_in_date
-                
-                # データポイント数が十分であれば終了
-                if total_data_points >= required_data_points:
-                    # 最新の有効な日付をキャッシュに保存
-                    newest_date = valid_dates[0]
-                    self.valid_dates[cache_key] = newest_date
-                    self.valid_dates[f"{cache_key}_time"] = time.time()
-                    
-                    # 最新日付のみを返す
-                    self.logger.info(f"{symbol} {timeframe}の有効な日付を発見: {newest_date}")
-                    
-                    # 重要な変更点：もはや追加日付は返さない
-                    return newest_date
-            else:
-                self.logger.info(f"{test_date}のデータが空です")
-            
-            # APIレート制限を考慮して少し待機
-            time.sleep(0.5)
-        
-        # 少なくとも1つの有効な日付が見つかった場合
-        if valid_dates:
-            newest_date = valid_dates[0]
-            self.valid_dates[cache_key] = newest_date
-            self.valid_dates[f"{cache_key}_time"] = time.time()
-            
-            # 最新日付と追加日付リストを返す（データポイント数は不足しているが、部分的なデータとして使用）
-            additional_dates = valid_dates[1:] if len(valid_dates) > 1 else []
-            self.logger.info(f"{symbol} {timeframe}の日付を発見しましたが、データが不足しています。合計: {total_data_points}/{required_data_points}")
-            self.logger.info(f"最新日付: {newest_date}, 追加日付: {additional_dates}")
-            return newest_date, additional_dates
-        
-        # 有効な日付が見つからなかった
-        self.logger.warning(f"{symbol} {timeframe}の有効な日付が見つかりませんでした")
-        return None, None
-
-    def get_required_data_points(self, timeframe):
-        """時間枠に基づいて必要なデータポイント数を返す"""
-        if timeframe == '5min':
-            return 24  # 2時間分 (5分足 * 12 * 24時間)
-        elif timeframe == '30min':
-            return 2 * 24  # 1日分 (1時間足 * 24時間 * 1日)
-        elif timeframe == '1hour':
-            return 24  # 1日分 (1時間足 * 24時間 * 1日)
-        elif timeframe == '1day':
-            return 7  # 1週間分 (日足 * 7日)
-        else:
-            return 100  # デフォルト (大半の時間枠で十分な数)
-
     def get_cached_data(self, symbol, timeframe, date_str=None, fallback_days=3):
         """キャッシュからデータを取得するか、必要に応じてAPIから取得（改良版）
         
@@ -1946,12 +1754,6 @@ class CryptoTradingBot:
             # 直接今日の日付を使用してみる
             date_str = datetime.now().strftime('%Y%m%d')
             self.logger.info(f"15分足データの日付として本日の日付 {date_str} を試行")
-        # 日付が指定されていない場合は有効な日付を検索（検索範囲拡大）
-        if date_str is None:
-            date_str = self.find_valid_date(symbol, timeframe, max_days_back=7)  # 5→7日に拡大
-            if date_str is None:
-                self.logger.warning(f"{symbol} {timeframe}の有効な日付が見つかりませんでした")
-                return pd.DataFrame()
                 
         cache_file = os.path.join(self.cache_dir, f"{symbol}_{timeframe}_{date_str}.json")
         
@@ -5246,8 +5048,6 @@ class CryptoTradingBot:
             if atr_series.empty:
                 raise ValueError("ATRデータが存在しません。")
             atr = atr_series.iloc[-2]
-            atr_prev = atr_series.iloc[-4]
-            atr_change_rate = (atr - atr_prev) / atr_prev if atr_prev != 0 else 0
 
             # 最新ADXの取得
             adx_series = df_5min['ADX'].dropna()
@@ -5270,25 +5070,34 @@ class CryptoTradingBot:
 
             # 通貨ペア別ATR倍率設定
             atr_thresholds = {
-                'ltc_jpy': {'low': 60, 'high': 75, 'low_mult': 0.88, 'high_mult_long': 1.10, 'high_mult_short': 1.10},
-                'ada_jpy': {'low': 0.50, 'high': 0.57, 'low_mult': 0.88, 'high_mult_long': 1.10, 'high_mult_short': 1.07},
-                'xrp_jpy': {'low': 1.5, 'high': 2.1, 'low_mult': 0.95, 'high_mult_long': 1.00, 'high_mult_short': 0.90},
-                'eth_jpy': {'low': 2000, 'high': 2500, 'low_mult': 0.92, 'high_mult_long': 1.00, 'high_mult_short': 1.10},
-                'sol_jpy': {'low': 100, 'high': 140, 'low_mult': 0.88, 'high_mult_long': 1.10, 'high_mult_short': 1.03},
-                'doge_jpy': {'low': 0.20, 'high': 0.24, 'low_mult': 0.93, 'high_mult_long': 0.95, 'high_mult_short': 1.00},
-                'bcc_jpy': {'low': 310, 'high': 350, 'low_mult': 0.88, 'high_mult_long': 1.10, 'high_mult_short': 1.10}
+                'ltc_jpy': {'low': 60, 'high': 75, 'low_mult': 0.90, 'high_mult_long': 1.10, 'high_mult_short': 1.10},
+                'ada_jpy': {'low': 0.50, 'high': 0.57, 'low_mult': 0.90, 'high_mult_long': 1.10, 'high_mult_short': 1.07},
+                'xrp_jpy': {'low': 1.5, 'high': 2.1, 'low_mult': 1.00, 'high_mult_long': 1.00, 'high_mult_short': 0.90},
+                'eth_jpy': {'low': 2000, 'high': 2500, 'low_mult': 0.95, 'high_mult_long': 1.00, 'high_mult_short': 1.10},
+                'sol_jpy': {'low': 100, 'high': 140, 'low_mult': 0.95, 'high_mult_long': 1.10, 'high_mult_short': 1.03},
+                'doge_jpy': {'low': 0.20, 'high': 0.24, 'low_mult': 0.95, 'high_mult_long': 0.95, 'high_mult_short': 1.00},
+                'bcc_jpy': {'low': 310, 'high': 350, 'low_mult': 0.90, 'high_mult_long': 1.15, 'high_mult_short': 1.10}
             }
             default_setting = {'low': 0.5, 'high': 2.0, 'low_mult': 0.9, 'high_mult_long': 1.1, 'high_mult_short': 1.1}
             config = atr_thresholds.get(symbol, default_setting)
 
+            # adx_thresholds = {
+            #     'ltc_jpy':   {'low': 20, 'high': 28, 'low_mult': 0.85, 'high_mult': 1.20},
+            #     'ada_jpy':   {'low': 22, 'high': 48, 'low_mult': 0.85, 'high_mult': 1.15},
+            #     'xrp_jpy':   {'low': 20, 'high': 30, 'low_mult': 0.90, 'high_mult': 1.15},
+            #     'eth_jpy':   {'low': 22, 'high': 30, 'low_mult': 0.85, 'high_mult': 1.15},
+            #     'sol_jpy':   {'low': 17, 'high': 32, 'low_mult': 0.85, 'high_mult': 1.15},
+            #     'doge_jpy':  {'low': 20, 'high': 35, 'low_mult': 0.90, 'high_mult': 0.95},
+            #     'bcc_jpy':   {'low': 22, 'high': 32, 'low_mult': 0.90, 'high_mult': 1.10}
+            # }
             adx_thresholds = {
-                'ltc_jpy':   {'low': 20, 'high': 50, 'low_mult': 0.83, 'high_mult': 1.15},
-                'ada_jpy':   {'low': 22, 'high': 48, 'low_mult': 0.83, 'high_mult': 1.15},
+                'ltc_jpy':   {'low': 20, 'high': 50, 'low_mult': 0.85, 'high_mult': 1.15},
+                'ada_jpy':   {'low': 22, 'high': 48, 'low_mult': 0.85, 'high_mult': 1.15},
                 'xrp_jpy':   {'low': 20, 'high': 50, 'low_mult': 0.80, 'high_mult': 1.20},
                 'eth_jpy':   {'low': 20, 'high': 50, 'low_mult': 0.85, 'high_mult': 1.15},
                 'sol_jpy':   {'low': 20, 'high': 50, 'low_mult': 0.85, 'high_mult': 1.15},
                 'doge_jpy':  {'low': 20, 'high': 50, 'low_mult': 0.80, 'high_mult': 1.20},
-                'bcc_jpy':   {'low': 22, 'high': 32, 'low_mult': 0.83, 'high_mult': 1.15}
+                'bcc_jpy':   {'low': 22, 'high': 32, 'low_mult': 0.85, 'high_mult': 1.15}
             }
             default_adx_setting = {'low': 20, 'high': 50, 'low_mult': 0.90, 'high_mult': 1.10}
             adx_config = adx_thresholds.get(symbol, default_adx_setting)
@@ -5315,7 +5124,6 @@ class CryptoTradingBot:
                 elif adx > adx_config['high']:
                     tp_pct *= adx_config['high_mult']
                     sl_pct *= adx_config['high_mult']
-
 
             # トレンド方向と一致しているかを+DI / -DIで判定
             if plus_di is not None and minus_di is not None:
