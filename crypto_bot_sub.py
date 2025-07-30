@@ -1155,88 +1155,6 @@ class CryptoTradingBot:
             self.logger.error(f"詳細建玉情報取得エラー: {str(e)}", exc_info=True)
             return None
 
-    def close_margin_position(self, symbol, position_id=None):
-        """GMOコインの信用取引ポジションを決済"""
-        try:
-            if not self.gmo_api:
-                self.logger.error("GMOコインAPIが初期化されていません")
-                return {'success': False, 'error': "GMO API not initialized"}
-            
-            # 通貨ペアをGMO形式に変換
-            gmo_symbol = self.symbol_mapping.get(symbol, symbol.upper().replace('_', ''))
-            
-            # ポジションIDが指定されていない場合は保存されているIDを使用
-            if position_id is None:
-                position_id = self.position_ids.get(symbol)
-            
-            if position_id is None:
-                self.logger.error(f"{symbol}のポジションIDが見つかりません")
-                return {'success': False, 'error': "Position ID not found"}
-
-            # 現在のポジション情報を取得
-            positions_response = self.gmo_api.get_margin_positions(gmo_symbol)
-            
-            if positions_response.get("status") != 0:
-                error_msg = positions_response.get("messages", [{}])[0].get("message_string", "不明なエラー")
-                self.logger.error(f"ポジション情報取得失敗: {error_msg}")
-                return {'success': False, 'error': error_msg}
-            
-            # データ形式を確認
-            positions_data = positions_response.get("data", {})
-            
-            # データが辞書の場合はlistを取得、リストの場合はそのまま使用
-            if isinstance(positions_data, dict):
-                positions = positions_data.get("list", [])
-            else:
-                positions = positions_data
-            
-            # ポジションを探す
-            target_position = None
-            positions_data = positions_response.get("data", {})
-            positions = positions_data.get("list", []) if isinstance(positions_data, dict) else positions_data
-            self.logger.warning(f"positions: {positions}")
-            for pos in positions:
-                if str(pos.get("positionId")) == str(position_id):
-                    target_position = pos
-                    break
-            
-            if not target_position:
-                self.logger.warning(f"ポジションID {position_id} が見つかりません")
-                return {'success': False, 'error': "Position not found"}
-            
-            # 決済方向の判定
-            side = "SELL" if target_position.get("side") == "BUY" else "BUY"
-            size = target_position.get("size", 0)
-            
-            self.logger.info(f"GMOコイン信用取引決済: {gmo_symbol} {side} {size} (ポジションID: {position_id})")
-            
-            # 決済注文実行（成行注文）
-            response = self.gmo_api.close_position(
-                symbol=gmo_symbol,
-                position_id=int(position_id),
-                size=str(size),
-                side=side,
-                position_type="MARKET"
-            )
-            
-            if response.get("status") == 0:
-                order_id = str(response.get("data"))
-                self.logger.info(f"決済注文成功: 注文ID={order_id}")
-                
-                # ポジションIDをクリア
-                self.position_ids[symbol] = None
-                
-                return {'success': True, 'order_id': order_id}
-            else:
-                error_messages = response.get("messages", [])
-                error_msg = error_messages[0].get("message_string", "Unknown error") if error_messages else "Unknown error"
-                self.logger.error(f"決済注文エラー: {error_msg}")
-                return {'success': False, 'error': error_msg}
-                
-        except Exception as e:
-            self.logger.error(f"ポジション決済エラー: {str(e)}", exc_info=True)
-            return {'success': False, 'error': str(e)}
-
     def adjust_order_size(self, symbol, base_size):
         """取引所の最小注文量を考慮して注文サイズを調整する
         
@@ -5070,34 +4988,24 @@ class CryptoTradingBot:
 
             # 通貨ペア別ATR倍率設定
             atr_thresholds = {
-                'ltc_jpy': {'low': 60, 'high': 75, 'low_mult': 0.90, 'high_mult_long': 1.10, 'high_mult_short': 1.10},
-                'ada_jpy': {'low': 0.50, 'high': 0.57, 'low_mult': 0.90, 'high_mult_long': 1.10, 'high_mult_short': 1.07},
-                'xrp_jpy': {'low': 1.5, 'high': 2.1, 'low_mult': 1.00, 'high_mult_long': 1.00, 'high_mult_short': 0.90},
-                'eth_jpy': {'low': 2000, 'high': 2500, 'low_mult': 0.95, 'high_mult_long': 1.00, 'high_mult_short': 1.10},
-                'sol_jpy': {'low': 100, 'high': 140, 'low_mult': 0.95, 'high_mult_long': 1.10, 'high_mult_short': 1.03},
-                'doge_jpy': {'low': 0.20, 'high': 0.24, 'low_mult': 0.95, 'high_mult_long': 0.95, 'high_mult_short': 1.00},
-                'bcc_jpy': {'low': 310, 'high': 350, 'low_mult': 0.90, 'high_mult_long': 1.15, 'high_mult_short': 1.10}
+                'ltc_jpy': {'low': 60, 'high': 75, 'low_mult': 0.88, 'high_mult_long': 1.10, 'high_mult_short': 1.10},
+                'ada_jpy': {'low': 0.50, 'high': 0.57, 'low_mult': 0.88, 'high_mult_long': 1.10, 'high_mult_short': 1.07},
+                'xrp_jpy': {'low': 1.5, 'high': 2.1, 'low_mult': 0.95, 'high_mult_long': 1.00, 'high_mult_short': 0.90},
+                'eth_jpy': {'low': 2000, 'high': 2500, 'low_mult': 0.92, 'high_mult_long': 1.00, 'high_mult_short': 1.10},
+                'sol_jpy': {'low': 100, 'high': 140, 'low_mult': 0.88, 'high_mult_long': 1.10, 'high_mult_short': 1.03},
+                'doge_jpy': {'low': 0.20, 'high': 0.24, 'low_mult': 0.93, 'high_mult_long': 0.95, 'high_mult_short': 1.00},
+                'bcc_jpy': {'low': 310, 'high': 350, 'low_mult': 0.88, 'high_mult_long': 1.10, 'high_mult_short': 1.10}
             }
             default_setting = {'low': 0.5, 'high': 2.0, 'low_mult': 0.9, 'high_mult_long': 1.1, 'high_mult_short': 1.1}
             config = atr_thresholds.get(symbol, default_setting)
-
-            # adx_thresholds = {
-            #     'ltc_jpy':   {'low': 20, 'high': 28, 'low_mult': 0.85, 'high_mult': 1.20},
-            #     'ada_jpy':   {'low': 22, 'high': 48, 'low_mult': 0.85, 'high_mult': 1.15},
-            #     'xrp_jpy':   {'low': 20, 'high': 30, 'low_mult': 0.90, 'high_mult': 1.15},
-            #     'eth_jpy':   {'low': 22, 'high': 30, 'low_mult': 0.85, 'high_mult': 1.15},
-            #     'sol_jpy':   {'low': 17, 'high': 32, 'low_mult': 0.85, 'high_mult': 1.15},
-            #     'doge_jpy':  {'low': 20, 'high': 35, 'low_mult': 0.90, 'high_mult': 0.95},
-            #     'bcc_jpy':   {'low': 22, 'high': 32, 'low_mult': 0.90, 'high_mult': 1.10}
-            # }
             adx_thresholds = {
-                'ltc_jpy':   {'low': 20, 'high': 50, 'low_mult': 0.85, 'high_mult': 1.15},
-                'ada_jpy':   {'low': 22, 'high': 48, 'low_mult': 0.85, 'high_mult': 1.15},
+                'ltc_jpy':   {'low': 20, 'high': 50, 'low_mult': 0.83, 'high_mult': 1.15},
+                'ada_jpy':   {'low': 22, 'high': 48, 'low_mult': 0.83, 'high_mult': 1.15},
                 'xrp_jpy':   {'low': 20, 'high': 50, 'low_mult': 0.80, 'high_mult': 1.20},
                 'eth_jpy':   {'low': 20, 'high': 50, 'low_mult': 0.85, 'high_mult': 1.15},
                 'sol_jpy':   {'low': 20, 'high': 50, 'low_mult': 0.85, 'high_mult': 1.15},
                 'doge_jpy':  {'low': 20, 'high': 50, 'low_mult': 0.80, 'high_mult': 1.20},
-                'bcc_jpy':   {'low': 22, 'high': 32, 'low_mult': 0.85, 'high_mult': 1.15}
+                'bcc_jpy':   {'low': 22, 'high': 32, 'low_mult': 0.83, 'high_mult': 1.15}
             }
             default_adx_setting = {'low': 20, 'high': 50, 'low_mult': 0.90, 'high_mult': 1.10}
             adx_config = adx_thresholds.get(symbol, default_adx_setting)
