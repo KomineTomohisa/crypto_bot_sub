@@ -2474,8 +2474,8 @@ class CryptoTradingBot:
         df_5min['sell_signal'] = df_5min['sell_score_scaled'] >= sell_signal_threshold
 
         # if symbol == 'bcc_jpy':
-            # df_5min.loc[df_5min['ADX'] < 20, 'buy_signal'] = False
-            # df_5min.loc[df_5min['ADX'] < 20, 'sell_signal'] = False
+        #     df_5min.loc[df_5min['ADX'] < 22, 'buy_signal'] = False
+        #     df_5min.loc[df_5min['ADX'] < 22, 'sell_signal'] = False
 
             # df_5min.loc[df_5min['macd_score_long'] == 0, 'buy_signal'] = False
             # df_5min.loc[df_5min['macd_score_short'] == 0, 'sell_signal'] = False
@@ -4961,7 +4961,7 @@ class CryptoTradingBot:
                 'eth_jpy': {'low': 2000, 'high': 2500, 'low_mult': 0.92, 'high_mult_long': 1.00, 'high_mult_short': 1.10},
                 'sol_jpy': {'low': 100, 'high': 140, 'low_mult': 0.88, 'high_mult_long': 1.10, 'high_mult_short': 1.03},
                 'doge_jpy': {'low': 0.20, 'high': 0.24, 'low_mult': 0.93, 'high_mult_long': 0.95, 'high_mult_short': 1.00},
-                'bcc_jpy': {'low': 310, 'high': 350, 'low_mult': 0.88, 'high_mult_long': 1.10, 'high_mult_short': 1.10}
+                'bcc_jpy': {'low': 310, 'high': 350, 'low_mult': 0.88, 'high_mult_long': 1.08, 'high_mult_short': 1.08}
             }
             default_setting = {'low': 0.5, 'high': 2.0, 'low_mult': 0.9, 'high_mult_long': 1.1, 'high_mult_short': 1.1}
             config = atr_thresholds.get(symbol, default_setting)
@@ -4999,6 +4999,24 @@ class CryptoTradingBot:
                 elif adx > adx_config['high']:
                     tp_pct *= adx_config['high_mult']
                     sl_pct *= adx_config['high_mult']
+
+            # --- ADX減衰チェック ---
+            adx_prev = df_5min['ADX'].dropna().iloc[-3] if len(df_5min['ADX'].dropna()) >= 3 else adx
+            adx_decreasing = (adx is not None and adx_prev is not None and adx < adx_prev)
+
+            # --- DIクロスチェック ---
+            di_cross_signal = False
+            if plus_di is not None and minus_di is not None:
+                if position_type == 'long' and plus_di < minus_di:
+                    di_cross_signal = True
+                elif position_type == 'short' and minus_di < plus_di:
+                    di_cross_signal = True
+
+            # --- 早期警戒シグナルでの補正 ---
+            if adx_decreasing or di_cross_signal:
+                tp_pct *= 0.8    # 利確幅を縮小（早期確定）
+                sl_pct *= 0.9    # 損切りを少し手前に
+
 
             # トレンド方向と一致しているかを+DI / -DIで判定
             if plus_di is not None and minus_di is not None:
