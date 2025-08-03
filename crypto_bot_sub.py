@@ -342,7 +342,7 @@ class CryptoTradingBot:
             self.logger.error(f"GMOコイン総資産額取得エラー: {e}", exc_info=True)
             return 0.0
 
-    def __init__(self, initial_capital=100000, test_mode=True):
+    def __init__(self, initial_capital=200000, test_mode=True):
         """
         トレーディングボットの初期化
         
@@ -5090,7 +5090,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='仮想通貨トレーディングボット（ショート対応・改良版）')
     parser.add_argument('mode', choices=['backtest', 'live'], help='実行モード (backtest または live)')
     parser.add_argument('--days', type=int, default=60, help='バックテスト日数 (デフォルト: 60)')
-    parser.add_argument('--capital', type=int, default=100000, help='初期資金 (デフォルト: 100000円)')
+    parser.add_argument('--capital', type=int, default=200000, help='初期資金 (デフォルト: 200000円)')
     parser.add_argument('--test', action='store_true', help='テストモード（取引額を半分にする）')
     parser.add_argument('--notify', action='store_true', help='通知を有効にする')
     parser.add_argument('--debug', action='store_true', help='デバッグログを有効にする')
