@@ -2936,6 +2936,8 @@ class CryptoTradingBot:
                                     'entry_time': entry_time,
                                     'entry_rsi': entry_rsi,
                                     'entry_cci': entry_cci,
+                                    'entry_atr': row.get('ATR', 0),
+                                    'entry_adx': row.get('ADX', 0),
                                     'buy_score': row.get('buy_score_scaled', 0),  # 修正: buy_score_scaled を使用
                                     'sell_score': row.get('sell_score_scaled', 0),  # 修正: sell_score_scaled を使用
                                     'exit_price': exit_price,
@@ -3027,6 +3029,8 @@ class CryptoTradingBot:
                                     'entry_time': entry_time,
                                     'entry_rsi': entry_rsi,
                                     'entry_cci': entry_cci,
+                                    'entry_atr': row.get('ATR', 0),
+                                    'entry_adx': row.get('ADX', 0),
                                     'buy_score': row.get('buy_score_scaled', 0),  # 修正: buy_score_scaled を使用
                                     'sell_score': row.get('sell_score_scaled', 0),  # 修正: sell_score_scaled を使用
                                     'exit_price': exit_price,
@@ -3225,6 +3229,7 @@ class CryptoTradingBot:
 
         desired_columns = [
             'symbol', 'type', 'entry_price', 'entry_time', 'entry_rsi', 'entry_cci', 
+            'entry_atr', 'entry_adx',
             'ema_deviation',
             'exit_price', 'exit_time', 'size', 
             'profit', 'profit_pct', 'exit_reason', 'holding_hours', 
@@ -4210,6 +4215,8 @@ class CryptoTradingBot:
 
             # スコア値を保存
             self.entry_scores[symbol] = {
+                'entry_atr': entry_atr,
+                'entry_adx': entry_adx,
                 'rsi_score_long': signal_data.get('rsi_score_long', 0),
                 'rsi_score_short': signal_data.get('rsi_score_short', 0),
                 'cci_score_long': signal_data.get('cci_score_long', 0),
@@ -4241,6 +4248,8 @@ class CryptoTradingBot:
                 'time': datetime.now(),
                 'rsi': entry_rsi,
                 'cci': entry_cci,
+                'entry_atr': entry_atr,
+                'entry_adx': entry_adx,
                 'ema_deviation': ema_deviation,
                 'sentiment': entry_sentiment,
                 'buy_score': buy_score,  # これで buy_score_scaled が記録される
@@ -4524,6 +4533,8 @@ class CryptoTradingBot:
                     'type': position,
                     'entry_price': entry_price,
                     'entry_time': entry_time,
+                    'entry_atr': saved_scores.get('entry_atr', 0),  # ← この行を追加
+                    'entry_adx': saved_scores.get('entry_adx', 0),  
                     'exit_price': current_price,
                     'exit_time': datetime.now(),
                     'size': entry_size,
