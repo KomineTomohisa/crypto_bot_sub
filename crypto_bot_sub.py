@@ -383,9 +383,9 @@ class CryptoTradingBot:
         
         # 取引サイズ設定
         if self.test_mode:
-            self.TRADE_SIZE = 20000  # テストモード
+            self.TRADE_SIZE = 40000  # テストモード
         else:
-            self.TRADE_SIZE = 20000  # 通常取引額
+            self.TRADE_SIZE = 40000  # 通常取引額
             
         # API呼び出し制限管理
         self.last_api_call = time.time() - 1
@@ -2196,7 +2196,7 @@ class CryptoTradingBot:
             'ltc_jpy':  {'buy': 0.55, 'sell': 0.55},
             'ada_jpy':  {'buy': 0.45, 'sell': 0.45},
             'eth_jpy':  {'buy': 0.51, 'sell': 0.51},
-            'bcc_jpy':  {'buy': 0.51, 'sell': 0.51},
+            'bcc_jpy':  {'buy': 0.55, 'sell': 0.55},
         }
 
         # デフォルト閾値（上記に含まれていない通貨ペア用）
