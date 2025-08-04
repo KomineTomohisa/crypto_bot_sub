@@ -196,10 +196,12 @@ class CryptoTradingBot:
                 df['ADX'] = np.random.uniform(15, 40, len(df))  # ダミー値
             
             # buy_score, sell_scoreがない場合はダミー値を設定
+            # buy_score, sell_scoreが存在しない場合は NaN
             if 'buy_score' not in df.columns:
-                df['buy_score'] = df.get('buy_score_scaled', np.random.uniform(0, 1, len(df)))
+                df['buy_score'] = np.nan
             if 'sell_score' not in df.columns:
-                df['sell_score'] = df.get('sell_score_scaled', np.random.uniform(0, 1, len(df)))
+                df['sell_score'] = np.nan
+
             
             return df
             
@@ -2517,26 +2519,19 @@ class CryptoTradingBot:
             df_5min.loc[df_5min['adx_score_short'] < 0.1, 'sell_signal'] = False
 
 
-        #5分足データのMAフィルターを適用（修正：各時点の1つ前のレコードのMA25を使用）
-        if 'EMA_long' in df_5min.columns and len(df_5min) > 1:  # 少なくとも2レコード必要
-            # 最初のレコードはスキップし、2レコード目から処理
-            for i in range(1, len(df_5min)):
-                # インデックスではなく、位置（整数）でアクセス
-                # 現在の行と1つ前の行
-                current_row = df_5min.iloc[i]
-                previous_row = df_5min.iloc[i-1]
-                
-                # 1つ前のレコードのMA25と価格を取得
-                prev_5min_MA25 = previous_row['EMA_long']
-                prev_5min_price = previous_row['close']
-                
-                # 1つ前の価格がMA25以下の場合は現在の買いシグナルを無効化
-                if prev_5min_price <= prev_5min_MA25:
-                    df_5min.iloc[i, df_5min.columns.get_loc('buy_signal')] = False
-                
-                # 1つ前の価格がMA25以上の場合は現在の売りシグナルを無効化
-                if prev_5min_price >= prev_5min_MA25:
-                    df_5min.iloc[i, df_5min.columns.get_loc('sell_signal')] = False
+        if 'EMA_long' in df_5min.columns and len(df_5min) > 1:
+            prev_price = df_5min['close'].shift(1)
+            prev_ma = df_5min['EMA_long'].shift(1)
+            
+            window = 2  # 過去3本で判定（調整可）
+
+            # 過去window本すべてで価格 <= EMAなら買いシグナル無効化
+            buy_mask = (prev_price <= prev_ma).rolling(window).apply(lambda x: x.all(), raw=True).astype(bool)
+            df_5min.loc[buy_mask, 'buy_signal'] = False
+
+            # 過去window本すべてで価格 >= EMAなら売りシグナル無効化
+            sell_mask = (prev_price >= prev_ma).rolling(window).apply(lambda x: x.all(), raw=True).astype(bool)
+            df_5min.loc[sell_mask, 'sell_signal'] = False
 
         return df_5min
 
@@ -2837,9 +2832,6 @@ class CryptoTradingBot:
                                 
                                 # 買いシグナルが現在と前の足で両方Trueの場合のみエントリー
                                 if row['buy_signal'] and previous_row['buy_signal']:
-                                    # buy_scoreとsell_scoreを取得
-                                    buy_score_value = row.get('buy_score', 0)
-                                    sell_score_value = row.get('sell_score', 0)
 
                                     # ここで取引サイズを計算
                                     order_size = self.TRADE_SIZE / price
@@ -2865,9 +2857,6 @@ class CryptoTradingBot:
 
                                 # 売りシグナルが現在と前の足で両方Trueの場合のみエントリー
                                 elif row['sell_signal'] and previous_row['sell_signal']:
-                                    # buy_scoreとsell_scoreを取得
-                                    buy_score_value = row.get('buy_score', 0)
-                                    sell_score_value = row.get('sell_score', 0)
                                     
                                     # ここで取引サイズを計算
                                     order_size = self.TRADE_SIZE / price
