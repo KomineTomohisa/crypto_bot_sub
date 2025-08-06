@@ -78,11 +78,42 @@ class ExcelReportGenerator:
             df_symbol = df[df["symbol"] == symbol]
             for col in all_score_cols:
                 if col in df_symbol.columns:
-                    sub_df = df_symbol[[col, "profit"]].dropna()
-                    try:
-                        bins = pd.qcut(sub_df[col], q=10, duplicates='drop')
-                    except ValueError:
+                    # ★修正: スコア名からポジション種別を判定★
+                    if col.endswith('_long'):
+                        # ロング用スコアの場合、ロングポジションのみを対象
+                        position_filter = df_symbol['type'] == 'long'
+                        position_label = 'long'
+                    elif col.endswith('_short'):
+                        # ショート用スコアの場合、ショートポジションのみを対象
+                        position_filter = df_symbol['type'] == 'short'
+                        position_label = 'short'
+                    else:
+                        # その他のスコア（buy_score, sell_scoreなど）は全ポジション対象
+                        position_filter = pd.Series([True] * len(df_symbol))
+                        position_label = 'all'
+                    
+                    # フィルタリングされたデータを取得
+                    filtered_df = df_symbol[position_filter]
+                    sub_df = filtered_df[[col, "profit"]].dropna()
+                    
+                    if len(sub_df) < 10:  # 最低限のデータ数をチェック
                         continue
+                    
+                    # ★修正: 10分割から20分割に変更★
+                    try:
+                        bins = pd.qcut(sub_df[col], q=30, duplicates='drop')
+                    except ValueError:
+                        # 20分割でユニークな値が足りない場合は、データの長さに応じて調整
+                        unique_values = sub_df[col].nunique()
+                        if unique_values < 20:
+                            # ユニークな値が20未満の場合は、可能な最大分割数を使用
+                            try:
+                                bins = pd.qcut(sub_df[col], q=min(unique_values, 10), duplicates='drop')
+                            except ValueError:
+                                continue
+                        else:
+                            continue
+                    
                     grouped = sub_df.groupby(bins).agg(
                         avg_score=(col, "mean"),
                         avg_profit=("profit", "mean"),
@@ -91,6 +122,7 @@ class ExcelReportGenerator:
                     ).reset_index()
                     grouped.insert(0, "symbol", symbol)
                     grouped.insert(1, "score_feature", col)
+                    grouped.insert(2, "position_type", position_label)  # ★追加: ポジション種別を明示★
                     summary_data.append(grouped)
 
         if summary_data:
@@ -103,8 +135,8 @@ class ExcelReportGenerator:
 
             for i, row in enumerate(dataframe_to_rows(final_df, index=False, header=True)):
                 clean_row = [safe_convert(cell) for cell in row]
-                if len(clean_row) >= 7:
-                    rearranged = clean_row[:2] + clean_row[3:7] + [clean_row[2]] + clean_row[7:]
+                if len(clean_row) >= 8:  # ★修正: position_type列が追加されたので8列以上に変更★
+                    rearranged = clean_row[:3] + clean_row[4:8] + [clean_row[3]] + clean_row[8:]
                     summary_sheet.append(rearranged)
                 else:
                     summary_sheet.append(clean_row)
@@ -112,17 +144,17 @@ class ExcelReportGenerator:
             # 条件付き書式の追加（勝率・平均利益列）
             from openpyxl.formatting.rule import ColorScaleRule
 
-            # 勝率 → D列（=列番号4）
+            # 勝率 → E列（position_type列が追加されたため列番号が変更）
             rule_win = ColorScaleRule(start_type='percentile', start_value=0, start_color='FFAAAA',
                                       mid_type='percentile', mid_value=50, mid_color='FFFFAA',
                                       end_type='percentile', end_value=100, end_color='AAFFAA')
-            summary_sheet.conditional_formatting.add(f'D2:D{summary_sheet.max_row}', rule_win)
+            summary_sheet.conditional_formatting.add(f'E2:E{summary_sheet.max_row}', rule_win)
 
-            # 平均利益 → E列（=列番号5）
+            # 平均利益 → F列（position_type列が追加されたため列番号が変更）
             rule_profit = ColorScaleRule(start_type='percentile', start_value=0, start_color='FFAAAA',
                                          mid_type='percentile', mid_value=50, mid_color='FFFFAA',
                                          end_type='percentile', end_value=100, end_color='AAFFAA')
-            summary_sheet.conditional_formatting.add(f'E2:E{summary_sheet.max_row}', rule_profit)
+            summary_sheet.conditional_formatting.add(f'F2:F{summary_sheet.max_row}', rule_profit)
 
 
     def add_score_analysis_sheet(self):
@@ -143,33 +175,71 @@ class ExcelReportGenerator:
             for symbol in df["symbol"].dropna().unique():
                 df_symbol = df[df["symbol"] == symbol]
                 for score_col in score_cols:
-                    valid_data = df_symbol[df_symbol[score_col].notna()].copy()
-                    if len(valid_data) == 0:
+                    # ★修正: buy_scoreはlongポジション、sell_scoreはshortポジション用★
+                    if score_col == "buy_score":
+                        # buy_scoreの場合、ロングポジションのみを対象
+                        position_filter = df_symbol['type'] == 'long'
+                        position_label = 'long'
+                    elif score_col == "sell_score":
+                        # sell_scoreの場合、ショートポジションのみを対象
+                        position_filter = df_symbol['type'] == 'short'
+                        position_label = 'short'
+                    else:
+                        # その他のスコアは全ポジション対象
+                        position_filter = pd.Series([True] * len(df_symbol))
+                        position_label = 'all'
+                    
+                    # フィルタリングされたデータを取得
+                    filtered_df = df_symbol[position_filter]
+                    valid_data = filtered_df[filtered_df[score_col].notna()].copy()
+                    
+                    if len(valid_data) < 10:  # 最低限のデータ数をチェック
                         continue
 
+                    # ★修正: スコア分析シートも20分割に変更★
                     def get_score_bin(score):
                         if pd.isna(score):
                             return "N/A"
-                        elif score < 0.1:
-                            return "0.0-0.1"
-                        elif score < 0.2:
-                            return "0.1-0.2"
-                        elif score < 0.3:
-                            return "0.2-0.3"
-                        elif score < 0.4:
-                            return "0.3-0.4"
-                        elif score < 0.5:
-                            return "0.4-0.5"
-                        elif score < 0.6:
-                            return "0.5-0.6"
-                        elif score < 0.7:
-                            return "0.6-0.7"
-                        elif score < 0.8:
-                            return "0.7-0.8"
-                        elif score < 0.9:
-                            return "0.8-0.9"
+                        elif score < 0.05:
+                            return "0.00-0.05"
+                        elif score < 0.10:
+                            return "0.05-0.10"
+                        elif score < 0.15:
+                            return "0.10-0.15"
+                        elif score < 0.20:
+                            return "0.15-0.20"
+                        elif score < 0.25:
+                            return "0.20-0.25"
+                        elif score < 0.30:
+                            return "0.25-0.30"
+                        elif score < 0.35:
+                            return "0.30-0.35"
+                        elif score < 0.40:
+                            return "0.35-0.40"
+                        elif score < 0.45:
+                            return "0.40-0.45"
+                        elif score < 0.50:
+                            return "0.45-0.50"
+                        elif score < 0.55:
+                            return "0.50-0.55"
+                        elif score < 0.60:
+                            return "0.55-0.60"
+                        elif score < 0.65:
+                            return "0.60-0.65"
+                        elif score < 0.70:
+                            return "0.65-0.70"
+                        elif score < 0.75:
+                            return "0.70-0.75"
+                        elif score < 0.80:
+                            return "0.75-0.80"
+                        elif score < 0.85:
+                            return "0.80-0.85"
+                        elif score < 0.90:
+                            return "0.85-0.90"
+                        elif score < 0.95:
+                            return "0.90-0.95"
                         else:
-                            return "0.9-1.0"
+                            return "0.95-1.00"
 
                     valid_data["score_bin"] = valid_data[score_col].apply(get_score_bin)
 
@@ -181,6 +251,7 @@ class ExcelReportGenerator:
                     ).reset_index()
                     analysis.insert(0, "スコア種別", score_col)
                     analysis.insert(0, "通貨ペア", symbol)
+                    analysis.insert(1, "ポジション種別", position_label)  # ★追加: ポジション種別を明示★
 
                     if sheet.max_row > 1:
                         sheet.append([])  # 空行で区切る
@@ -190,6 +261,7 @@ class ExcelReportGenerator:
 
         except Exception as e:
             sheet.append([f"スコア分析でエラー: {str(e)}"])
+
 
     def add_market_condition_sheet(self):
         sheet = self.wb.create_sheet("市場状況")
