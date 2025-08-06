@@ -2495,9 +2495,12 @@ class CryptoTradingBot:
 
             df_5min.loc[df_5min['cci_score_long'] < 0.255, 'buy_signal'] = False
 
-        # if symbol == 'doge_jpy':
+        if symbol == 'doge_jpy':
             # df_5min.loc[df_5min['ADX'] < 20, 'buy_signal'] = False
             # df_5min.loc[df_5min['ADX'] < 20, 'sell_signal'] = False
+
+            df_5min.loc[df_5min['bb_score_short'] > 0.955, 'sell_signal'] = False
+            df_5min.loc[df_5min['mfi_score_short'] > 0.7, 'sell_signal'] = False
 
         # if symbol == 'sol_jpy':
         #     df_5min.loc[df_5min['ADX'] < 20, 'buy_signal'] = False
