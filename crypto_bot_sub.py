@@ -2492,8 +2492,15 @@ class CryptoTradingBot:
         # ATRスコア（ボラティリティ指標として使用）
         # ATRが高い = ボラティリティが高い = エントリーリスクが高い
         # 一般的に、ATRが低い時の方がエントリーに適している
-        atr_score_long = calc_score(df_5min['ATR'], df_5min['ATR'].quantile(0.8), df_5min['ATR'].quantile(0.2), reverse=True)
-        atr_score_short = calc_score(df_5min['ATR'], df_5min['ATR'].quantile(0.8), df_5min['ATR'].quantile(0.2), reverse=True)
+        atr_last50 = df_5min['ATR'].astype('float64').shift(1).rolling(50, min_periods=50)
+
+        # pandas 1.5未満では interpolation='linear' を使用
+        q80_last50 = atr_last50.quantile(0.8, interpolation='linear')
+        q20_last50 = atr_last50.quantile(0.2, interpolation='linear')
+
+        # 元の書き方に倣ってcalc_scoreでスコア化（reverse=True）
+        atr_score_long  = calc_score(df_5min['ATR'], q80_last50, q20_last50, reverse=True)
+        atr_score_short = calc_score(df_5min['ATR'], q80_last50, q20_last50, reverse=True)
         
         # +DIと-DIの差から方向性の強さを判断
         # +DIが-DIよりも大きい場合、上昇トレンドの可能性が高い
@@ -2612,8 +2619,6 @@ class CryptoTradingBot:
 
             df_5min.loc[df_5min['adx_score_short'] < 0.163, 'sell_signal'] = False
 
-            df_5min.loc[df_5min['atr_score_long'] < 0.025, 'buy_signal'] = False
-
         if symbol == 'ada_jpy':
             df_5min.loc[df_5min['rsi_score_long'] > 0.8, 'buy_signal'] = False
 
@@ -2629,12 +2634,12 @@ class CryptoTradingBot:
             df_5min.loc[df_5min['cci_score_long'] < 0.457, 'buy_signal'] = False
 
         if symbol == 'eth_jpy':
+            df_5min.loc[df_5min['bb_score_long'] > 0.765, 'buy_signal'] = False
             df_5min.loc[df_5min['bb_score_short'] > 0.547, 'sell_signal'] = False
 
             df_5min.loc[df_5min['adx_score_long'] > 0.921, 'buy_signal'] = False
             df_5min.loc[df_5min['adx_score_short'] < 0.0724, 'sell_signal'] = False
 
-            df_5min.loc[df_5min['atr_score_short'] < 0.0165, 'sell_signal'] = False
             df_5min.loc[df_5min['cci_score_long'] > 0.934, 'buy_signal'] = False
 
         if symbol == 'xrp_jpy':
