@@ -4429,31 +4429,59 @@ class CryptoTradingBot:
         exit_condition = False
         exit_reason = ""
 
+        # --- ここから判定ブロック置き換え（指値なし・バー内タッチ検出） ---
         exit_levels = self.calculate_dynamic_exit_levels(symbol, df_5min, position, entry_price)
-        take_profit_price = exit_levels['take_profit_price']
-        stop_loss_price = exit_levels['stop_loss_price']
+        take_profit_price = float(exit_levels['take_profit_price'])
+        stop_loss_price   = float(exit_levels['stop_loss_price'])
 
+        # 現在値（通知や近接判定に使うだけ）
         current_price = self.get_current_price(symbol)
-        
-        if position == 'long':
-            if current_price >= take_profit_price:
-                exit_condition = True
-                profit_temp = (current_price - entry_price) * entry_size
-                exit_reason = "利益確定" if profit_temp > 0 else "損切り"
-            elif current_price <= stop_loss_price:
-                exit_condition = True
-                profit_temp = (current_price - entry_price) * entry_size
-                exit_reason = "損切り" if profit_temp <= 0 else "利益確定"
-        else:  # short
-            if current_price <= take_profit_price:
-                exit_condition = True
-                profit_temp = (entry_price - current_price) * entry_size
-                exit_reason = "利益確定" if profit_temp > 0 else "損切り"
-            elif current_price >= stop_loss_price:
-                exit_condition = True
-                profit_temp = (entry_price - current_price) * entry_size
-                exit_reason = "損切り" if profit_temp <= 0 else "利益確定"
 
+        # 最新5分バーの高値・安値で「一瞬タッチ」を検出
+        last_bar = df_5min.iloc[-1] if len(df_5min) > 0 else None
+        bar_high = float(last_bar['high']) if last_bar is not None else None
+        bar_low  = float(last_bar['low'])  if last_bar is not None else None
+
+        exit_condition = False
+        exit_reason = ""
+
+        if position == 'long':
+            # 5分足の高値がTP以上、または安値がSL以下に触れていれば即EXIT
+            tp_touch = (bar_high is not None and bar_high >= take_profit_price)
+            sl_touch = (bar_low  is not None and bar_low  <= stop_loss_price)
+        else:  # short
+            tp_touch = (bar_low  is not None and bar_low  <= take_profit_price)   # 価格が下抜けたら利確
+            sl_touch = (bar_high is not None and bar_high >= stop_loss_price)     # 価格が上抜けたら損切
+
+        if tp_touch or sl_touch:
+            exit_condition = True
+            exit_reason = "利益確定" if tp_touch else "損切り"
+        else:
+            # バー更新タイミングの取りこぼし対策として、近接時だけ短時間の高頻度再確認（任意）
+            # 例: 0.05% 以内に近づいたら最大3秒 100ms間隔で current_price を再チェック
+            band = 0.0005  # 0.05%
+            near = False
+            if current_price:
+                if position == 'long':
+                    near = (abs(current_price - take_profit_price) <= take_profit_price * band) or \
+                        (abs(current_price - stop_loss_price)   <= stop_loss_price   * band)
+                else:
+                    near = (abs(current_price - take_profit_price) <= take_profit_price * band) or \
+                        (abs(current_price - stop_loss_price)   <= stop_loss_price   * band)
+            if near:
+                deadline = time.time() + 3.0
+                while time.time() < deadline and not exit_condition:
+                    cp = self.get_current_price(symbol) or current_price
+                    if position == 'long':
+                        if cp >= take_profit_price or cp <= stop_loss_price:
+                            exit_condition = True
+                            exit_reason = "利益確定" if cp >= take_profit_price else "損切り"
+                    else:
+                        if cp <= take_profit_price or cp >= stop_loss_price:
+                            exit_condition = True
+                            exit_reason = "利益確定" if cp <= take_profit_price else "損切り"
+                    if not exit_condition:
+                        time.sleep(0.1)
         
         # 長時間保有の処理（48時間以上で警告、72時間以上で強制決済）- これはlive固有の機能
         if hours >= 72:
@@ -4722,9 +4750,9 @@ class CryptoTradingBot:
             self.logger.info(f"メモリ使用量: {memory_mb:.2f}MB")
             
             # ディスク容量の確認
-            total, used, free = psutil.disk_usage('/')
-            free_gb = free / 1024 / 1024 / 1024
-            self.logger.info(f"ディスク空き容量: {free_gb:.2f}GB")
+            du = psutil.disk_usage('/')
+            free_gb = du.free / 1024 / 1024 / 1024
+            self.logger.info(f"ディスク空き容量: {free_gb:.2f}GB (使用率: {du.percent:.1f}%)")
             
             # ディスクが少ない場合は警告
             if free_gb < 1.0:
