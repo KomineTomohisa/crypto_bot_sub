@@ -1272,7 +1272,7 @@ class CryptoTradingBot:
             elif symbol == "sol_jpy":
                 size = round(size, 1)
             elif symbol == "bcc_jpy":  # 追加
-                size = round(size, 1)  # BCHは小数点以下2桁
+                size = round(size, 1)  # BCHは小数点以下1桁
             else:
                 size_str = str(size)
             
@@ -1286,7 +1286,10 @@ class CryptoTradingBot:
                     
                     for pos in positions:
                         if pos.get("symbol") == gmo_symbol:
-                            existing_positions.add(pos.get("positionId"))
+                            pid = pos.get("positionId")
+                            if pid is not None:
+                                existing_positions.add(pid)
+
             except Exception as e:
                 self.logger.warning(f"既存ポジション取得エラー: {e}")
 
@@ -1309,52 +1312,154 @@ class CryptoTradingBot:
             response = self.gmo_api._request("POST", "/v1/order", data=order_data)
             
             if response.get("status") == 0:
-                order_id = str(response.get("data"))
+                # GMOの戻りが {"data": "...orderId..."} or {"data": {"orderId": "..."}}
+                data = response.get("data")
+                if isinstance(data, dict):
+                    order_id = str(data.get("orderId") or data.get("order_id") or data.get("id") or "")
+                else:
+                    order_id = str(data)
                 self.logger.info(f"注文成功: {gmo_symbol} {side} {size}, 注文ID: {order_id}")
-                
-                # ポジションID取得のリトライメカニズム
+
+                # --- 直後のポジション同期で「建玉の建値」と「実約定サイズ」を取得する ---
                 position_id = None
+                avg_entry = 0.0              # 取得できたら更新
+                executed_size_pos = 0.0      # 建玉のサイズ（実約定合計）
                 max_retries = 5
                 retry_interval = 2  # 秒
-                
+
                 for retry in range(max_retries):
                     time.sleep(retry_interval)
-                    
                     try:
-                        # 最新のポジション情報を取得
                         positions_response = self.gmo_api.get_margin_positions(gmo_symbol)
                         if positions_response.get("status") == 0:
                             positions_data = positions_response.get("data", {})
                             positions = positions_data.get("list", []) if isinstance(positions_data, dict) else positions_data
-                            
-                            # 新規ポジションを探す（既存のポジションIDにないもの）
+
+                            # 既存ポジション集合にない「今回新規のポジション」を探索
                             for pos in positions:
-                                if (pos.get("symbol") == gmo_symbol and 
+                                if (
+                                    pos.get("symbol") == gmo_symbol and
                                     pos.get("side") == side and
-                                    pos.get("positionId") not in existing_positions):
-                                    
+                                    pos.get("positionId") not in existing_positions
+                                ):
                                     position_id = pos.get("positionId")
-                                    self.logger.info(f"新規ポジションID取得成功: {position_id} (試行: {retry + 1}/{max_retries})")
+                                    # 建値（平均建玉価格）
+                                    try:
+                                        avg_entry = float(pos.get("price") or 0)
+                                    except Exception:
+                                        avg_entry = 0.0
+                                    # 建玉サイズ（実約定合計サイズ）
+                                    try:
+                                        executed_size_pos = float(pos.get("size") or 0)
+                                    except Exception:
+                                        executed_size_pos = 0.0
+
+                                    self.logger.info(
+                                        f"新規ポジション取得: id={position_id}, price={avg_entry}, size={executed_size_pos} "
+                                        f"(試行 {retry + 1}/{max_retries})"
+                                    )
                                     break
-                            
+
                             if position_id:
+                                # 見つかったら即ループ終了
                                 break
-                                
+
                     except Exception as e:
-                        self.logger.warning(f"ポジションID取得試行{retry + 1}失敗: {e}")
-                    
+                        self.logger.warning(f"ポジション同期試行{retry + 1}失敗: {e}")
+
                     if retry < max_retries - 1:
-                        self.logger.info(f"ポジションID未取得。再試行します... ({retry + 2}/{max_retries})")
-                
-                # ポジションIDが取得できた場合は保存
+                        self.logger.info(f"ポジション未同期。再試行... ({retry + 2}/{max_retries})")
+
+                # --- 取得できた情報を保存（建値・サイズ・ポジションID） ---
                 if position_id:
                     self.position_ids[symbol] = position_id
                     self.logger.info(f"ポジションID保存成功: {symbol} = {position_id}")
                 else:
-                    self.logger.warning(f"ポジションIDを取得できませんでした: {symbol}")
-                    # 注文は成功しているので、後でverify_positionsで同期を試みる
-                
-                return {'success': True, 'order_id': order_id, 'executed_size': size, 'position_id': position_id}
+                    self.logger.warning(f"ポジションIDを取得できませんでした: {symbol}（後で verify_positions で同期）")
+
+                # 建玉から建値が取れたら entry_prices を更新
+                if avg_entry > 0:
+                    self.entry_prices[symbol] = avg_entry
+                    self.logger.info(f"[ENTRY] 建玉の建値で entry_price 更新: {symbol} = {avg_entry}")
+
+                # 建玉から実約定サイズが取れたら entry_sizes を上書き（部分約定対応）
+                if executed_size_pos > 0:
+                    self.entry_sizes[symbol] = executed_size_pos
+                    self.logger.info(f"[ENTRY] 建玉サイズで entry_size 更新: {symbol} = {executed_size_pos}")
+
+                # --- フォールバック: 建玉から price が取れない場合は注文照会→約定履歴から平均約定価格を試みる ---
+                if avg_entry <= 0:
+                    try:
+                        # 1) 注文照会で averagePrice 相当が取れればそれを使う
+                        od = self.gmo_api._request("GET", "/v1/orders", params={"orderId": str(order_id)})
+                        if od.get("status") == 0:
+                            lst = od.get("data", {}).get("list", [])
+                            if lst:
+                                od0 = lst[0]
+                                ap = float(od0.get("averagePrice") or 0)
+                                ex_sz = float(od0.get("executedSize") or 0)
+                                if ap > 0:
+                                    avg_entry = ap
+                                    self.entry_prices[symbol] = avg_entry
+                                    self.logger.info(f"[ENTRY] 注文照会の平均約定価格で更新: {symbol} = {avg_entry}")
+                                if ex_sz > 0 and (self.entry_sizes.get(symbol, 0) <= 0):
+                                    self.entry_sizes[symbol] = ex_sz
+                                    self.logger.info(f"[ENTRY] 注文照会の実行サイズで更新: {symbol} = {ex_sz}")
+
+                        # 2) まだ price が無ければ約定履歴から VWAP を算出
+                        if avg_entry <= 0:
+                            from datetime import datetime
+                            hist = self.gmo_api._request(
+                                "GET", "/v1/closedOrders",
+                                params={"symbol": gmo_symbol, "date": datetime.now().strftime("%Y%m%d")}
+                            )
+                            if hist.get("status") == 0:
+                                for odr in hist.get("data", {}).get("list", []):
+                                    if str(odr.get("orderId")) == str(order_id):
+                                        # fills があれば VWAP（Σ p*s / Σ s）
+                                        fills = odr.get("fills") or []
+                                        num = 0.0
+                                        den = 0.0
+                                        for f in fills:
+                                            try:
+                                                p = float(f.get("price") or 0)
+                                                s = float(f.get("size") or 0)
+                                                num += p * s
+                                                den += s
+                                            except Exception:
+                                                continue
+                                        vwap = (num / den) if den > 0 else float(odr.get("averagePrice") or 0)
+                                        if vwap > 0:
+                                            avg_entry = vwap
+                                            self.entry_prices[symbol] = avg_entry
+                                            self.logger.info(f"[ENTRY] 約定履歴のVWAPで entry_price 更新: {symbol} = {avg_entry}")
+
+                                        # 実行サイズのフォールバック更新
+                                        try:
+                                            ex_sz = float(odr.get("executedSize") or 0)
+                                            if ex_sz > 0 and (self.entry_sizes.get(symbol, 0) <= 0):
+                                                self.entry_sizes[symbol] = ex_sz
+                                                self.logger.info(f"[ENTRY] 約定履歴の実行サイズで更新: {symbol} = {ex_sz}")
+                                        except Exception:
+                                            pass
+                                        break
+                    except Exception as e:
+                        self.logger.warning(f"[ENTRY] 平均約定価格のフォールバック取得に失敗: {e}")
+
+                # ここまでで avg_entry が取れなかった場合、旧ロジックの last を無理に入れない（ズレの原因）
+                if avg_entry <= 0:
+                    self.logger.warning("[ENTRY] 平均約定価格を取得できませんでした。entry_prices は未更新のままです。")
+
+                # 戻り値の executed_size は「建玉サイズ」 > 「注文サイズ」の優先で返す
+                executed_size_return = executed_size_pos if executed_size_pos > 0 else size
+
+                return {
+                    'success': True,
+                    'order_id': order_id,
+                    'executed_size': executed_size_return,
+                    'position_id': position_id
+                }
+
             else:
                 # エラーハンドリング
                 error_messages = response.get("messages", [])
