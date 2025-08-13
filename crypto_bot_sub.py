@@ -923,7 +923,7 @@ class CryptoTradingBot:
     def verify_positions(self):
         """GMOコインの信用取引建玉を使用してポジションを検証する"""
         self.logger.info("取引所ポジション情報の検証を開始...")
-        
+
         # ローカルポジション情報のバックアップ
         local_positions_backup = {
             'positions': self.positions.copy(),
@@ -931,45 +931,36 @@ class CryptoTradingBot:
             'entry_times': {k: v for k, v in self.entry_times.items()},
             'entry_sizes': self.entry_sizes.copy()
         }
-        
-        # 不整合カウンタ
+
         inconsistencies = 0
         resolved = 0
-        
+
         for symbol in self.symbols:
             try:
-                # APIレート制限を考慮して少し待機
-                time.sleep(0.5)
-                
-                # 通貨シンボルからコインを取得
+                time.sleep(0.5)  # APIレート制限対策
+
                 coin = symbol.split('_')[0]
-                
-                # GMOコインから建玉情報を取得
                 position_details = self.get_position_details(coin)
-                
-                # 建玉の有無を判断
+
                 has_actual_position = False
                 actual_side = None
                 actual_size = 0.0
-                
+
                 if position_details and position_details["positions"]:
-                    # ネットポジションで判断
                     net_size = position_details["net_size"]
                     if abs(net_size) >= self.min_order_sizes.get(symbol, 0.001):
                         has_actual_position = True
                         actual_side = "long" if net_size > 0 else "short"
                         actual_size = abs(net_size)
 
-                # ログ追加: 建玉情報を常に表示
-                self.logger.info(f"{symbol}: ボット状態={self.positions[symbol]}, "
-                            f"実際の建玉={actual_side if has_actual_position else 'なし'}")
+                self.logger.info(
+                    f"{symbol}: ボット状態={self.positions[symbol]}, "
+                    f"実際の建玉={actual_side if has_actual_position else 'なし'}"
+                )
 
-                # ボットの記録と実際のポジションを比較
                 if self.positions[symbol] is not None:  # ボットではポジションあり
-                    if not has_actual_position:  # 実際にはポジションなし
+                    if not has_actual_position:
                         self.logger.warning(f"{symbol}: ボットではポジション有りだが、実際には建玉が見つかりませんでした。")
-                        
-                        # ポジション情報をリセット
                         self.positions[symbol] = None
                         self.entry_prices[symbol] = 0
                         self.entry_times[symbol] = None
@@ -977,49 +968,75 @@ class CryptoTradingBot:
                         inconsistencies += 1
                         resolved += 1
                     else:
-                        # ポジションタイプの確認
                         if self.positions[symbol] != actual_side:
-                            self.logger.warning(f"{symbol}: ポジションタイプの不一致。記録: {self.positions[symbol]}, 実際: {actual_side}")
+                            self.logger.warning(
+                                f"{symbol}: ポジションタイプの不一致。記録: {self.positions[symbol]}, 実際: {actual_side}"
+                            )
                             self.positions[symbol] = actual_side
                             inconsistencies += 1
                             resolved += 1
-                        
-                        # ポジションサイズの誤差を確認
+
+                        # サイズの誤差チェック
                         size_diff_pct = abs(self.entry_sizes[symbol] - actual_size) / max(self.entry_sizes[symbol], actual_size) * 100
-                        
-                        if size_diff_pct > 5:  # 5%以上の差がある場合
-                            self.logger.warning(f"{symbol}: 記録上のポジションサイズ({self.entry_sizes[symbol]:.6f})と"
-                                            f"実際のサイズ({actual_size:.6f})に{size_diff_pct:.1f}%の差があります。更新します。")
+                        if size_diff_pct > 5:
+                            self.logger.warning(
+                                f"{symbol}: 記録上のポジションサイズ({self.entry_sizes[symbol]:.6f})と"
+                                f"実際のサイズ({actual_size:.6f})に{size_diff_pct:.1f}%の差があります。更新します。"
+                            )
                             self.entry_sizes[symbol] = actual_size
                             inconsistencies += 1
                             resolved += 1
-                
-                elif has_actual_position:  # ボットではポジションなし、実際にはポジションあり
-                    self.logger.warning(f"{symbol}: ボットではポジションなしだが、実際には{actual_size:.6f}の{actual_side}建玉が見つかりました。")
 
-                    # 現在価格の取得（参照用）
-                    current_price = self.get_current_price(symbol)
-                    
-                    # ポジション情報を作成
+                        # 価格は常に建玉から更新
+                        side_key = "BUY" if actual_side == "long" else "SELL"
+                        prices = [
+                            pos["price"] for pos in position_details["positions"]
+                            if pos["side"] == side_key
+                        ]
+                        if prices:
+                            avg_price = sum(prices) / len(prices)
+                            self.logger.info(
+                                f"{symbol}: 建玉平均価格を更新します。旧値: {self.entry_prices[symbol]:.2f} → 新値: {avg_price:.2f}"
+                            )
+                            self.entry_prices[symbol] = avg_price
+                            inconsistencies += 1
+                            resolved += 1
+
+
+
+                elif has_actual_position:  # ボットではポジションなし、実際にはポジションあり
+                    self.logger.warning(
+                        f"{symbol}: ボットではポジションなしだが、実際には{actual_size:.6f}の{actual_side}建玉が見つかりました。"
+                    )
+
+                    # 建玉から取得した平均価格を使用（該当サイドのみ）
+                    avg_price = 0.0
+                    side_key = "BUY" if actual_side == "long" else "SELL"
+                    prices = [
+                        pos["price"] for pos in position_details["positions"]
+                        if pos["side"] == side_key
+                    ]
+                    if prices:
+                        avg_price = sum(prices) / len(prices)
+
                     self.positions[symbol] = actual_side
-                    self.entry_prices[symbol] = current_price  # 現在価格を参考値として使用
+                    self.entry_prices[symbol] = avg_price
                     self.entry_times[symbol] = datetime.now() - timedelta(hours=1)  # 1時間前からの保有と仮定
                     self.entry_sizes[symbol] = actual_size
-                    
+
                     inconsistencies += 1
                     resolved += 1
-                    
-                    self.logger.info(f"{symbol}: ポジション情報を更新しました（推定値）。")
-                
+                    self.logger.info(f"{symbol}: ポジション情報を更新しました（推定値, 価格={avg_price}）。")
+
             except Exception as e:
                 self.logger.error(f"{symbol}のポジション検証中にエラー: {e}", exc_info=True)
-        
-        # 変更があった場合のみ保存
+
         if inconsistencies > 0:
             self.save_positions()
             self.logger.info(f"ポジション情報の検証完了: {inconsistencies}件の不整合を検出、{resolved}件を解決しました")
         else:
             self.logger.info("ポジション情報の検証完了: 不整合はありませんでした")
+
             
     def get_balance(self, coin):
         """GMOコインから信用取引の建玉情報を取得
@@ -3889,7 +3906,7 @@ class CryptoTradingBot:
                         self._perform_health_check()
                         health_check_counter = 0
                     
-                    # 定期的なポジション検証（1時間ごと）
+                    # 定期的なポジション検証
                     self.logger.info("定期ポジション検証を実行します")
                     self.verify_positions()
                     
