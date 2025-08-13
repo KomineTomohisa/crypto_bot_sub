@@ -473,33 +473,65 @@ class CryptoTradingBot:
         self.logger.info(f"=== ボット初期化完了 （初期資金: {initial_capital:,}円, テストモード: {test_mode}) ===")
 
     def setup_logging(self):
-        """ロギングの設定"""
-        self.logger = logging.getLogger('crypto_bot')
+        """ロギング設定（毎日 0:00 に日次ローテーション、JST想定）"""
+        import logging
+        from logging.handlers import TimedRotatingFileHandler
+        import os
+        import time as _time
+
+        # JSTで回したい場合の保険（Linux）
+        try:
+            os.environ.setdefault("TZ", "Asia/Tokyo")
+            if hasattr(_time, "tzset"):
+                _time.tzset()
+        except Exception:
+            pass
+
+        self.logger = logging.getLogger("crypto_bot")
         self.logger.setLevel(logging.INFO)
-        
-        # すでにハンドラーが設定されている場合はクリア
-        if self.logger.handlers:
-            self.logger.handlers.clear()
-        
-        # 時間ベースのログファイル名 (日付と時刻を含む)
-        log_filename = os.path.join(self.log_dir, f'crypto_bot_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
-        
-        # ファイルハンドラー（UTF-8エンコーディングを指定）
-        file_handler = logging.FileHandler(log_filename, encoding='utf-8')
-        file_handler.setLevel(logging.INFO)
-        
-        # コンソールハンドラー（UTF-8エンコーディング対応）
-        console_handler = logging.StreamHandler()
-        console_handler.setLevel(logging.INFO)
-        
-        # フォーマット
-        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-        file_handler.setFormatter(formatter)
-        console_handler.setFormatter(formatter)
-        
-        # ハンドラーの追加
-        self.logger.addHandler(file_handler)
-        self.logger.addHandler(console_handler)
+        self.logger.propagate = False  # 二重出力防止
+
+        # 既存ハンドラをクリア（多重追加防止）
+        for h in list(self.logger.handlers):
+            try:
+                h.close()
+            except Exception:
+                pass
+            self.logger.removeHandler(h)
+
+        # ログディレクトリ作成
+        os.makedirs(self.log_dir, exist_ok=True)
+
+        # ログファイルパス
+        base_log_path = os.path.join(self.log_dir, "crypto_bot.log")
+
+        # 日次ローテーション（ローカルタイムの真夜中）
+        self.file_handler = TimedRotatingFileHandler(
+            filename=base_log_path,
+            when="midnight",
+            interval=1,
+            backupCount=20,     # 古いログは20個まで保持
+            encoding="utf-8",
+            utc=False           # JSTに設定済みならJSTで回る
+        )
+
+        # フォーマット設定
+        formatter = logging.Formatter(
+            "%(asctime)s - %(levelname)s - %(message)s"
+        )
+        self.file_handler.setFormatter(formatter)
+        self.file_handler.setLevel(logging.INFO)
+
+        # コンソール出力も保持
+        self.console_handler = logging.StreamHandler()
+        self.console_handler.setFormatter(formatter)
+        self.console_handler.setLevel(logging.INFO)
+
+        # ハンドラ登録
+        self.logger.addHandler(self.file_handler)
+        self.logger.addHandler(self.console_handler)
+
+
     
     def send_notification(self, subject, message, notification_type='info'):
         """通知を送信（メールとLINE）
