@@ -133,34 +133,22 @@ class GMOCoinAPI:
         return self._request("GET", path)
 
     def close_position(self, symbol, position_id, size, side, position_type="limit", price=None):
+        """ポジションを決済する（公式例準拠）
+        
+        Parameters:
+        symbol (str): 通貨ペアシンボル
+        position_id (int): ポジションID
+        size (str): 決済サイズ
+        side (str): 取引サイド（BUY or SELL）
+        position_type (str): 注文タイプ（LIMIT or MARKET）
+        price (str): 指値価格（LIMIT注文の場合）
         """
-        ポジションを決済する（/v1/closeOrder）
-        - 公式仕様: 成功時 { "status": 0, "data": "<orderId文字列>", ... }
-        - 返り値は dict に統一し、orderId を orderId / order_id の両方に正規化（取得不可時は None）
-        - timeInForce は既定 FAS のため指定しない（GTC は仕様外）
-        - ログは print で INFO/WARNING/ERROR を出力（logger未定義環境でも安全）
-        """
-        import json, time
-
-        # ---- print ログ関数（簡易）----
-        def _log(level: str, msg: str):
-            ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-            print(f"{ts} - {symbol} - {level} - {msg}")
-
         path = "/v1/closeOrder"
-        exec_type = str(position_type).upper()
-        side_up   = str(side).upper()
-
-        # === 入力ログ（開始） ===
-        start_ts = time.time()
-        _log("INFO",
-            f"close_position START (side={side_up}, exec={exec_type}, size={size}, price={price}, position_id={position_id})")
-
-        # === リクエスト組み立て ===
+        
         data = {
             "symbol": symbol,
-            "side": side_up,
-            "executionType": exec_type,
+            "side": side,
+            "executionType": position_type.upper(),
             "settlePosition": [
                 {
                     "positionId": position_id,
@@ -168,107 +156,13 @@ class GMOCoinAPI:
                 }
             ]
         }
-
-        # LIMIT のときだけ価格を付与（timeInForce は指定しない）
-        if exec_type == "LIMIT":
-            if price is None:
-                _log("ERROR", "close_position ERROR - LIMITにはpriceが必要です")
-                raise ValueError("close_position: LIMIT には price が必要です。")
+        
+        # LIMIT注文の場合は価格とタイムインフォースを追加
+        if position_type.upper() == "LIMIT" and price:
             data["price"] = str(price)
-
-        # ペイロード簡易ログ（署名や秘密は含めない）
-        try:
-            _log("INFO", f"close_position payload={json.dumps(data, ensure_ascii=False)}")
-        except Exception:
-            _log("INFO", "close_position payload=<unserializable>")
-
-        # === リクエスト送信 ===
-        try:
-            resp = self._request("POST", path, data=data)
-        except Exception as e:
-            elapsed_ms = int((time.time() - start_ts) * 1000)
-            _log("ERROR", f"close_position REQUEST FAILED ({elapsed_ms}ms): {e}")
-            return {"status": -1, "orderId": None, "error": str(e)}
-
-        # 応答の型と一部情報をログ
-        elapsed_ms = int((time.time() - start_ts) * 1000)
-        if isinstance(resp, dict):
-            keys = ",".join(list(resp.keys())[:6])
-            _log("INFO", f"close_position RESP({elapsed_ms}ms) type=dict status={resp.get('status')} keys=[{keys}]")
-        else:
-            preview = str(resp)
-            preview = preview[:240] + ("..." if len(preview) > 240 else "")
-            _log("INFO", f"close_position RESP({elapsed_ms}ms) type={type(resp).__name__} preview={preview}")
-
-        # === レスポンス正規化 & orderId 抽出 ===
-        # 1) 文字列ならJSONパースを試みる
-        if isinstance(resp, str):
-            try:
-                resp_obj = json.loads(resp)
-                _log("INFO", "close_position resp string -> parsed JSON")
-            except Exception:
-                _log("WARNING", "close_position resp not JSON-parsable; returning raw")
-                return {"status": -1, "orderId": None, "raw": resp}
-        elif isinstance(resp, dict):
-            resp_obj = resp
-        else:
-            _log("WARNING", f"close_position unexpected resp type={type(resp).__name__}; returning raw")
-            return {"status": -1, "orderId": None, "raw": resp}
-
-        order_id = None
-        d = resp_obj.get("data")
-
-        # (a) 公式仕様：data が文字列ならそれが orderId
-        if isinstance(d, str) and d:
-            order_id = d
-            _log("INFO", f"close_position extracted orderId from data(str) -> {order_id}")
-        # (b) data が dict の場合（環境差対応）
-        elif isinstance(d, dict):
-            order_id = d.get("orderId") or d.get("order_id") or d.get("id")
-            _log("INFO", f"close_position extracted orderId from data(dict) -> {order_id}")
-
-        # (c) トップレベル直下にも揺れ対応
-        if not order_id:
-            top = resp_obj.get("orderId") or resp_obj.get("order_id") or resp_obj.get("id")
-            if top:
-                order_id = top
-                _log("INFO", f"close_position extracted orderId from top-level -> {order_id}")
-
-        # (d) 最終フォールバック：受付IDを暫定採用
-        if not order_id:
-            acc = None
-            if isinstance(d, dict):
-                acc = d.get("orderAcceptanceId") or d.get("acceptanceId")
-            acc = acc or resp_obj.get("orderAcceptanceId") or resp_obj.get("acceptanceId")
-            if acc:
-                order_id = str(acc)
-                _log("INFO", f"close_position fallback to acceptanceId as orderId -> {order_id}")
-            else:
-                _log("WARNING", f"close_position could NOT extract orderId (status={resp_obj.get('status')})")
-
-        # 正規化して返す（呼び出し側の実装ゆれに備えて両キーを用意）
-        if order_id is not None:
-            resp_obj["orderId"] = str(order_id)
-            resp_obj["order_id"] = str(order_id)
-
-        # 完了ログ
-        elapsed_total_ms = int((time.time() - start_ts) * 1000)
-        _log("INFO", f"close_position DONE (orderId={order_id}, status={resp_obj.get('status')}, {elapsed_total_ms}ms)")
-
-        return resp_obj
-
-
-    # GMOCoinAPI クラス内に追加
-    def cancel_order(self, order_id: str | int):
-        """
-        アクテ  ィブな注文をキャンセルします。
-        :param order_id: 取消対象の orderId（数値 or 文字列）
-        :return: APIレスポンス(dict)
-        """
-        path = "/v1/cancelOrder"
-        payload = {"orderId": int(order_id)}  # 公式例に合わせて数値で送る（strでも通る場合あり）
-        return self._request("POST", path, data=payload)
-
+            data["timeInForce"] = "FAK"  # Fill and Kill
+        
+        return self._request("POST", path, data=data)
 
 class CryptoTradingBot:
     def _prepare_trade_logs_for_excel_report(self, trade_logs):
@@ -526,10 +420,6 @@ class CryptoTradingBot:
 
         # ポジションID管理を追加
         self.position_ids = {symbol: None for symbol in self.symbols}  # ポジションIDを保存
-        self.exit_order_ids = {symbol: {"tp": None, "sl": None} for symbol in self.symbols}
-        self.exit_order_prices = {symbol: {"tp": None, "sl": None} for symbol in self.symbols}
-        self.last_exit_order_bar = {symbol: None for symbol in self.symbols}  # 直近に発注した5分バーの時刻/インデックス
-
 
         # GMO APIの初期化
         self.gmo_api = None
@@ -550,8 +440,6 @@ class CryptoTradingBot:
             'bcc_jpy': 'BCH_JPY',
             'ada_jpy': 'ADA_JPY'  # 追加
         }
-
-        self.opposite_narrow_state = {symbol: {'long': False, 'short': False} for symbol in self.symbols}
         
         # バックアップスケジュール
         self.last_backup_time = time.time()
@@ -4568,193 +4456,336 @@ class CryptoTradingBot:
             error_message = order_result.get('error', '不明なエラー')
             self.logger.error(f" {symbol}の{position_type}エントリー注文が失敗しました: {error_message}")
 
+
     def _check_exit_conditions(self, symbol, stats, trade_logs, df_5min):
+        """イグジット条件をチェックし、必要に応じて決済を実行する（backtest関数と整合性あり）
+        
+        Parameters:
+        symbol (str): 通貨ペア
+        current_price (float): 現在価格
+        stats (dict): 統計情報の辞書
+        trade_logs (list): 取引ログのリスト
         """
-        実稼働用のイグジット管理（指値常設・新バーで更新）
-        - TP/SLのクローズ指値を板に置く（ロング→SELL, ショート→BUY）
-        - df_5minに新バーが追加されたら、既存の指値をキャンセルして最新のTP/SLで入れ直す
-        - ポジションがなくなったら残っているクローズ指値はキャンセルしてクリアする
+        position = self.positions[symbol]
+        entry_price = self.entry_prices[symbol]
+        entry_time = self.entry_times[symbol]
+        entry_size = self.entry_sizes[symbol]
+        
+        # 保有時間の計算
+        holding_time = datetime.now() - entry_time
+        hours = holding_time.total_seconds() / 3600
+        
+        # イグジット条件の計算
+        exit_condition = False
+        exit_reason = ""
 
-        Parameters
-        ----------
-        symbol : str
-            内部シンボル（例: 'xrp_jpy'）
-        stats, trade_logs :
-            既存シグネチャ互換のダミー引数（本関数では使用しないが、呼び出し元の互換性のため残置）
-        df_5min : pandas.DataFrame
-            5分/15分足の最新データフレーム。最後の行が“最新バー”（確定済み）であることを想定
-        """
-        try:
-            position = self.positions.get(symbol)
-            # 1) ポジションが無い場合：残っているクローズ指値はキャンセルしてクリアして終了
-            if position is None:
-                # もし板にTP/SLが残っていたら全キャンセル
-                for k in ("tp", "sl"):
-                    oid = self.exit_order_ids[symbol].get(k)
-                    if oid:
-                        try:
-                            self.gmo_api.cancel_order(oid)
-                            self.logger.info(f"{symbol}: ポジション無しのため既存{ k.upper() }指値(orderId={oid})をキャンセル")
-                        except Exception as e:
-                            self.logger.warning(f"{symbol}: {k.upper()}キャンセル失敗（ポジション無し）: {e}")
-                        finally:
-                            self.exit_order_ids[symbol][k] = None
-                            self.exit_order_prices[symbol][k] = None
-                self.last_exit_order_bar[symbol] = None
-                return
+        # --- ここから判定ブロック置き換え（指値なし・バー内タッチ検出） ---
+        exit_levels = self.calculate_dynamic_exit_levels(symbol, df_5min, position, entry_price)
+        take_profit_price = float(exit_levels['take_profit_price'])
+        stop_loss_price   = float(exit_levels['stop_loss_price'])
 
-            # 2) 新バー判定：df_5minの最終インデックスで判定
-            if df_5min is None or len(df_5min) == 0:
-                self.logger.warning(f"{symbol}: df_5minが空のためイグジット注文更新をスキップ")
-                return
+        # 現在値（通知や近接判定に使うだけ）
+        current_price = self.get_current_price(symbol)
 
-            latest_bar_key = df_5min.index[-1]
-            is_new_bar = (self.last_exit_order_bar.get(symbol) != latest_bar_key)
+        # 最新5分バーの高値・安値で「一瞬タッチ」を検出
+        last_bar = df_5min.iloc[-1] if len(df_5min) > 0 else None
+        bar_high = float(last_bar['high']) if last_bar is not None else None
+        bar_low  = float(last_bar['low'])  if last_bar is not None else None
 
-            # 3) ポジションサイズの確認（部分約定対策）
-            #    取引所から最新の建玉サイズを取得できるメソッドがあれば使う。無ければ自己記録値を使用。
-            current_size = self.entry_sizes.get(symbol, 0)
-            if current_size <= 0:
-                # サイズ異常時は保守的に全キャンセルして抜ける
-                for k in ("tp", "sl"):
-                    oid = self.exit_order_ids[symbol].get(k)
-                    if oid:
-                        try:
-                            self.gmo_api.cancel_order(oid)
-                            self.logger.info(f"{symbol}: サイズ0/未取得のため既存{ k.upper() }指値(orderId={oid})をキャンセル")
-                        except Exception as e:
-                            self.logger.warning(f"{symbol}: {k.upper()}キャンセル失敗（サイズ0）: {e}")
-                        finally:
-                            self.exit_order_ids[symbol][k] = None
-                            self.exit_order_prices[symbol][k] = None
-                self.last_exit_order_bar[symbol] = latest_bar_key
-                return
+        exit_condition = False
+        exit_reason = ""
 
-            # 4) GMO用シンボルと position_id を確認
-            gmo_symbol = self.symbol_mapping.get(symbol, symbol.upper())
-            position_id = self.position_ids.get(symbol)
-            if not position_id:
-                self.logger.warning(f"{symbol}: position_id が不明のためクローズ指値を出せません")
-                return
+        if position == 'long':
+            # 5分足の高値がTP以上、または安値がSL以下に触れていれば即EXIT
+            tp_touch = (bar_high is not None and bar_high >= take_profit_price)
+            sl_touch = (bar_low  is not None and bar_low  <= stop_loss_price)
+        else:  # short
+            tp_touch = (bar_low  is not None and bar_low  <= take_profit_price)   # 価格が下抜けたら利確
+            sl_touch = (bar_high is not None and bar_high >= stop_loss_price)     # 価格が上抜けたら損切
 
-            # 5) TP/SL を計算（既存の動的ロジックを使用）
-            entry_price = self.entry_prices.get(symbol)
-            if entry_price is None:
-                self.logger.warning(f"{symbol}: entry_price が不明のためクローズ指値を出せません")
-                return
+        if tp_touch or sl_touch:
+            exit_condition = True
+            exit_reason = "利益確定" if tp_touch else "損切り"
+        else:
+            # バー更新タイミングの取りこぼし対策として、近接時だけ短時間の高頻度再確認（任意）
+            # 例: 0.05% 以内に近づいたら最大3秒 100ms間隔で current_price を再チェック
+            band = 0.0005  # 0.05%
+            near = False
+            if current_price:
+                if position == 'long':
+                    near = (abs(current_price - take_profit_price) <= take_profit_price * band) or \
+                        (abs(current_price - stop_loss_price)   <= stop_loss_price   * band)
+                else:
+                    near = (abs(current_price - take_profit_price) <= take_profit_price * band) or \
+                        (abs(current_price - stop_loss_price)   <= stop_loss_price   * band)
+            if near:
+                deadline = time.time() + 3.0
+                while time.time() < deadline and not exit_condition:
+                    cp = self.get_current_price(symbol) or current_price
+                    if position == 'long':
+                        if cp >= take_profit_price or cp <= stop_loss_price:
+                            exit_condition = True
+                            exit_reason = "利益確定" if cp >= take_profit_price else "損切り"
+                    else:
+                        if cp <= take_profit_price or cp >= stop_loss_price:
+                            exit_condition = True
+                            exit_reason = "利益確定" if cp <= take_profit_price else "損切り"
+                    if not exit_condition:
+                        time.sleep(0.1)
+        
+        # 長時間保有の処理（48時間以上で警告、72時間以上で強制決済）- これはlive固有の機能
+        if hours >= 72:
+            self.logger.warning(f"{symbol}のポジションが72時間以上保有されています。強制決済します。")
+            exit_condition = True
+            exit_reason = "長時間保有による強制決済"
+        elif hours >= 48:
+            self.logger.warning(f"{symbol}のポジションが48時間以上保有されています。監視を強化してください。")
+        
+        # イグジット条件を満たしている場合
+        if exit_condition:
+            # 決済注文の実行
+            self.logger.info(f"{symbol}の{position}ポジションをイグジットします: {exit_reason}")
+            
+            # 通貨ペアの全ポジションを取得
+            position_details = self.get_position_details(symbol.split('_')[0])
 
-            exit_levels = self.calculate_dynamic_exit_levels(
-                symbol=symbol,
-                df_5min=df_5min,
-                position_type=position,
-                entry_price=entry_price
-            )
+            if not position_details or not position_details.get("positions"):
+                self.logger.warning(f"{symbol}の決済対象ポジションが見つかりません。ポジション同期を試みます。")
+                # ポジション同期を試みる
+                self.verify_positions()
+                position_details = self.get_position_details(symbol.split('_')[0])
+                
+                if not position_details or not position_details.get("positions"):
+                    self.logger.error(f"{symbol}の決済対象ポジションが再取得できませんでした。手動での対応が必要です。")
+                    self.send_notification(
+                        f"ポジション決済エラー: {symbol}",
+                        f"決済対象ポジションが見つからないため、決済できませんでした。\n"
+                        f"手動での対応が必要です。",
+                        "error"
+                    )
+                    return
 
-            try:
-                take_profit_price = float(exit_levels["take_profit_price"])
-                stop_loss_price   = float(exit_levels["stop_loss_price"])
-            except Exception:
-                self.logger.error(f"{symbol}: calculate_dynamic_exit_levels から正しい価格が取得できません: {exit_levels}")
-                return
+            # 複数ポジションを決済
+            close_results = []
+            success_count = 0
+            failed_count = 0
+            total_executed_size = 0
+            total_order_ids = []
 
-            # 6) 決済サイド（ロング→SELL、ショート→BUY）
-            close_side = "SELL" if position == "long" else "BUY"
+            # GMOコインの形式に変換
+            gmo_symbol = self.symbol_mapping.get(symbol, symbol.upper().replace('_', ''))
 
-            # 7) 更新条件の判定
-            #    (a) 新バーが出ている とき
-            #    (b) または、既存の指値価格から乖離が一定以上（例: 0.05%）あるとき
-            UPDATE_THRESHOLD_PCT = 0.0005  # 0.05%
-            need_update = False
-            if is_new_bar:
-                need_update = True
+            # ポジションの反対売買方向を決定
+            side = "BUY" if position == 'short' else "SELL"
+
+            # 各ポジションを順番に決済
+            for pos in position_details["positions"]:
+                # 同じシンボルのポジションのみ処理（安全対策）
+                if pos.get("symbol") != gmo_symbol:
+                    self.logger.info(f"シンボル不一致: 期待={gmo_symbol}, 実際={pos.get('symbol')}")
+                    continue
+                    
+                # ポジションの方向が一致するか確認（買いポジションには売り決済、売りポジションには買い決済）
+                pos_side = pos.get("side")
+                if (position == 'long' and pos_side != "BUY") or (position == 'short' and pos_side != "SELL"):
+                    self.logger.info(f"ポジション方向不一致: position={position}, pos_side={pos_side}")
+                    continue
+                    
+                position_id = pos.get("positionId")  # ここがpositionIdになっている可能性あり
+                if position_id is None:
+                    position_id = pos.get("position_id")  # 別の形式も試す
+                    
+                if position_id is None:
+                    self.logger.error(f"ポジションIDが見つかりません: {pos}")
+                    continue
+
+                pos_size = pos.get("size", 0)
+                
+                self.logger.info(f"個別ポジション決済: {gmo_symbol} {side} サイズ:{pos_size} (ポジションID: {position_id})")
+                
+                # ポジションサイズを適切にフォーマット
+                if symbol == "doge_jpy" or symbol == "DOGE_JPY":
+                    formatted_size = str(int(float(pos_size)))
+                elif symbol == "xrp_jpy" or symbol == "XRP_JPY":
+                    formatted_size = str(int(float(pos_size)))
+                elif symbol == "eth_jpy" or symbol == "ETH_JPY":
+                    formatted_size = str(round(float(pos_size), 2))
+                elif symbol == "ltc_jpy" or symbol == "LTC_JPY":
+                    formatted_size = str(int(float(pos_size)))
+                elif symbol == "sol_jpy" or symbol == "SOL_JPY":
+                    formatted_size = str(round(float(pos_size), 1))
+                elif symbol == "bcc_jpy" or symbol == "BCH_JPY":  # 追加
+                    formatted_size = str(round(float(pos_size), 1))
+                elif symbol == "ada_jpy" or symbol == "ADA_JPY":  # 追加
+                    formatted_size = str(int(float(pos_size)))
+                else:
+                    formatted_size = str(pos_size)
+
+
+                # 決済注文実行
+                try:
+                    response = self.gmo_api.close_position(
+                        symbol=gmo_symbol,
+                        position_id=int(position_id),
+                        size=formatted_size,
+                        side=side,
+                        position_type="MARKET"
+                    )
+                    
+                    if response.get("status") == 0:
+                        order_id = str(response.get("data"))
+                        self.logger.info(f"決済注文成功: 注文ID={order_id}")
+                        success_count += 1
+                        total_order_ids.append(order_id)
+                        
+                        close_results.append({
+                            'position_id': position_id,
+                            'success': True,
+                            'order_id': order_id,
+                            'size': pos_size
+                        })
+                    else:
+                        error_messages = response.get("messages", [])
+                        error_msg = error_messages[0].get("message_string", "Unknown error") if error_messages else "Unknown error"
+                        self.logger.error(f"決済注文エラー: {error_msg}")
+                        failed_count += 1
+                        
+                        close_results.append({
+                            'position_id': position_id,
+                            'success': False,
+                            'error': error_msg,
+                            'size': pos_size
+                        })
+                except Exception as e:
+                    self.logger.error(f"ポジション決済中のエラー: {str(e)}")
+                    failed_count += 1
+                    
+                    close_results.append({
+                        'position_id': position_id,
+                        'success': False,
+                        'error': str(e),
+                        'size': pos_size
+                    })
+            
+            # 決済結果の集計
+            if success_count > 0:
+                # 約定確認（少し待ってから確認）
+                time.sleep(3)
+                
+                # 全約定サイズを取得
+                for result in close_results:
+                    if result.get('success'):
+                        order_id = result.get('order_id')
+                        executed_size = self.check_order_execution(order_id, symbol)
+                        if executed_size > 0:
+                            total_executed_size += float(executed_size)
+                
+                # 成功した決済がある場合
+                self.logger.info(f"{symbol}のポジション決済結果: 成功={success_count}, 失敗={failed_count}, 総約定サイズ={total_executed_size}")
+                
+                # 損益計算
+                if position == 'long':
+                    profit = (current_price - entry_price) * entry_size
+                    profit_pct = (current_price - entry_price) / entry_price * 100
+                else:  # 'short'
+                    profit = (entry_price - current_price) * entry_size
+                    profit_pct = (entry_price - current_price) / entry_price * 100
+                
+                # 手数料を考慮
+                #profit *= 0.9976  # 0.24%の手数料
+                
+                # 統計情報の更新
+                self.total_profit += profit
+                stats['total_trades'] += 1
+                stats['daily_trades'] += 1
+                
+                if profit > 0:
+                    stats['total_wins'] += 1
+                    stats['daily_wins'] += 1
+                    stats['total_profit'] += profit
+                    stats['daily_profit'] += profit
+                else:
+                    stats['total_losses'] += 1
+                    stats['daily_losses'] += 1
+                    stats['total_loss'] += abs(profit)
+                    stats['daily_loss'] += abs(profit)
+                
+                # ログ出力
+                entry_sentiment = getattr(self, 'sentiment', {}).copy() if hasattr(self, 'sentiment') else {}
+                self.log_exit(symbol, position, current_price, entry_price, datetime.now(), profit, profit_pct, exit_reason, hours, entry_sentiment)
+                
+                # 通知送信
+                if self.notification_settings['send_on_exit']:
+                    self.send_notification(
+                        f"{symbol} {position}決済",
+                        f"価格: {current_price:.2f}円\n"
+                        f"損益: {profit:.2f}円 ({profit_pct:+.2f}%)\n"
+                        f"保有時間: {hours:.1f}時間\n"
+                        f"理由: {exit_reason}\n"
+                        f"決済結果: 成功={success_count}, 失敗={failed_count}",
+                        "exit"
+                    )
+                
+                # 保存されていたスコア値を取得
+                saved_scores = self.entry_scores.get(symbol, {})
+
+                # 取引ログを記録
+                trade_log_exit = {
+                    'symbol': symbol,
+                    'type': position,
+                    'entry_price': entry_price,
+                    'entry_time': entry_time,
+                    'entry_atr': saved_scores.get('entry_atr', 0),  # ← この行を追加
+                    'entry_adx': saved_scores.get('entry_adx', 0),  
+                    'exit_price': current_price,
+                    'exit_time': datetime.now(),
+                    'size': entry_size,
+                    'profit': profit,
+                    'profit_pct': profit_pct,
+                    'exit_reason': exit_reason,
+                    'holding_hours': hours,
+                    # 保存されたスコア値を使用
+                    'rsi_score_long': saved_scores.get('rsi_score_long', 0),
+                    'rsi_score_short': saved_scores.get('rsi_score_short', 0),
+                    'cci_score_long': saved_scores.get('cci_score_long', 0),
+                    'cci_score_short': saved_scores.get('cci_score_short', 0),
+                    'volume_score': saved_scores.get('volume_score', 0),
+                    'bb_score_long': saved_scores.get('bb_score_long', 0),
+                    'bb_score_short': saved_scores.get('bb_score_short', 0),
+                    'ma_score_long': saved_scores.get('ma_score_long', 0),
+                    'ma_score_short': saved_scores.get('ma_score_short', 0),
+                    'adx_score_long': saved_scores.get('adx_score_long', 0),
+                    'adx_score_short': saved_scores.get('adx_score_short', 0),
+                    'mfi_score_long': saved_scores.get('mfi_score_long', 0),
+                    'mfi_score_short': saved_scores.get('mfi_score_short', 0),
+                    'atr_score_long': saved_scores.get('atr_score_long', 0),
+                    'atr_score_short': saved_scores.get('atr_score_short', 0),
+                    'macd_score_long': saved_scores.get('macd_score_long', 0),
+                    'macd_score_short': saved_scores.get('macd_score_short', 0) 
+                }
+                trade_logs.append(trade_log_exit)
+                
+                
+                # ポジション情報をリセット
+                self.positions[symbol] = None
+                self.entry_prices[symbol] = 0
+                self.entry_times[symbol] = None
+                self.entry_sizes[symbol] = 0
+                self.position_ids[symbol] = None  # ポジションIDもクリア
+                self.entry_scores[symbol] = {}
+                
+                # ポジション情報を保存
+                self.save_positions()
             else:
-                old_tp = self.exit_order_prices[symbol]["tp"]
-                old_sl = self.exit_order_prices[symbol]["sl"]
-                def _pct_diff(a, b):
-                    try:
-                        return abs(a - b) / ((abs(a) + abs(b)) / 2)
-                    except Exception:
-                        return 1.0
-                tp_changed = (old_tp is None) or (_pct_diff(old_tp, take_profit_price) > UPDATE_THRESHOLD_PCT)
-                sl_changed = (old_sl is None) or (_pct_diff(old_sl, stop_loss_price) > UPDATE_THRESHOLD_PCT)
-                if tp_changed or sl_changed:
-                    need_update = True
-
-            # 8) 更新不要なら終了（板を維持）
-            if not need_update:
-                return
-
-            # 9) 既存のTP/SL注文をキャンセル（あれば）
-            for k in ("tp", "sl"):
-                oid = self.exit_order_ids[symbol].get(k)
-                if oid:
-                    try:
-                        self.gmo_api.cancel_order(oid)
-                        self.logger.info(f"{symbol}: 既存{ k.upper() }指値をキャンセル (orderId={oid})")
-                    except Exception as e:
-                        # 既に約定/失効の可能性もあるので警告で続行
-                        self.logger.warning(f"{symbol}: {k.upper()}キャンセル失敗: {e}")
-                    finally:
-                        self.exit_order_ids[symbol][k] = None
-                        self.exit_order_prices[symbol][k] = None
-
-            # 10) 最新サイズでTP/SLのクローズ指値を再発注
-            #     （部分約定でサイズが減っている場合は current_size の残量で出し直す）
-            #     注意：取引所の仕様でクローズ指値は建玉単位 or 注文ID単位など差異があるため、
-            #           あなたの既存 close_position 実装に合わせてください。
-            # TP
-            try:
-                resp_tp = self.gmo_api.close_position(
-                    symbol=gmo_symbol,
-                    position_id=position_id,
-                    size=current_size,
-                    side=close_side,
-                    position_type="LIMIT",
-                    price=take_profit_price
+                # 全ての決済が失敗した場合
+                self.logger.error(f"{symbol}の全てのポジション決済に失敗しました")
+                
+                # 通知を送信
+                self.send_notification(
+                    f"決済エラー: {symbol} {position}",
+                    f"全てのポジション決済が失敗しました。手動での対応が必要かもしれません。",
+                    "error"
                 )
-                # レスポンスから orderId を取得（実装に合わせて取り出し）
-                order_id_tp = None
-                if isinstance(resp_tp, dict):
-                    data = resp_tp.get("data")
-                    if isinstance(data, dict):
-                        order_id_tp = data.get("orderId") or data.get("order_id")
-                    elif data is not None:
-                        order_id_tp = str(data)
-                self.exit_order_ids[symbol]["tp"] = str(order_id_tp) if order_id_tp else None
-                self.exit_order_prices[symbol]["tp"] = take_profit_price
-                self.logger.info(f"{symbol}: TPクローズ指値を発注 (price={take_profit_price}, size={current_size}, orderId={order_id_tp})")
-            except Exception as e:
-                self.logger.error(f"{symbol}: TPクローズ指値の発注失敗: {e}")
-
-            # SL
-            try:
-                resp_sl = self.gmo_api.close_position(
-                    symbol=gmo_symbol,
-                    position_id=position_id,
-                    size=current_size,
-                    side=close_side,
-                    position_type="LIMIT",
-                    price=stop_loss_price
-                )
-                order_id_sl = None
-                if isinstance(resp_sl, dict):
-                    data = resp_sl.get("data")
-                    if isinstance(data, dict):
-                        order_id_sl = data.get("orderId") or data.get("order_id")
-                    elif data is not None:
-                        order_id_sl = str(data)
-                self.exit_order_ids[symbol]["sl"] = str(order_id_sl) if order_id_sl else None
-                self.exit_order_prices[symbol]["sl"] = stop_loss_price
-                self.logger.info(f"{symbol}: SLクローズ指値を発注 (price={stop_loss_price}, size={current_size}, orderId={order_id_sl})")
-            except Exception as e:
-                self.logger.error(f"{symbol}: SLクローズ指値の発注失敗: {e}")
-
-            # 11) 最終更新バーを記録
-            self.last_exit_order_bar[symbol] = latest_bar_key
-
-        except Exception as e:
-            self.logger.exception(f"{symbol}: _check_exit_conditions 実行中にエラー: {e}")
-
 
     def _perform_health_check(self):
         """システムの健全性チェックを実行する"""
@@ -5208,74 +5239,6 @@ class CryptoTradingBot:
                 elif position_type == 'short' and minus_di < plus_di:
                     tp_pct *= 0.90
                     sl_pct *= 0.95
-
-            # ========== 追加機能: 逆方向 2 連続シグナルで狭め、同方向 2 連続で解除（ロック継続版） ==========
-            # 対象は確定足: -3, -2（= 直近2本のクローズ済バー）
-            # シグナル列が無い場合は score>=0.5 を True 相当とする
-            score_true_thresh = 0.5
-            has_buy_sig  = 'buy_signal'  in df_5min.columns
-            has_sell_sig = 'sell_signal' in df_5min.columns
-            has_buy_scr  = 'buy_score'   in df_5min.columns
-            has_sell_scr = 'sell_score'  in df_5min.columns
-
-            # 直近確定2本の True/False 配列を用意（不足・NaNは False 扱い）
-            if has_buy_sig:
-                buy_seq = df_5min['buy_signal'].iloc[-4:-1].fillna(False).astype(bool)
-            elif has_buy_scr:
-                buy_seq = (df_5min['buy_score'] >= score_true_thresh).iloc[-4:-1].fillna(False)
-            else:
-                buy_seq = None
-
-            if has_sell_sig:
-                sell_seq = df_5min['sell_signal'].iloc[-4:-1].fillna(False).astype(bool)
-            elif has_sell_scr:
-                sell_seq = (df_5min['sell_score'] >= score_true_thresh).iloc[-4:-1].fillna(False)
-            else:
-                sell_seq = None
-
-            # 2連続 True 判定
-            def is_three_streak_true(seq):
-                return seq is not None and len(seq) == 3 and all(seq)
-
-            # 狭め係数
-            opposite_streak_factor = 0.73
-
-            # --- 逆方向/同方向の2連続を判定 ---
-            if position_type == 'long':
-                opp_2streak  = is_three_streak_true(sell_seq)  # 逆方向（ロング時は sell）
-                same_2streak = is_three_streak_true(buy_seq)   # 同方向（ロング時は buy）
-            else:
-                opp_2streak  = is_three_streak_true(buy_seq)   # 逆方向（ショート時は buy）
-                same_2streak = is_three_streak_true(sell_seq)  # 同方向（ショート時は sell）
-
-            # --- 状態辞書の安全初期化（symbolが未登録でも落ちないように） ---
-            if not hasattr(self, 'opposite_narrow_state'):
-                self.opposite_narrow_state = {}
-            if symbol not in self.opposite_narrow_state:
-                self.opposite_narrow_state[symbol] = {'long': False, 'short': False}
-            if position_type not in self.opposite_narrow_state[symbol]:
-                self.opposite_narrow_state[symbol][position_type] = False
-
-            # 現在のロック状態を取得
-            lock_on = self.opposite_narrow_state[symbol][position_type]
-
-            # --- 状態更新ロジック ---
-            # 解除条件：同方向2連続が出たらロックOFF
-            if same_2streak:
-                lock_on = False
-            # 開始条件：逆方向2連続 かつ 同方向2連続なし → ロックON
-            elif opp_2streak and not same_2streak:
-                lock_on = True
-            # それ以外：状態維持（過去にONならONのまま、OFFならOFFのまま）
-
-            # 状態を保存
-            self.opposite_narrow_state[symbol][position_type] = lock_on
-
-            # --- 適用ロジック ---
-            # ロックONの間は毎バー狭めを継続（解除条件が出るまで継続）
-            if lock_on:
-                sl_pct *= opposite_streak_factor
-            # ======================================================================
 
             # エグジット価格計算
             if position_type == 'long':
