@@ -133,31 +133,30 @@ class GMOCoinAPI:
         return self._request("GET", path)
 
     def close_position(self, symbol, position_id, size, side, position_type="limit", price=None):
-        """ポジションを決済する（公式例準拠・最小修正で orderId を正規化して返す）
-
-        Parameters
-        ----------
-        symbol : str
-            通貨ペアシンボル（例: "ETH_JPY"）
-        position_id : int
-            建玉ID
-        size : str | float | int
-            決済サイズ
-        side : str
-            "BUY" or "SELL"（ロング決済=SELL / ショート決済=BUY）
-        position_type : str
-            "LIMIT" or "MARKET"（大文字小文字はどちらでも可）
-        price : str | float | int | None
-            LIMIT時の指値価格
         """
-        import json
+        ポジションを決済する（/v1/closeOrder）
+        - 公式仕様: 成功時のレスポンスは { "status": 0, "data": "<orderId文字列>", ... }
+        - 返り値は dict に統一し、orderId を orderId / order_id の両方に正規化（取得不可時は None）
+        - timeInForce は仕様上 FAS が既定のため明示指定しない（GTC は仕様外）
+        - ログを .info 多めで出力（開始/ペイロード/応答/抽出/フォールバック/完了 など）
+        """
+        import json, time
 
         path = "/v1/closeOrder"
-
-        # --- リクエスト組み立て（大文字正規化・型整形） ---
         exec_type = str(position_type).upper()
         side_up   = str(side).upper()
 
+        # === 入力ログ（開始） ===
+        start_ts = time.time()
+        try:
+            self.logger.info(
+                f"{symbol}: close_position START "
+                f"(side={side_up}, exec={exec_type}, size={size}, price={price}, position_id={position_id})"
+            )
+        except Exception:
+            pass  # logger未初期化でも落ちないように
+
+        # === リクエスト組み立て ===
         data = {
             "symbol": symbol,
             "side": side_up,
@@ -170,63 +169,101 @@ class GMOCoinAPI:
             ]
         }
 
-        # LIMIT のときだけ価格・TIF を付与（必要なければ timeInForce は削除可）
-        if exec_type == "LIMIT" and price is not None:
+        if exec_type == "LIMIT":
+            if price is None:
+                self.logger.error(f"{symbol}: close_position ERROR - LIMITにはpriceが必要です")
+                raise ValueError("close_position: LIMIT には price が必要です。")
             data["price"] = str(price)
-            data["timeInForce"] = "GTC"   # 板に残す運用。未指定でも良い環境ならこの行は削除OK。
 
-        # --- 発注 ---
-        resp = self._request("POST", path, data=data)
+        # ペイロード簡易ログ（署名や秘密は含まれない）
+        try:
+            self.logger.info(f"{symbol}: close_position payload={json.dumps(data, ensure_ascii=False)}")
+        except Exception:
+            pass
 
-        # --- レスポンス正規化（dictに統一 & orderId を極力埋める） ---
-        # 1) 文字列で返ってきた場合は JSON パースを試みる
+        # === リクエスト送信 ===
+        resp = None
+        try:
+            resp = self._request("POST", path, data=data)
+        except Exception as e:
+            elapsed_ms = int((time.time() - start_ts) * 1000)
+            self.logger.error(f"{symbol}: close_position REQUEST FAILED ({elapsed_ms}ms): {e}")
+            return {"status": -1, "orderId": None, "error": str(e)}
+
+        # 応答の型と一部情報をログ
+        elapsed_ms = int((time.time() - start_ts) * 1000)
+        try:
+            if isinstance(resp, dict):
+                keys = ",".join(list(resp.keys())[:6])
+                self.logger.info(f"{symbol}: close_position RESP({elapsed_ms}ms) type=dict status={resp.get('status')} keys=[{keys}]")
+            else:
+                preview = str(resp)
+                preview = preview[:240] + ("..." if len(preview) > 240 else "")
+                self.logger.info(f"{symbol}: close_position RESP({elapsed_ms}ms) type={type(resp).__name__} preview={preview}")
+        except Exception:
+            pass
+
+        # === レスポンス正規化 & orderId 抽出 ===
+        # 1) 文字列ならJSONパースを試みる
         if isinstance(resp, str):
             try:
                 resp_obj = json.loads(resp)
+                self.logger.info(f"{symbol}: close_position resp string -> parsed JSON")
             except Exception:
-                # パースできない場合はラップして返す（rawに格納）
+                self.logger.warning(f"{symbol}: close_position resp not JSON-parsable; returning raw")
                 return {"status": -1, "orderId": None, "raw": resp}
         elif isinstance(resp, dict):
             resp_obj = resp
         else:
-            # 想定外の型は raw として包む
+            self.logger.warning(f"{symbol}: close_position unexpected resp type={type(resp).__name__}; returning raw")
             return {"status": -1, "orderId": None, "raw": resp}
 
-        # 2) orderId 抽出（公式は data が "123456" の文字列 = orderId で返ることが多い）
         order_id = None
         d = resp_obj.get("data")
 
-        # (a) data が文字列ならそれが orderId
+        # (a) 公式仕様：data が文字列ならそれが orderId
         if isinstance(d, str) and d:
             order_id = d
-        # (b) data が dict の環境差対応
+            self.logger.info(f"{symbol}: close_position extracted orderId from data(str) -> {order_id}")
+        # (b) data が dict の場合（環境差対応）
         elif isinstance(d, dict):
             order_id = d.get("orderId") or d.get("order_id") or d.get("id")
+            self.logger.info(f"{symbol}: close_position extracted orderId from data(dict) -> {order_id}")
 
-        # (c) トップレベル直下の揺れにも対応
+        # (c) トップレベル直下にも揺れ対応
         if not order_id:
-            order_id = resp_obj.get("orderId") or resp_obj.get("order_id") or resp_obj.get("id")
+            top = resp_obj.get("orderId") or resp_obj.get("order_id") or resp_obj.get("id")
+            if top:
+                order_id = top
+                self.logger.info(f"{symbol}: close_position extracted orderId from top-level -> {order_id}")
 
-        # (d) まだ取れなければ、非同期の受付IDを暫定的に採用（後段で解決する想定）
+        # (d) 最終フォールバック：受付IDを暫定採用
         if not order_id:
             acc = None
             if isinstance(d, dict):
                 acc = d.get("orderAcceptanceId") or d.get("acceptanceId")
             acc = acc or resp_obj.get("orderAcceptanceId") or resp_obj.get("acceptanceId")
             if acc:
-                order_id = acc
+                order_id = str(acc)
+                self.logger.info(f"{symbol}: close_position fallback to acceptanceId as orderId -> {order_id}")
+            else:
+                self.logger.warning(f"{symbol}: close_position could NOT extract orderId (status={resp_obj.get('status')})")
 
-        # 3) 正規化して返す（呼び出し側の実装ゆれに備えて両キーを用意）
-        if order_id:
+        # 正規化して返す（呼び出し側の実装ゆれに備えて両キーを用意）
+        if order_id is not None:
             resp_obj["orderId"] = str(order_id)
             resp_obj["order_id"] = str(order_id)
-            return resp_obj
-        else:
-            # 取れなかった場合も raw を添えて返す（上位でフォールバック可能にする）
-            resp_obj.setdefault("orderId", None)
-            resp_obj.setdefault("order_id", None)
-            return resp_obj
 
+        # 完了ログ
+        try:
+            elapsed_total_ms = int((time.time() - start_ts) * 1000)
+            self.logger.info(
+                f"{symbol}: close_position DONE (orderId={order_id}, status={resp_obj.get('status')}, {elapsed_total_ms}ms)"
+            )
+        except Exception:
+            pass
+
+        return resp_obj
 
     # GMOCoinAPI クラス内に追加
     def cancel_order(self, order_id: str | int):
