@@ -133,22 +133,35 @@ class GMOCoinAPI:
         return self._request("GET", path)
 
     def close_position(self, symbol, position_id, size, side, position_type="limit", price=None):
-        """ポジションを決済する（公式例準拠）
-        
-        Parameters:
-        symbol (str): 通貨ペアシンボル
-        position_id (int): ポジションID
-        size (str): 決済サイズ
-        side (str): 取引サイド（BUY or SELL）
-        position_type (str): 注文タイプ（LIMIT or MARKET）
-        price (str): 指値価格（LIMIT注文の場合）
+        """ポジションを決済する（公式例準拠・最小修正で orderId を正規化して返す）
+
+        Parameters
+        ----------
+        symbol : str
+            通貨ペアシンボル（例: "ETH_JPY"）
+        position_id : int
+            建玉ID
+        size : str | float | int
+            決済サイズ
+        side : str
+            "BUY" or "SELL"（ロング決済=SELL / ショート決済=BUY）
+        position_type : str
+            "LIMIT" or "MARKET"（大文字小文字はどちらでも可）
+        price : str | float | int | None
+            LIMIT時の指値価格
         """
+        import json
+
         path = "/v1/closeOrder"
-        
+
+        # --- リクエスト組み立て（大文字正規化・型整形） ---
+        exec_type = str(position_type).upper()
+        side_up   = str(side).upper()
+
         data = {
             "symbol": symbol,
-            "side": side,
-            "executionType": position_type.upper(),
+            "side": side_up,
+            "executionType": exec_type,
             "settlePosition": [
                 {
                     "positionId": position_id,
@@ -156,14 +169,64 @@ class GMOCoinAPI:
                 }
             ]
         }
-        
-        # LIMIT注文の場合は価格とタイムインフォースを追加
-        if position_type.upper() == "LIMIT" and price:
+
+        # LIMIT のときだけ価格・TIF を付与（必要なければ timeInForce は削除可）
+        if exec_type == "LIMIT" and price is not None:
             data["price"] = str(price)
-            # NEW: 板に残したいので GTC を使う（取引所仕様に合わせて、未指定でもOKなら削除）
-            data["timeInForce"] = "GTC"   # ← ここを FAK から変更（またはこの行を削除）
-        
-        return self._request("POST", path, data=data)
+            data["timeInForce"] = "GTC"   # 板に残す運用。未指定でも良い環境ならこの行は削除OK。
+
+        # --- 発注 ---
+        resp = self._request("POST", path, data=data)
+
+        # --- レスポンス正規化（dictに統一 & orderId を極力埋める） ---
+        # 1) 文字列で返ってきた場合は JSON パースを試みる
+        if isinstance(resp, str):
+            try:
+                resp_obj = json.loads(resp)
+            except Exception:
+                # パースできない場合はラップして返す（rawに格納）
+                return {"status": -1, "orderId": None, "raw": resp}
+        elif isinstance(resp, dict):
+            resp_obj = resp
+        else:
+            # 想定外の型は raw として包む
+            return {"status": -1, "orderId": None, "raw": resp}
+
+        # 2) orderId 抽出（公式は data が "123456" の文字列 = orderId で返ることが多い）
+        order_id = None
+        d = resp_obj.get("data")
+
+        # (a) data が文字列ならそれが orderId
+        if isinstance(d, str) and d:
+            order_id = d
+        # (b) data が dict の環境差対応
+        elif isinstance(d, dict):
+            order_id = d.get("orderId") or d.get("order_id") or d.get("id")
+
+        # (c) トップレベル直下の揺れにも対応
+        if not order_id:
+            order_id = resp_obj.get("orderId") or resp_obj.get("order_id") or resp_obj.get("id")
+
+        # (d) まだ取れなければ、非同期の受付IDを暫定的に採用（後段で解決する想定）
+        if not order_id:
+            acc = None
+            if isinstance(d, dict):
+                acc = d.get("orderAcceptanceId") or d.get("acceptanceId")
+            acc = acc or resp_obj.get("orderAcceptanceId") or resp_obj.get("acceptanceId")
+            if acc:
+                order_id = acc
+
+        # 3) 正規化して返す（呼び出し側の実装ゆれに備えて両キーを用意）
+        if order_id:
+            resp_obj["orderId"] = str(order_id)
+            resp_obj["order_id"] = str(order_id)
+            return resp_obj
+        else:
+            # 取れなかった場合も raw を添えて返す（上位でフォールバック可能にする）
+            resp_obj.setdefault("orderId", None)
+            resp_obj.setdefault("order_id", None)
+            return resp_obj
+
 
     # GMOCoinAPI クラス内に追加
     def cancel_order(self, order_id: str | int):
