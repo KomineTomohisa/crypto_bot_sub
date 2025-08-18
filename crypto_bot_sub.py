@@ -4554,9 +4554,9 @@ class CryptoTradingBot:
                 symbol=symbol,
                 df_5min=df_5min,
                 position_type=position,
-                entry_price=entry_price,
-                holding_minutes=None  # 既存実装に合わせて必要なら算出して渡す
+                entry_price=entry_price
             )
+
             try:
                 take_profit_price = float(exit_levels["take_profit_price"])
                 stop_loss_price   = float(exit_levels["stop_loss_price"])
