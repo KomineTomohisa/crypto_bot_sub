@@ -2361,10 +2361,10 @@ class CryptoTradingBot:
             'doge_jpy': {'buy': 0.51, 'sell': 0.51},
             'sol_jpy':  {'buy': 0.20, 'sell': 0.30},
             'xrp_jpy':  {'buy': 0.40, 'sell': 0.40},
-            'ltc_jpy':  {'buy': 0.60, 'sell': 0.55},
+            'ltc_jpy':  {'buy': 0.60, 'sell': 0.60},
             'ada_jpy':  {'buy': 0.45, 'sell': 0.45},
             'eth_jpy':  {'buy': 0.51, 'sell': 0.51},
-            'bcc_jpy':  {'buy': 0.55, 'sell': 0.55},
+            'bcc_jpy':  {'buy': 0.60, 'sell': 0.55},
         }
 
         # デフォルト閾値（上記に含まれていない通貨ペア用）
@@ -2857,6 +2857,9 @@ class CryptoTradingBot:
         total_balance = self.initial_capital + self.total_profit
         trade_logs = []  # 全取引ログを格納
 
+        # 銘柄ごとのシグナル蓄積用（リスト→後で結合）
+        signal_rows = {symbol: [] for symbol in self.symbols}
+
         def run_backtest(symbol):
             # 各通貨ペア専用の変数（スレッドローカル）
             total_trades = 0
@@ -2956,6 +2959,28 @@ class CryptoTradingBot:
                         continue
                         
                     self.logger.info(f"データ抽出完了: {symbol}, 最終データ数: {len(df_5min)}")
+
+                    # NaN 安全化（既存の最終確認と同趣旨）
+                    if 'buy_signal' in df_5min.columns and pd.isna(df_5min['buy_signal']).any():
+                        df_5min['buy_signal'] = df_5min['buy_signal'].fillna(False)
+                    if 'sell_signal' in df_5min.columns and pd.isna(df_5min['sell_signal']).any():
+                        df_5min['sell_signal'] = df_5min['sell_signal'].fillna(False)
+
+                    # 追加：その日のシグナルを rows に蓄積
+                    if 'timestamp' in df_5min.columns:
+                        sig_day = df_5min[['timestamp', 'buy_signal', 'sell_signal']].copy()
+                    else:
+                        # timestamp 列がない場合はインデックスを時刻として使う
+                        sig_day = df_5min.copy()
+                        sig_day = sig_day.reset_index().rename(columns={'index': 'timestamp'})
+                        sig_day = sig_day[['timestamp', 'buy_signal', 'sell_signal']]
+
+                    # 型を揃える（Excel 側のリサンプリングで都合が良いように）
+                    sig_day['timestamp'] = pd.to_datetime(sig_day['timestamp'], errors='coerce')
+                    sig_day['buy_signal'] = sig_day['buy_signal'].fillna(False).astype(bool)
+                    sig_day['sell_signal'] = sig_day['sell_signal'].fillna(False).astype(bool)
+
+                    signal_rows[symbol].append(sig_day)
 
                     # バックテスト処理
                     position = None
@@ -3110,6 +3135,8 @@ class CryptoTradingBot:
                                 exit_reason = "利益確定" if profit > 0 else "損切り"
                                 self.log_exit(symbol, 'long', exit_price, entry_price, timestamp, profit, profit_pct, exit_reason, hours, entry_sentiment)
 
+                                buy5, sell5 = self._last5_flags_str(df_5min, i)
+
                                 # 取引記録（スレッドローカル）
                                 trade_data = {
                                     'symbol': symbol,
@@ -3132,6 +3159,8 @@ class CryptoTradingBot:
                                     'profit_pct': profit_pct,
                                     'exit_reason': exit_reason,
                                     'holding_hours': hours,
+                                    'exit_buy_last5': buy5,
+                                    'exit_sell_last5': sell5,
                                     'sentiment_bullish': entry_sentiment.get('bullish', 0),
                                     'sentiment_bearish': entry_sentiment.get('bearish', 0),
                                     'sentiment_volatility': entry_sentiment.get('volatility', 0),
@@ -3193,6 +3222,8 @@ class CryptoTradingBot:
                                 exit_reason = "利益確定" if profit > 0 else "損切り"
                                 self.log_exit(symbol, 'short', exit_price, entry_price, timestamp, profit, profit_pct, exit_reason, hours, entry_sentiment)
 
+                                buy5, sell5 = self._last5_flags_str(df_5min, i)
+
                                 # 取引記録（スレッドローカル）
                                 trade_data = {
                                     'symbol': symbol,
@@ -3215,6 +3246,8 @@ class CryptoTradingBot:
                                     'profit_pct': profit_pct,
                                     'exit_reason': exit_reason,
                                     'holding_hours': hours,
+                                    'exit_buy_last5': buy5,
+                                    'exit_sell_last5': sell5,
                                     'sentiment_bullish': entry_sentiment.get('bullish', 0),
                                     'sentiment_bearish': entry_sentiment.get('bearish', 0),
                                     'sentiment_volatility': entry_sentiment.get('volatility', 0),
@@ -3305,9 +3338,29 @@ class CryptoTradingBot:
         # 取引詳細の最終サマリー出力
         self.output_trade_summary(trade_logs)
 
+        signal_history = {}
+        for sym, parts in signal_rows.items():
+            if not parts:
+                continue
+            df = pd.concat(parts, ignore_index=True)
+
+            # timestamp 整理
+            df = df.dropna(subset=['timestamp'])
+            df = df.sort_values('timestamp').drop_duplicates(subset=['timestamp'], keep='last').reset_index(drop=True)
+
+            # DatetimeIndex 化
+            df = df.set_index('timestamp')
+
+            # 必須2列だけ渡す
+            signal_history[sym] = df[['buy_signal', 'sell_signal']]
+
         # Excelファイルに取引ログを保存
         if trade_logs:
-            self.save_trade_logs_to_excel(trade_logs)
+            try:
+                self.save_trade_logs_to_excel(trade_logs, signal_history)  # ← 変更点
+            except Exception as e:
+                self.logger.error(f"取引ログExcelの保存に失敗: {e}")
+
 
         # バックテストの全体結果
         backtest_profit = self.total_profit - start_profit
@@ -3383,7 +3436,16 @@ class CryptoTradingBot:
             self.logger.info(f"  保有時間: {trade['holding_hours']:.1f}時間")
             self.logger.info("")
 
-    def save_trade_logs_to_excel(self, trade_logs):
+    def _last5_flags_str(self, df_5min, end_idx):
+        def seq(col):
+            if col in df_5min.columns:
+                s = df_5min[col].iloc[max(0, end_idx-5):end_idx].fillna(False).astype(bool)
+                return ''.join('1' if v else '0' for v in s.tolist()).rjust(5, '0')
+            return None
+        return seq('buy_signal'), seq('sell_signal')
+
+
+    def save_trade_logs_to_excel(self, trade_logs, signal_history=None):
         """
         取引ログを通貨ペアごとにシート分割して Excel (.xlsx) で保存する
         追加シートとして各通貨ペアのロング/ショート統計情報も保存
@@ -3417,7 +3479,9 @@ class CryptoTradingBot:
             'adx_score_long', 'adx_score_short',
             'mfi_score_long', 'mfi_score_short',
             'atr_score_long', 'atr_score_short',
-            'macd_score_long', 'macd_score_short'
+            'macd_score_long', 'macd_score_short',
+            'exit_buy_last5', 'exit_sell_last5'
+
         ]
         
         # 必要な列が存在しない場合は追加
@@ -3617,186 +3681,136 @@ class CryptoTradingBot:
                 position_sheet.insert_chart('D2', position_chart)
 
                 # 5. 修正版：総合タイムライン（ポジションタイムラインシートは削除）
-                self._create_overall_timeline_chart_fixed(writer, df_trades)
+                self._create_overall_timeline_chart_fixed(writer, df_trades, signal_history)
 
         self.logger.info(f"取引ログを Excel に保存しました: {trade_log_file}")
 
-    def _create_overall_timeline_chart_fixed(self, writer, df_trades):
+    def _create_overall_timeline_chart_fixed(self, writer, df_trades, signal_history=None):
         """
-        全通貨ペアのポジション保有状況を一つのタイムラインで表示（修正版）
-        条件付き書式を正しく適用し、ポジションタイムラインシートは作成しない
-        
-        Parameters:
-        writer: ExcelWriter オブジェクト
-        df_trades: 取引データのDataFrame
+        全通貨ペアのタイムラインを表示
+        1ブロック(3行) = [ポジション, buy_signal, sell_signal]
+        列は15分単位
         """
         try:
             workbook = writer.book
-            
-            # 時間範囲を決定
+            overall_sheet = workbook.add_worksheet('総合タイムライン')
+
+            # === 時間範囲（15分刻み） ===
             all_times = []
-            for _, trade in df_trades.iterrows():
-                if pd.notna(trade['entry_time']) and pd.notna(trade['exit_time']):
-                    all_times.extend([trade['entry_time'], trade['exit_time']])
-            
+            for _, tr in df_trades.iterrows():
+                if pd.notna(tr.get('entry_time')) and pd.notna(tr.get('exit_time')):
+                    all_times.extend([pd.to_datetime(tr['entry_time']),
+                                    pd.to_datetime(tr['exit_time'])])
             if not all_times:
                 self.logger.warning("総合タイムライン作成：有効な時間データがありません")
                 return
-            
-            # 時間を datetime に変換
-            all_times = [pd.to_datetime(t) if not isinstance(t, pd.Timestamp) else t for t in all_times]
-            min_time = min(all_times)
-            max_time = max(all_times)
-            
-            # 総合タイムラインシートを作成
-            overall_sheet = workbook.add_worksheet('総合タイムライン')
-            
-            # 通貨ペアリストを取得
-            symbols = sorted(df_trades['symbol'].unique())
-            symbol_to_row = {symbol: i + 1 for i, symbol in enumerate(symbols)}
-            
-            # 時間軸データを準備（1時間単位）
-            total_hours = int((max_time - min_time).total_seconds() // 3600) + 1
-            max_display_hours = min(total_hours, 2200)  # 最大200時間まで表示（Excel制限対策）
-            
-            # ヘッダー設定
-            headers = ['通貨ペア'] + [f'時間{i}' for i in range(max_display_hours)]
-            for col, header in enumerate(headers):
-                overall_sheet.write(0, col, header)
-            
-            # 通貨ペア名を書き込み
-            for i, symbol in enumerate(symbols):
-                overall_sheet.write(i + 1, 0, symbol)
-            
-            # 各ポジションの保有状況をマッピング（利益・損失情報付き）
-            position_matrix = {}
-            profit_matrix = {}  # 利益情報を別途保存
-            
-            for symbol in symbols:
-                position_matrix[symbol] = [0] * max_display_hours  # 0: ポジションなし, 1: ロング, -1: ショート
-                profit_matrix[symbol] = [0] * max_display_hours    # 0: ポジションなし, 1: 利益, -1: 損失
-            
-            # ポジションデータを時間軸にマッピング（利益・損失情報付き）
-            for _, trade in df_trades.iterrows():
-                if pd.notna(trade['entry_time']) and pd.notna(trade['exit_time']):
-                    symbol = trade['symbol']
-                    entry_time = pd.to_datetime(trade['entry_time'])
-                    exit_time = pd.to_datetime(trade['exit_time'])
-                    
-                    # 基準時刻からの経過時間を計算（時間単位）
-                    start_hour = int((entry_time - min_time).total_seconds() // 3600)
-                    end_hour = int((exit_time - min_time).total_seconds() // 3600)
-                    
-                    position_value = 1 if trade['type'] == 'long' else -1
-                    profit_value = 1 if trade.get('profit', 0) > 0 else -1  # 利益なら1、損失なら-1
-                    
-                    for hour in range(start_hour, min(end_hour + 1, max_display_hours)):
-                        if 0 <= hour < max_display_hours:
-                            position_matrix[symbol][hour] = position_value
-                            profit_matrix[symbol][hour] = profit_value
-            
-            # 条件付き書式用のフォーマットを定義（利益・損失別）
-            # ロングポジション
-            long_profit_format = workbook.add_format({
-                'bg_color': '#00AA00',  # 濃い緑（ロング利益）
-                'font_color': '#FFFFFF',  # 白文字
-                'align': 'center'
-            })
-            
-            long_loss_format = workbook.add_format({
-                'bg_color': '#90EE90',  # ライトグリーン（ロング損失）
-                'font_color': '#006400',  # ダークグリーン
-                'align': 'center'
-            })
-            
-            # ショートポジション
-            short_profit_format = workbook.add_format({
-                'bg_color': '#CC0000',  # 濃い赤（ショート利益）
-                'font_color': '#FFFFFF',  # 白文字
-                'align': 'center'
-            })
-            
-            short_loss_format = workbook.add_format({
-                'bg_color': '#FFB6C1',  # ライトピンク（ショート損失）
-                'font_color': '#8B0000',  # ダークレッド
-                'align': 'center'
-            })
-            
-            no_position_format = workbook.add_format({
-                'bg_color': '#F5F5F5',  # ライトグレー
-                'align': 'center'
-            })
-            
-            # Excel列参照を正しく生成する関数
-            def get_excel_column_letter(col_num):
-                """
-                数値からExcel列参照を生成する
-                例: 0 -> A, 25 -> Z, 26 -> AA, 27 -> AB, ...
-                """
-                result = ""
-                while col_num >= 0:
-                    remainder = col_num % 26
-                    result = chr(65 + remainder) + result  # 65 = 'A'のASCIIコード
-                    col_num = (col_num // 26) - 1
-                    if col_num < 0:
-                        break
-                return result
 
-            # データ範囲を計算
-            end_col_letter = get_excel_column_letter(max_display_hours)
-            data_range = f'B2:{end_col_letter}{len(symbols) + 1}'
-            
-            # 修正：利益・損失に応じてフォーマットを適用
-            # 各セルを個別にフォーマット（ポジションタイプ＋利益・損失で色分け）
-            for row_idx, symbol in enumerate(symbols):
-                for col_idx in range(max_display_hours):
-                    cell_row = row_idx + 1  # データは2行目から開始（0-indexedなので+1）
-                    cell_col = col_idx + 1  # データは2列目から開始（0-indexedなので+1）
-                    
-                    position_value = position_matrix[symbol][col_idx]
-                    profit_value = profit_matrix[symbol][col_idx]
-                    
-                    # フォーマットの選択
-                    if position_value == 1:  # ロングポジション
-                        if profit_value == 1:  # 利益
-                            format_to_use = long_profit_format
-                            display_value = "L+"  # ロング利益
-                        else:  # 損失
-                            format_to_use = long_loss_format
-                            display_value = "L-"  # ロング損失
-                    elif position_value == -1:  # ショートポジション
-                        if profit_value == 1:  # 利益
-                            format_to_use = short_profit_format
-                            display_value = "S+"  # ショート利益
-                        else:  # 損失
-                            format_to_use = short_loss_format
-                            display_value = "S-"  # ショート損失
-                    else:  # ポジションなし
-                        format_to_use = no_position_format
-                        display_value = ""  # 空白
-                    
-                    overall_sheet.write(cell_row, cell_col, display_value, format_to_use)
-            
-            # カラム幅を調整
-            overall_sheet.set_column('A:A', 15)  # 通貨ペア列
-            overall_sheet.set_column('B:' + get_excel_column_letter(max_display_hours), 3)  # 時間列（狭くして多くの時間を表示）
-            
-            # 説明テキストを追加（更新された凡例）
-            overall_sheet.write(len(symbols) + 3, 0, '凡例:')
-            overall_sheet.write(len(symbols) + 4, 0, 'L+ = ロング利益', long_profit_format)
-            overall_sheet.write(len(symbols) + 5, 0, 'L- = ロング損失', long_loss_format)
-            overall_sheet.write(len(symbols) + 6, 0, 'S+ = ショート利益', short_profit_format)
-            overall_sheet.write(len(symbols) + 7, 0, 'S- = ショート損失', short_loss_format)
-            overall_sheet.write(len(symbols) + 8, 0, '空白 = ポジションなし', no_position_format)
-            
-            # 時間範囲の説明
-            overall_sheet.write(len(symbols) + 8, 0, f'期間: {min_time.strftime("%Y-%m-%d %H:%M")} ～ {max_time.strftime("%Y-%m-%d %H:%M")}')
-            overall_sheet.write(len(symbols) + 9, 0, f'表示時間: {max_display_hours}時間（総時間: {total_hours}時間）')
-            
-            self.logger.info("総合タイムライングラフを作成しました")
-            
+            min_time = min(all_times).floor('15min')
+            max_time = max(all_times).ceil('15min')
+            total_quarters = int((max_time - min_time).total_seconds() // 900) + 1  # 900秒=15分
+            max_display_quarters = min(total_quarters, 8800)  # 列数上限
+
+            symbols = sorted(df_trades['symbol'].unique())
+
+            # === ヘッダ ===
+            headers = ['通貨/種別'] + [
+                (min_time + pd.Timedelta(minutes=15*i)).strftime("%m-%d %H:%M")
+                for i in range(max_display_quarters)
+            ]
+            for col, h in enumerate(headers):
+                overall_sheet.write(0, col, h)
+
+            # === フォーマット定義 ===
+            fmt_long  = workbook.add_format({'bg_color': '#9AD9A1'})   # 濃い緑
+            fmt_short = workbook.add_format({'bg_color': '#F28B82'})   # 濃い赤
+            fmt_buy   = workbook.add_format({'bg_color': '#D7ECD9'})   # 薄緑
+            fmt_sell  = workbook.add_format({'bg_color': '#FDE2E1'})   # 薄赤
+            fmt_gray  = workbook.add_format({'font_color': '#999999'}) # 数字グレー
+
+            # === 事前に行列を用意 ===
+            def quarter_idx(ts):
+                return int((ts - min_time).total_seconds() // 900)
+
+            pos_matrix  = {s: [0]*max_display_quarters for s in symbols}
+            buy_matrix  = {s: [0]*max_display_quarters for s in symbols}
+            sell_matrix = {s: [0]*max_display_quarters for s in symbols}
+
+            # === ポジション埋め ===
+            for _, tr in df_trades.iterrows():
+                if pd.isna(tr.get('entry_time')) or pd.isna(tr.get('exit_time')):
+                    continue
+                s = tr['symbol']
+                start = max(0, min(max_display_quarters-1,
+                                quarter_idx(pd.to_datetime(tr['entry_time']))))
+                end   = max(0, min(max_display_quarters-1,
+                                quarter_idx(pd.to_datetime(tr['exit_time']))))
+                pv = 1 if tr.get('type') == 'long' else -1
+                for q in range(start, end+1):
+                    pos_matrix[s][q] = pv
+
+            # === シグナル埋め ===
+            if signal_history:
+                for s in symbols:
+                    df_sig = signal_history.get(s)
+                    if df_sig is None or not {'buy_signal', 'sell_signal'} <= set(df_sig.columns):
+                        continue
+                    df_sig = df_sig.copy()
+                    if not isinstance(df_sig.index, pd.DatetimeIndex):
+                        if 'timestamp' in df_sig.columns:
+                            df_sig.set_index(pd.to_datetime(df_sig['timestamp']), inplace=True)
+                        else:
+                            continue
+                    # 15分単位に resample
+                    quarterly = (
+                        df_sig[['buy_signal', 'sell_signal']]
+                        .astype(bool)
+                        .resample('15min', label='left', closed='left')
+                        .max()
+                        .fillna(False)
+                    )
+                    for q in range(max_display_quarters):
+                        bucket_start = min_time + pd.Timedelta(minutes=15*q)
+                        if bucket_start in quarterly.index:
+                            if bool(quarterly.at[bucket_start, 'buy_signal']):
+                                buy_matrix[s][q] = 1
+                            if bool(quarterly.at[bucket_start, 'sell_signal']):
+                                sell_matrix[s][q] = 1
+
+            # === シート出力 ===
+            for i, s in enumerate(symbols):
+                row_base = 1 + i*3
+                overall_sheet.write(row_base + 0, 0, f'{s} (position)')
+                overall_sheet.write(row_base + 1, 0, f'{s} buy_signal')
+                overall_sheet.write(row_base + 2, 0, f'{s} sell_signal')
+
+                # 値書き込み
+                for q in range(max_display_quarters):
+                    overall_sheet.write(row_base + 0, 1+q, pos_matrix[s][q])
+                    overall_sheet.write(row_base + 1, 1+q, buy_matrix[s][q])
+                    overall_sheet.write(row_base + 2, 1+q, sell_matrix[s][q])
+
+                # 条件付き書式（色付け）
+                overall_sheet.conditional_format(row_base + 0, 1, row_base + 0, max_display_quarters,
+                                                {'type': 'cell', 'criteria': '==', 'value': 1,  'format': fmt_long})
+                overall_sheet.conditional_format(row_base + 0, 1, row_base + 0, max_display_quarters,
+                                                {'type': 'cell', 'criteria': '==', 'value': -1, 'format': fmt_short})
+                overall_sheet.conditional_format(row_base + 1, 1, row_base + 1, max_display_quarters,
+                                                {'type': 'cell', 'criteria': '==', 'value': 1,  'format': fmt_buy})
+                overall_sheet.conditional_format(row_base + 2, 1, row_base + 2, max_display_quarters,
+                                                {'type': 'cell', 'criteria': '==', 'value': 1,  'format': fmt_sell})
+
+                # 数字をグレーに（任意）
+                overall_sheet.conditional_format(row_base, 1, row_base+2, max_display_quarters,
+                                                {'type': 'cell', 'criteria': '>=', 'value': -1, 'format': fmt_gray})
+
+            # 先頭列の幅を広げる
+            overall_sheet.set_column(0, 0, 22)
+
         except Exception as e:
-            self.logger.error(f"総合タイムライングラフ作成エラー: {e}", exc_info=True)
+            self.logger.error(f"総合タイムライン作成エラー: {e}", exc_info=True)
+
+
+
 
     def save_backtest_result(self, results, days_to_test, start_profit):
         """バックテスト結果をJSONファイルに保存"""
@@ -5239,6 +5253,81 @@ class CryptoTradingBot:
                 elif position_type == 'short' and minus_di < plus_di:
                     tp_pct *= 0.90
                     sl_pct *= 0.95
+
+            # ========== 逆方向 4本中3本で開始、同方向 2本連続で解除（ロック継続版） ==========
+            # 対象バー：確定足のみ（-1 は含めない）
+            score_true_thresh = 0.5
+            has_buy_sig  = 'buy_signal'  in df_5min.columns
+            has_sell_sig = 'sell_signal' in df_5min.columns
+            has_buy_scr  = 'buy_score'   in df_5min.columns
+            has_sell_scr = 'sell_score'  in df_5min.columns
+
+            def lastN_bool(series_or_boollike, N):
+                """確定N本（終値確定済み）を True/False 配列で取得（不足・NaNは False 扱い）"""
+                seq = series_or_boollike.iloc[-(N+1):-1]  # 例: N=4 → -5:-1（-5,-4,-3,-2）
+                return seq.fillna(False).astype(bool)
+
+            # ---- True/False 配列の用意（フォールバック：score >= 0.5） ----
+            if has_buy_sig:
+                buy_seq4 = lastN_bool(df_5min['buy_signal'], 4)
+                buy_seq2 = lastN_bool(df_5min['buy_signal'], 2)
+            elif has_buy_scr:
+                buy_seq4 = lastN_bool(df_5min['buy_score'] >= score_true_thresh, 4)
+                buy_seq2 = lastN_bool(df_5min['buy_score'] >= score_true_thresh, 2)
+            else:
+                buy_seq4 = buy_seq2 = None
+
+            if has_sell_sig:
+                sell_seq4 = lastN_bool(df_5min['sell_signal'], 4)
+                sell_seq2 = lastN_bool(df_5min['sell_signal'], 2)
+            elif has_sell_scr:
+                sell_seq4 = lastN_bool(df_5min['sell_score'] >= score_true_thresh, 4)
+                sell_seq2 = lastN_bool(df_5min['sell_score'] >= score_true_thresh, 2)
+            else:
+                sell_seq4 = sell_seq2 = None
+
+            def is_three_of_four(seq):
+                return (seq is not None) and (len(seq) == 4) and (int(seq.sum()) >= 3)
+
+            def is_two_streak_true(seq):
+                return (seq is not None) and (len(seq) == 2) and bool(seq.iloc[0]) and bool(seq.iloc[1])
+
+            # ---- 開始（逆方向3/4）／解除（同方向2連続）の判定 ----
+            if position_type == 'long':
+                opp_start   = is_three_of_four(sell_seq4)   # 逆方向（ロング時は sell）が4本中3本
+                same_unlock = is_two_streak_true(buy_seq2)  # 同方向（ロング時は buy）が2本連続
+            else:  # short
+                opp_start   = is_three_of_four(buy_seq4)    # 逆方向（ショート時は buy）が4本中3本
+                same_unlock = is_two_streak_true(sell_seq2) # 同方向（ショート時は sell）が2本連続
+
+            # ---- 状態辞書の安全初期化 ----
+            if not hasattr(self, 'opposite_narrow_state'):
+                self.opposite_narrow_state = {}
+            if symbol not in self.opposite_narrow_state:
+                self.opposite_narrow_state[symbol] = {'long': False, 'short': False}
+            if position_type not in self.opposite_narrow_state[symbol]:
+                self.opposite_narrow_state[symbol][position_type] = False
+
+            lock_on = self.opposite_narrow_state[symbol][position_type]
+
+            # ---- 状態更新ロジック ----
+            # 解除：同方向が2本連続で出たらロックOFF
+            if same_unlock:
+                lock_on = False
+            # 開始：逆方向が4本中3本 かつ 解除条件は出ていない → ロックON
+            elif opp_start and not same_unlock:
+                lock_on = True
+            # それ以外：状態維持
+
+            # 保存
+            self.opposite_narrow_state[symbol][position_type] = lock_on
+
+            # ---- 適用 ----
+            opposite_streak_factor = 0.70  # 狭め係数（必要に応じて調整）
+            if lock_on:
+                sl_pct *= opposite_streak_factor
+            # ======================================================================
+
 
             # エグジット価格計算
             if position_type == 'long':
