@@ -466,6 +466,8 @@ class CryptoTradingBot:
             'bcc_jpy': 0.1,     # BCH
             'ada_jpy': 10      # ADA
         }
+
+        self.reentry_block_until = {symbol: None for symbol in self.symbols}
         
         # 保存されたポジション情報を読み込む
         self.load_positions()
@@ -3809,9 +3811,6 @@ class CryptoTradingBot:
         except Exception as e:
             self.logger.error(f"総合タイムライン作成エラー: {e}", exc_info=True)
 
-
-
-
     def save_backtest_result(self, results, days_to_test, start_profit):
         """バックテスト結果をJSONファイルに保存"""
         backtest_profit = self.total_profit - start_profit
@@ -3980,27 +3979,26 @@ class CryptoTradingBot:
                             
                             # ポジションがない場合のエントリー判断
                             if position is None:
+                                # ★ ここから追加: 再エントリー解禁時刻のチェック
+                                unlock_time = self.reentry_block_until.get(symbol)
+                                if unlock_time is not None and datetime.now() < unlock_time:
+                                    remain = (unlock_time - datetime.now()).total_seconds()
+                                    self.logger.info(
+                                        f"{symbol}: 決済直後のクールダウン中（次の15分足待ち）。残り {remain:.0f} 秒は新規エントリー判定をスキップ"
+                                    )
+                                    # このシンボルの残処理をスキップ
+                                    continue
 
-                                # if symbol == 'doge_jpy':
-                                #     self.logger.info(f"ETH: 強制売りシグナル設定")
-                                #     # DataFrameのコピーを作成してからアクセスする
-                                #     latest_signals = latest_signals.copy()
-                                #     latest_signals['sell_signal'] = True
-                                # elif symbol == 'sol_jpy':
-                                #     self.logger.info(f"ETH: 強制売りシグナル設定")
-                                #     # DataFrameのコピーを作成してからアクセスする
-                                #     latest_signals = latest_signals.copy()
-                                #     latest_signals['sell_signal'] = True
-                                # else:
-                                #     buy_signal = latest_signals.get('buy_signal', False)
-    
-                                # 買いシグナル検出
-                                if latest_signals.get('buy_signal', False) and previous_signals.get('buy_signal', False):
-                                    self._handle_entry(symbol, 'long', latest_signals, stats, trade_logs)                                   
-                                
-                                # 売りシグナル検出
-                                elif latest_signals.get('sell_signal', False) and previous_signals.get('sell_signal', False):
-                                    self._handle_entry(symbol, 'short', latest_signals, stats, trade_logs)
+                                else:
+                                    # 解禁済みなら通常のエントリー判定
+                                    if latest_signals.get('buy_signal', False) and previous_signals.get('buy_signal', False):
+                                        self._handle_entry(symbol, 'long', latest_signals, stats, trade_logs)
+                                        # エントリーできたのでブロック情報は不要
+                                        self.reentry_block_until[symbol] = None
+                                    elif latest_signals.get('sell_signal', False) and previous_signals.get('sell_signal', False):
+                                        self._handle_entry(symbol, 'short', latest_signals, stats, trade_logs)
+                                        self.reentry_block_until[symbol] = None
+
                             
                             # ポジションがある場合のイグジット判断
                             elif position is not None:
@@ -4470,6 +4468,13 @@ class CryptoTradingBot:
             error_message = order_result.get('error', '不明なエラー')
             self.logger.error(f" {symbol}の{position_type}エントリー注文が失敗しました: {error_message}")
 
+    def _ceil_to_next_15min(self, ts):
+        """ts の次の15分境界（:00/:15/:30/:45 の“次”）を返す"""
+        ts = ts.replace(second=0, microsecond=0)
+        add = 15 - (ts.minute % 15)
+        if add == 0:
+            add = 15
+        return ts + timedelta(minutes=add)
 
     def _check_exit_conditions(self, symbol, stats, trade_logs, df_5min):
         """イグジット条件をチェックし、必要に応じて決済を実行する（backtest関数と整合性あり）
@@ -4779,7 +4784,6 @@ class CryptoTradingBot:
                 }
                 trade_logs.append(trade_log_exit)
                 
-                
                 # ポジション情報をリセット
                 self.positions[symbol] = None
                 self.entry_prices[symbol] = 0
@@ -4787,7 +4791,14 @@ class CryptoTradingBot:
                 self.entry_sizes[symbol] = 0
                 self.position_ids[symbol] = None  # ポジションIDもクリア
                 self.entry_scores[symbol] = {}
-                
+
+                now = datetime.now()
+                unlock_time = self._ceil_to_next_15min(now)
+                self.reentry_block_until[symbol] = unlock_time
+                self.logger.info(
+                    f"{symbol}: 決済後の再エントリーを次の15分足開始までブロックします（解禁: {unlock_time}）"
+                )
+
                 # ポジション情報を保存
                 self.save_positions()
             else:
