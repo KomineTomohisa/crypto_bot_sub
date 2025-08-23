@@ -2281,6 +2281,9 @@ class CryptoTradingBot:
                         df[col] = df[col].fillna(0.04)
                     else:
                         df[col] = df[col].fillna(0)
+
+            numeric_cols = df.select_dtypes(include=[np.number]).columns
+            df[numeric_cols] = df[numeric_cols].round(4)
             
             # 結果の検証
             debug_info = {
@@ -3967,6 +3970,10 @@ class CryptoTradingBot:
                             
                             # シグナル生成（センチメント考慮版）
                             df_5min = self.generate_signals_with_sentiment(symbol, df_5min, df_hourly)
+
+                            df_5min = df_5min.sort_values('timestamp').reset_index(drop=True)
+                            if len(df_5min) > 96:
+                                df_5min = df_5min.iloc[-96:].copy().reset_index(drop=True)
                             
                             # 最新のシグナル情報を取得
                             latest_signals = df_5min.iloc[-2]
@@ -4192,100 +4199,94 @@ class CryptoTradingBot:
             self.logger.info("現在ポジションはありません")
 
     def _get_market_data(self, symbol):
-        """市場データを取得する（完全な24時間分の30分足データを確保）
-        
-        Parameters:
-        symbol (str): 通貨ペア
-        
+        """
+        市場データを取得する（15分足: 前日＋当日＋必要に応じて前々日を結合し、timestampで一意化）
+        ※ここでは「96本へのトリムは行わない」。この後段（build_features → シグナル判定の後）で
+        バックテストと同じタイミングでトリムする想定。
+
         Returns:
-        tuple: (30分足データ, 時間足データ) 取得失敗時はNoneを含む
+            tuple[pd.DataFrame, pd.DataFrame]: (15分足データ, 1時間足データ)
+                - 15分足: timestampでソート・重複排除済み
+                - 1時間足: 直近3日を結合、timestampでソート・重複排除済み
+            取得不能時は (None, None)
         """
         try:
-            # 現在の日付を取得
             current_date = datetime.now()
-            date_str = current_date.strftime('%Y%m%d')
-            
-            # 30分足データの取得（複数日の結合を考慮）
-            self.logger.info(f"{symbol}の15分足データ取得を開始します（完全な24時間分を確保）")
-            
-            # 最新の日付から必要日数分のデータを取得して結合する
-            all_30min_data = []
-            required_candles = 96  # 24時間分の15分足（96本）
-            candles_collected = 0
-            days_to_check = 3  # 最大3日分までさかのぼる
-            
-            for day_offset in range(days_to_check):
-                check_date = current_date - timedelta(days=day_offset)
-                check_date_str = check_date.strftime('%Y%m%d')
-                
-                df_day = self.get_cached_data(symbol, '15min', check_date_str)
-                
-                if not df_day.empty:
-                    # データの行数（ローソク足の数）を取得
-                    day_candles = len(df_day)
-                    
-                    # 最新日のデータ結合方法
-                    if day_offset == 0:
-                        # 現在の日付の場合は、全データを追加
-                        all_30min_data.append(df_day)
-                        candles_collected += day_candles
-                    else:
-                        # 前日以前の場合は、古い方から必要分だけ追加
-                        remaining_needed = required_candles - candles_collected
-                        if remaining_needed <= 0:
-                            # すでに十分なデータがある場合は追加不要
-                            break
-                            
-                        if day_candles > remaining_needed:
-                            # 必要な分だけ取得（新しい順）
-                            df_day = df_day.sort_index(ascending=False).head(remaining_needed).sort_index()
-                            
-                        all_30min_data.append(df_day)
-                        candles_collected += min(day_candles, remaining_needed)
-                
-                # すでに十分なデータが集まった場合は終了
-                if candles_collected >= required_candles:
-                    self.logger.debug(f"十分なデータ({candles_collected}/{required_candles}本)が集まりました")
-                    break
-                    
-            # データが十分に集まったかをチェック
-            if candles_collected < required_candles / 2:  # 最低でも半分（24本=12時間分）は欲しい
-                self.logger.warning(f"{symbol}の15分足データが不足しています: {candles_collected}/{required_candles}本")
-                if candles_collected == 0:
-                    return None, None
-            
-            # 結合したデータを時刻順にソート
-            if all_30min_data:
-                df_30min = pd.concat(all_30min_data).sort_values('timestamp')
-                self.logger.info(f"{symbol}の15分足データ: 合計{len(df_30min)}本取得（目標: {required_candles}本）")
-                
-                # 最新の48本（24時間分）だけを使用
-                if len(df_30min) > required_candles:
-                    df_30min = df_30min.iloc[-required_candles:]
-            else:
-                self.logger.warning(f"{symbol}の15分足データを取得できませんでした")
-                df_30min = pd.DataFrame()  # 空のデータフレーム
-            
-            # 1時間足データの取得（3日分 - バックテストと同様）
-            hourly_candles = []
+
+            # ========= 15分足（直近最大3日分を結合 → ソート → 重複排除。ここではトリムしない） =========
+            self.logger.info(f"{symbol}の15分足データ取得を開始します（前日＋当日＋必要に応じて前々日を結合）")
+
+            fifteen_parts = []
+            for day_offset in (1, 0, 2):  # 優先順: 前日 → 当日 → 前々日（不足時の補完）
+                d = current_date - timedelta(days=day_offset)
+                dstr = d.strftime('%Y%m%d')
+                df_day = self.get_cached_data(symbol, '15min', dstr)
+                if df_day is None or df_day.empty:
+                    continue
+
+                # timestamp 正規化（列が無い場合は index を昇格）
+                if 'timestamp' not in df_day.columns:
+                    df_day = df_day.reset_index()
+                    # 汎用的に index→timestamp へ
+                    if 'index' in df_day.columns:
+                        df_day = df_day.rename(columns={'index': 'timestamp'})
+
+                df_day['timestamp'] = pd.to_datetime(df_day['timestamp'], errors='coerce', utc=False)
+                df_day = df_day.dropna(subset=['timestamp'])
+                df_day = df_day.sort_values('timestamp')
+
+                fifteen_parts.append(df_day)
+
+            if not fifteen_parts:
+                self.logger.warning(f"{symbol}: 15分足データを取得できませんでした")
+                return None, None
+
+            df_15m = pd.concat(fifteen_parts, ignore_index=True)
+            # timestamp で整列 → 重複排除（後勝ち＝最新の再計算値を残す）
+            df_15m = df_15m.sort_values('timestamp')
+            before = len(df_15m)
+            df_15m = df_15m.drop_duplicates(subset=['timestamp'], keep='last').reset_index(drop=True)
+            after = len(df_15m)
+            if before != after:
+                self.logger.info(f"{symbol} 15分足: 重複 {before - after} 件を排除、最終 {after} 本")
+
+            # ========= 1時間足（直近3日分を結合 → ソート → 重複排除） =========
+            hourly_parts = []
             for h_offset in range(2, -1, -1):
-                hourly_date = (current_date - timedelta(days=h_offset)).strftime('%Y%m%d')
-                df_hourly_day = self.get_cached_data(symbol, '1hour', hourly_date)
-                if not df_hourly_day.empty:
-                    hourly_candles.append(df_hourly_day)
-            
-            # 時間足データの結合
-            if hourly_candles:
-                df_hourly = pd.concat(hourly_candles).sort_values('timestamp')
+                d = current_date - timedelta(days=h_offset)
+                dstr = d.strftime('%Y%m%d')
+                df_h = self.get_cached_data(symbol, '1hour', dstr)
+                if df_h is None or df_h.empty:
+                    continue
+
+                if 'timestamp' not in df_h.columns:
+                    df_h = df_h.reset_index()
+                    if 'index' in df_h.columns:
+                        df_h = df_h.rename(columns={'index': 'timestamp'})
+
+                df_h['timestamp'] = pd.to_datetime(df_h['timestamp'], errors='coerce', utc=False)
+                df_h = df_h.dropna(subset=['timestamp']).sort_values('timestamp')
+                hourly_parts.append(df_h)
+
+            if hourly_parts:
+                df_hourly = pd.concat(hourly_parts, ignore_index=True)
+                df_hourly = df_hourly.sort_values('timestamp')
+                before_h = len(df_hourly)
+                df_hourly = df_hourly.drop_duplicates(subset=['timestamp'], keep='last').reset_index(drop=True)
+                after_h = len(df_hourly)
+                if before_h != after_h:
+                    self.logger.info(f"{symbol} 1時間足: 重複 {before_h - after_h} 件を排除、最終 {after_h} 本")
             else:
-                self.logger.warning(f"{symbol}の時間足データを取得できませんでした")
-                df_hourly = pd.DataFrame()  # 空のデータフレーム
-            
-            return df_30min, df_hourly
-                
+                self.logger.warning(f"{symbol}: 1時間足データを取得できませんでした")
+                df_hourly = pd.DataFrame()
+
+            self.logger.info(f"{symbol}の15分足データ: 合計 {len(df_15m)} 本 / 1時間足データ: 合計 {len(df_hourly)} 本")
+            return df_15m, df_hourly
+
         except Exception as e:
             self.logger.error(f"{symbol}のデータ取得中にエラーが発生: {str(e)}", exc_info=True)
             return None, None
+
 
     def _handle_entry(self, symbol, position_type, signal_data, stats, trade_logs):
         """エントリー処理を実行する（backtest関数と整合性あり）
