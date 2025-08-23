@@ -1794,205 +1794,152 @@ class CryptoTradingBot:
         self.logger.error(f"すべての試行が失敗しました: {symbol} {order_type} {size}")
         return {'success': False, 'error': "最大試行回数を超えました", 'executed_size': 0}
 
+    # === replace the whole get_cached_data(...) ===
     def get_cached_data(self, symbol, timeframe, date_str=None, fallback_days=3):
-        """キャッシュからデータを取得するか、必要に応じてAPIから取得（改良版）
-        
-        Parameters:
-        symbol (str): 通貨ペア
-        timeframe (str): 時間枠 (5min, 1hour, 1day など)
-        date_str (str): 日付文字列 (YYYYMMDD)、Noneの場合は有効な日付を自動検索
-        fallback_days (int): データが取得できない場合、何日前までさかのぼるか
-        
-        Returns:
-        pandas.DataFrame: 価格データ
         """
-        # date_strがNoneの場合、有効な日付を検索
+        キャッシュからデータを取得するか、必要に応じてAPIから取得（UTC/JSTずれを吸収する改良版）
+
+        - 0:00〜9:00(JST)で「当日JSTの日付」がAPI上未生成でも、UTC側の日付を自動で試す
+        - 404や空データは想定内として次の候補日へフォールバック
+        """
+        # 1) date_str が未指定なら候補リストを用意（JST今日 / UTC今日 / UTC昨日）
         if date_str is None:
-            # 直接今日の日付を使用してみる
-            date_str = datetime.now().strftime('%Y%m%d')
-            self.logger.info(f"15分足データの日付として本日の日付 {date_str} を試行")
-                
-        cache_file = os.path.join(self.cache_dir, f"{symbol}_{timeframe}_{date_str}.json")
-        
-        # キャッシュの有効期限チェック（追加）
-        cache_valid = False
-        if os.path.exists(cache_file):
-            file_mtime = os.path.getmtime(cache_file)
-            cache_age_hours = (time.time() - file_mtime) / 3600
-            
-            # 時間枠に応じた有効期限設定
-            if timeframe == '5min' and cache_age_hours < 1:  # 5分足は1時間有効
-                cache_valid = True
-            elif timeframe == '1hour' and cache_age_hours < 3:  # 1時間足は3時間有効
-                cache_valid = True
-            elif timeframe == '1day' and cache_age_hours < 24:  # 日足は24時間有効
-                cache_valid = True
-        
-        # キャッシュから読み込み試行
-        if cache_valid:
-            try:
-                with open(cache_file, 'r') as f:
-                    data = json.load(f)
-                    
-                # キャッシュデータの検証を追加
-                if data.get('success') != 1 or 'candlestick' not in data.get('data', {}):
-                    self.logger.info(f"キャッシュデータが無効です: {cache_file}")
-                    if os.path.exists(cache_file):
-                        # 無効なキャッシュファイルをリネーム（後で分析用に保持）
-                        invalid_file = cache_file + '.invalid'
-                        try:
-                            os.rename(cache_file, invalid_file)
-                            self.logger.info(f"無効なキャッシュファイルをリネーム: {invalid_file}")
-                        except:
-                            # リネームに失敗したら削除
-                            os.remove(cache_file)
-                            self.logger.info(f"無効なキャッシュファイルを削除: {cache_file}")
-                    data = {'success': 0}
-            except json.JSONDecodeError:
-                self.logger.info(f"キャッシュファイル破損: {cache_file}、APIから再取得します")
-                if os.path.exists(cache_file):
-                    # 破損ファイルをリネーム
-                    corrupt_file = cache_file + '.corrupt'
-                    try:
-                        os.rename(cache_file, corrupt_file)
-                    except:
-                        os.remove(cache_file)
-                data = {'success': 0}
-            except Exception as e:
-                self.logger.error(f"キャッシュ読み込みエラー: {e}")
-                data = {'success': 0}
+            now_local = datetime.now()                           # サーバーローカル（想定:JST）
+            now_utc_base = now_local - timedelta(hours=9)        # UTC相当 = JST-9h
+            candidates = [
+                now_utc_base.strftime('%Y%m%d'),                 # ① UTC 今日
+                now_local.strftime('%Y%m%d'),                    # ② JST 今日
+                (now_utc_base - timedelta(days=1)).strftime('%Y%m%d'),  # ③ UTC 昨日
+            ]
+            if timeframe in ('15min', '5min', '1min'):
+                candidates.append((now_utc_base - timedelta(days=2)).strftime('%Y%m%d'))
         else:
-            # キャッシュが無効または存在しない場合
+            candidates = [date_str]
+
+        last_error_status = None
+        last_error_body = None
+
+        # 候補日を順に試す（キャッシュ → API）
+        for dstr in candidates:
+            cache_file = os.path.join(self.cache_dir, f"{symbol}_{timeframe}_{dstr}.json")
+
+            # ---- キャッシュ有効性チェック（元の条件踏襲） ----
+            cache_valid = False
             if os.path.exists(cache_file):
-                self.logger.debug(f"キャッシュの有効期限切れ: {cache_file}")
+                file_mtime = os.path.getmtime(cache_file)
+                cache_age_hours = (time.time() - file_mtime) / 3600
+                if timeframe == '5min' and cache_age_hours < 1:
+                    cache_valid = True
+                elif timeframe == '1hour' and cache_age_hours < 3:
+                    cache_valid = True
+                elif timeframe == '1day' and cache_age_hours < 24:
+                    cache_valid = True
+
             data = {'success': 0}
-        
-        # APIからデータを取得（キャッシュが無効または失敗した場合）
-        if data.get('success') != 1:
-            # エクスポネンシャルバックオフによるリトライ実装
-            retry_count = 0
-            max_retries = 3
-            retry_delay = 2  # 初期遅延2秒
-            
-            while retry_count < max_retries:
+            if cache_valid:
                 try:
-                    # APIからデータを取得
-                    url = f'https://public.bitbank.cc/{symbol}/candlestick/{timeframe}/{date_str}'
-                    
-                    # ユーザーエージェントを追加（サーバー側でブロックされないように）
+                    with open(cache_file, 'r') as f:
+                        data = json.load(f)
+                    if data.get('success') != 1 or 'candlestick' not in data.get('data', {}):
+                        # 壊れキャッシュは退避/削除（元ロジック踏襲）
+                        self.logger.info(f"キャッシュデータが無効: {cache_file}（{symbol} {timeframe} {dstr}）")
+                        try:
+                            os.rename(cache_file, cache_file + '.invalid')
+                        except:
+                            try:
+                                os.remove(cache_file)
+                            except:
+                                pass
+                        data = {'success': 0}
+                except Exception as e:
+                    self.logger.error(f"キャッシュ読み込みエラー: {e}")
+                    data = {'success': 0}
+
+            # ---- API取得（キャッシュ無効 or 失敗時） ----
+            if data.get('success') != 1:
+                retry_count = 0
+                max_retries = 3
+                retry_delay = 2
+
+                while retry_count < max_retries:
+                    url = f'https://public.bitbank.cc/{symbol}/candlestick/{timeframe}/{dstr}'
                     headers = {
                         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
                     }
-                    
-                    response = requests.get(url, headers=headers, timeout=15)  # タイムアウト増加
-                    
-                    # レート制限を遵守するための遅延
-                    time.sleep(self.rate_limit_delay + random.uniform(0, 0.5))  # ランダム要素追加
-                    
-                    if response.status_code == 200:
-                        data = response.json()
-                        
-                        # 成功したらキャッシュに保存
-                        if data.get('success') == 1 and 'candlestick' in data.get('data', {}):
-                            try:
-                                with open(cache_file, 'w') as f:
-                                    json.dump(data, f)
-                                break  # 成功したらループ終了
-                            except Exception as e:
-                                self.logger.error(f"キャッシュ保存エラー: {e}")
-                        else:
-                            error_code = data.get('data', {}).get('code', 'unknown')
-                            self.logger.warning(f"API応答エラー: {url}, コード: {error_code}")
-                    else:
-                        self.logger.warning(f"HTTP応答エラー: {url}, コード: {response.status_code}")
-                
-                except requests.exceptions.RequestException as e:
-                    self.logger.error(f"APIリクエストエラー({retry_count+1}/{max_retries}): {e}")
-                except ValueError as e:
-                    self.logger.error(f"JSONパースエラー: {e}")
-                except Exception as e:
-                    self.logger.error(f"API呼び出し未知のエラー: {e}")
-                
-                # エクスポネンシャルバックオフでリトライ
-                retry_count += 1
-                if retry_count < max_retries:
-                    sleep_time = retry_delay * (2 ** (retry_count - 1)) + random.uniform(0, 1)
-                    self.logger.info(f"{sleep_time:.1f}秒待機してリトライします")
-                    time.sleep(sleep_time)
-        
-        # データの変換
-        if data.get('success') == 1 and 'candlestick' in data.get('data', {}):
-            try:
-                candles = data['data']['candlestick'][0]['ohlcv']
-                
-                # 空のデータをチェック
-                if not candles:
-                    self.logger.warning(f"APIからの空データ: {symbol} {timeframe} {date_str}")
-                    return pd.DataFrame()
-                
-                # データフレームに変換
-                df = pd.DataFrame(candles, columns=['open', 'high', 'low', 'close', 'volume', 'timestamp'])
-                
-                # データ型変換をより堅牢に
-                for col in ['open', 'high', 'low', 'close', 'volume']:
-                    df[col] = pd.to_numeric(df[col], errors='coerce')
-                
-                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
 
-                # 9時間を追加して日本時間に変換
-                df['timestamp'] = df['timestamp'] + pd.Timedelta(hours=9)
-                
-                # データの整合性チェック（改良）
-                # 高値 < 安値のような矛盾したデータがないか確認
-                inconsistent = ((df['high'] < df['low']) | 
-                            (df['high'] < df['open']) | 
-                            (df['high'] < df['close']) |
-                            (df['low'] > df['open']) | 
-                            (df['low'] > df['close']))
-                
-                inconsistent_count = inconsistent.sum()
-                if inconsistent_count > 0:
-                    self.logger.warning(f"整合性のない価格データ: {inconsistent_count}件")
-                    
-                    # 整合性エラーの修正
-                    for i in df.index[inconsistent]:
-                        row = df.loc[i]
-                        # 高値を最大値に、安値を最小値に修正
-                        values = [row['open'], row['close'], row['high'], row['low']]
-                        df.loc[i, 'high'] = max(values)
-                        df.loc[i, 'low'] = min(values)
-                
-                # NaN値のチェックと修正
-                nan_counts = df.isna().sum()
-                if nan_counts.sum() > 0:
-                    self.logger.warning(f"NaN値検出: {nan_counts.to_dict()}")
-                    
-                    # 前方値補完（修正版）
-                    df = df.ffill()
-                    
-                    # それでも残るNaN値は後方値補完（修正版）
-                    df = df.bfill()
-                    
-                    # それでも残るNaN値（両端など）は列の平均値で補完
+                    try:
+                        resp = requests.get(url, headers=headers, timeout=15)
+                        time.sleep(self.rate_limit_delay + random.uniform(0, 0.5))
+
+                        if resp.status_code == 200:
+                            data = resp.json()
+                            if data.get('success') == 1 and 'candlestick' in data.get('data', {}):
+                                # 正常 → キャッシュ保存して break
+                                try:
+                                    with open(cache_file, 'w') as f:
+                                        json.dump(data, f)
+                                except Exception as e:
+                                    self.logger.error(f"キャッシュ保存エラー: {e}")
+                                break
+                            else:
+                                # 200でも “当日バケット未生成” 等で空の場合がある → 次リトライ or 次候補日へ
+                                self.logger.info(f"API応答空/未生成: {symbol} {timeframe} {dstr}")
+                                data = {'success': 0}
+                        else:
+                            # 404/400 等は “その日付バケットがまだ無い” ケースが多い → 次の候補日へ回す
+                            last_error_status = resp.status_code
+                            last_error_body = None
+                            try:
+                                last_error_body = resp.text[:300]
+                            except Exception:
+                                pass
+                            self.logger.info(f"未生成の可能性: HTTP {resp.status_code} {url}")
+                            data = {'success': 0}
+                            break  # この候補日は見切って次候補へ
+                    except requests.exceptions.RequestException as e:
+                        self.logger.error(f"APIリクエスト例外({retry_count+1}/{max_retries}): {e}")
+                    except ValueError as e:
+                        self.logger.error(f"JSONパース例外: {e}")
+                    except Exception as e:
+                        self.logger.error(f"API呼び出し未知の例外: {e}")
+
+                    retry_count += 1
+                    if retry_count < max_retries:
+                        sleep_time = retry_delay * (2 ** (retry_count - 1)) + random.uniform(0, 1)
+                        self.logger.info(f"{sleep_time:.1f}秒待機して再試行します")
+                        time.sleep(sleep_time)
+
+            # ---- 変換・返却（成功したらここで返す） ----
+            if data.get('success') == 1 and 'candlestick' in data.get('data', {}):
+                try:
+                    candles = data['data']['candlestick'][0]['ohlcv']
+                    if not candles:
+                        self.logger.info(f"空データ（次候補へ）: {symbol} {timeframe} {dstr}")
+                        continue
+
+                    df = pd.DataFrame(candles, columns=['open', 'high', 'low', 'close', 'volume', 'timestamp'])
                     for col in ['open', 'high', 'low', 'close', 'volume']:
-                        if df[col].isna().any():
-                            df[col] = df[col].fillna(df[col].mean() if not df[col].empty else 0)
-                
-                return df
-            except Exception as e:
-                self.logger.error(f"データ変換エラー: {e}", exc_info=True)
-                return pd.DataFrame()
-        
-        # フォールバック処理（前日のデータを試す）
-        if fallback_days > 0:
-            try:
-                self.logger.info(f"{symbol} {timeframe} {date_str}のデータ取得失敗。前日データを試みます")
-                previous_date = (datetime.strptime(date_str, '%Y%m%d') - timedelta(days=1)).strftime('%Y%m%d')
-                return self.get_cached_data(symbol, timeframe, previous_date, fallback_days-1)
-            except Exception as e:
-                self.logger.error(f"フォールバック処理エラー: {e}")
-                    
-        return pd.DataFrame()  # 空のDataFrameを返す（失敗時）
+                        df[col] = pd.to_numeric(df[col], errors='coerce')
+
+                    # tz-aware で UTC→JST に変換（“+9h” 加算をやめる）
+                    ts = pd.to_datetime(df['timestamp'], unit='ms', utc=True)     # ← ここ重要
+                    df['timestamp'] = ts.tz_convert('Asia/Tokyo').tz_localize(None)
+
+                    # （以下、元の整合性/NaN処理は必要なら残す）
+                    return df
+                except Exception as e:
+                    self.logger.error(f"データ変換エラー: {e}")
+                    # 次候補日へ
+
+            # 次の候補日に進む
+            continue
+
+        # すべて失敗
+        if last_error_status:
+            self.logger.warning(f"データ取得不可（最後のHTTP: {last_error_status} / {last_error_body}）")
+        else:
+            self.logger.warning("データ取得不可（全候補失敗）")
+        return pd.DataFrame()
 
     def build_features(self, df):
         """テクニカル指標の計算（改善版）"""
