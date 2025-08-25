@@ -1710,7 +1710,7 @@ class CryptoTradingBot:
             self.logger.error(f"GMOコイン注文確認エラー: {e}", exc_info=True)
             return 0
             
-    def execute_order_with_confirmation(self, symbol, order_type, size, max_retries=3):
+    def execute_order_with_confirmation(self, symbol, order_type, size, max_retries=1):
         """確実に注文を実行し、ポジションが実際に保有されていることを確認する"""
         for attempt in range(max_retries):
             try:
