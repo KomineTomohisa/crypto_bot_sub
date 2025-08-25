@@ -1710,7 +1710,7 @@ class CryptoTradingBot:
             self.logger.error(f"GMOコイン注文確認エラー: {e}", exc_info=True)
             return 0
             
-    def execute_order_with_confirmation(self, symbol, order_type, size, max_retries=3):
+    def execute_order_with_confirmation(self, symbol, order_type, size, max_retries=1):
         """確実に注文を実行し、ポジションが実際に保有されていることを確認する"""
         for attempt in range(max_retries):
             try:
@@ -2657,6 +2657,7 @@ class CryptoTradingBot:
         df_5min['sell_signal'] = df_5min['sell_score_scaled'] >= sell_signal_threshold
 
         if symbol == 'bcc_jpy':
+            df_5min.loc[df_5min['mfi_score_long'] > 0.672, 'buy_signal'] = False
             df_5min.loc[df_5min['mfi_score_short'] > 0.642, 'sell_signal'] = False
 
             df_5min.loc[df_5min['cci_score_long'] < 0.255, 'buy_signal'] = False
@@ -2701,7 +2702,12 @@ class CryptoTradingBot:
 
         if symbol == 'xrp_jpy':
             df_5min.loc[df_5min['rsi_score_long'] > 0.712, 'buy_signal'] = False
+
             df_5min.loc[df_5min['ma_score_long'] > 0.285, 'buy_signal'] = False
+
+            df_5min.loc[df_5min['mfi_score_short'] < 0.164, 'sell_signal'] = False
+
+            df_5min.loc[df_5min['cci_score_short'] > 0.939, 'sell_signal'] = False
 
 
         if 'EMA_long' in df_5min.columns and len(df_5min) > 1:
@@ -2757,7 +2763,7 @@ class CryptoTradingBot:
                 'eth_jpy': {'max_deviation': 1.1},  # 4.5%を超える乖離でシグナル無効化
                 'sol_jpy': {'max_deviation': 1.1},  # 6%を超える乖離でシグナル無効化
                 'doge_jpy': {'max_deviation': 1.1}, # 5.5%を超える乖離でシグナル無効化
-                'bcc_jpy': {'max_deviation': 1.1},  # 4.5%を超える乖離でシグナル無効化
+                'bcc_jpy': {'max_deviation': 0.9},  # 4.5%を超える乖離でシグナル無効化
                 'ada_jpy': {'max_deviation': 1.1},  # 4%を超える乖離でシグナル無効化
             }
             
@@ -5269,79 +5275,79 @@ class CryptoTradingBot:
                     tp_pct *= 0.90
                     sl_pct *= 0.95
 
-            # ========== 逆方向 4本中3本で開始、同方向 2本連続で解除（ロック継続版） ==========
-            # 対象バー：確定足のみ（-1 は含めない）
-            score_true_thresh = 0.5
-            has_buy_sig  = 'buy_signal'  in df_5min.columns
-            has_sell_sig = 'sell_signal' in df_5min.columns
-            has_buy_scr  = 'buy_score'   in df_5min.columns
-            has_sell_scr = 'sell_score'  in df_5min.columns
+            # # ========== 逆方向 4本中3本で開始、同方向 2本連続で解除（ロック継続版） ==========
+            # # 対象バー：確定足のみ（-1 は含めない）
+            # score_true_thresh = 0.5
+            # has_buy_sig  = 'buy_signal'  in df_5min.columns
+            # has_sell_sig = 'sell_signal' in df_5min.columns
+            # has_buy_scr  = 'buy_score'   in df_5min.columns
+            # has_sell_scr = 'sell_score'  in df_5min.columns
 
-            def lastN_bool(series_or_boollike, N):
-                """確定N本（終値確定済み）を True/False 配列で取得（不足・NaNは False 扱い）"""
-                seq = series_or_boollike.iloc[-(N+1):-1]  # 例: N=4 → -5:-1（-5,-4,-3,-2）
-                return seq.fillna(False).astype(bool)
+            # def lastN_bool(series_or_boollike, N):
+            #     """確定N本（終値確定済み）を True/False 配列で取得（不足・NaNは False 扱い）"""
+            #     seq = series_or_boollike.iloc[-(N+1):-1]  # 例: N=4 → -5:-1（-5,-4,-3,-2）
+            #     return seq.fillna(False).astype(bool)
 
-            # ---- True/False 配列の用意（フォールバック：score >= 0.5） ----
-            if has_buy_sig:
-                buy_seq4 = lastN_bool(df_5min['buy_signal'], 4)
-                buy_seq2 = lastN_bool(df_5min['buy_signal'], 2)
-            elif has_buy_scr:
-                buy_seq4 = lastN_bool(df_5min['buy_score'] >= score_true_thresh, 4)
-                buy_seq2 = lastN_bool(df_5min['buy_score'] >= score_true_thresh, 2)
-            else:
-                buy_seq4 = buy_seq2 = None
+            # # ---- True/False 配列の用意（フォールバック：score >= 0.5） ----
+            # if has_buy_sig:
+            #     buy_seq4 = lastN_bool(df_5min['buy_signal'], 4)
+            #     buy_seq2 = lastN_bool(df_5min['buy_signal'], 2)
+            # elif has_buy_scr:
+            #     buy_seq4 = lastN_bool(df_5min['buy_score'] >= score_true_thresh, 4)
+            #     buy_seq2 = lastN_bool(df_5min['buy_score'] >= score_true_thresh, 2)
+            # else:
+            #     buy_seq4 = buy_seq2 = None
 
-            if has_sell_sig:
-                sell_seq4 = lastN_bool(df_5min['sell_signal'], 4)
-                sell_seq2 = lastN_bool(df_5min['sell_signal'], 2)
-            elif has_sell_scr:
-                sell_seq4 = lastN_bool(df_5min['sell_score'] >= score_true_thresh, 4)
-                sell_seq2 = lastN_bool(df_5min['sell_score'] >= score_true_thresh, 2)
-            else:
-                sell_seq4 = sell_seq2 = None
+            # if has_sell_sig:
+            #     sell_seq4 = lastN_bool(df_5min['sell_signal'], 4)
+            #     sell_seq2 = lastN_bool(df_5min['sell_signal'], 2)
+            # elif has_sell_scr:
+            #     sell_seq4 = lastN_bool(df_5min['sell_score'] >= score_true_thresh, 4)
+            #     sell_seq2 = lastN_bool(df_5min['sell_score'] >= score_true_thresh, 2)
+            # else:
+            #     sell_seq4 = sell_seq2 = None
 
-            def is_three_of_four(seq):
-                return (seq is not None) and (len(seq) == 4) and (int(seq.sum()) >= 3)
+            # def is_three_of_four(seq):
+            #     return (seq is not None) and (len(seq) == 4) and (int(seq.sum()) >= 3)
 
-            def is_two_streak_true(seq):
-                return (seq is not None) and (len(seq) == 2) and bool(seq.iloc[0]) and bool(seq.iloc[1])
+            # def is_two_streak_true(seq):
+            #     return (seq is not None) and (len(seq) == 2) and bool(seq.iloc[0]) and bool(seq.iloc[1])
 
-            # ---- 開始（逆方向3/4）／解除（同方向2連続）の判定 ----
-            if position_type == 'long':
-                opp_start   = is_three_of_four(sell_seq4)   # 逆方向（ロング時は sell）が4本中3本
-                same_unlock = is_two_streak_true(buy_seq2)  # 同方向（ロング時は buy）が2本連続
-            else:  # short
-                opp_start   = is_three_of_four(buy_seq4)    # 逆方向（ショート時は buy）が4本中3本
-                same_unlock = is_two_streak_true(sell_seq2) # 同方向（ショート時は sell）が2本連続
+            # # ---- 開始（逆方向3/4）／解除（同方向2連続）の判定 ----
+            # if position_type == 'long':
+            #     opp_start   = is_three_of_four(sell_seq4)   # 逆方向（ロング時は sell）が4本中3本
+            #     same_unlock = is_two_streak_true(buy_seq2)  # 同方向（ロング時は buy）が2本連続
+            # else:  # short
+            #     opp_start   = is_three_of_four(buy_seq4)    # 逆方向（ショート時は buy）が4本中3本
+            #     same_unlock = is_two_streak_true(sell_seq2) # 同方向（ショート時は sell）が2本連続
 
-            # ---- 状態辞書の安全初期化 ----
-            if not hasattr(self, 'opposite_narrow_state'):
-                self.opposite_narrow_state = {}
-            if symbol not in self.opposite_narrow_state:
-                self.opposite_narrow_state[symbol] = {'long': False, 'short': False}
-            if position_type not in self.opposite_narrow_state[symbol]:
-                self.opposite_narrow_state[symbol][position_type] = False
+            # # ---- 状態辞書の安全初期化 ----
+            # if not hasattr(self, 'opposite_narrow_state'):
+            #     self.opposite_narrow_state = {}
+            # if symbol not in self.opposite_narrow_state:
+            #     self.opposite_narrow_state[symbol] = {'long': False, 'short': False}
+            # if position_type not in self.opposite_narrow_state[symbol]:
+            #     self.opposite_narrow_state[symbol][position_type] = False
 
-            lock_on = self.opposite_narrow_state[symbol][position_type]
+            # lock_on = self.opposite_narrow_state[symbol][position_type]
 
-            # ---- 状態更新ロジック ----
-            # 解除：同方向が2本連続で出たらロックOFF
-            if same_unlock:
-                lock_on = False
-            # 開始：逆方向が4本中3本 かつ 解除条件は出ていない → ロックON
-            elif opp_start and not same_unlock:
-                lock_on = True
-            # それ以外：状態維持
+            # # ---- 状態更新ロジック ----
+            # # 解除：同方向が2本連続で出たらロックOFF
+            # if same_unlock:
+            #     lock_on = False
+            # # 開始：逆方向が4本中3本 かつ 解除条件は出ていない → ロックON
+            # elif opp_start and not same_unlock:
+            #     lock_on = True
+            # # それ以外：状態維持
 
-            # 保存
-            self.opposite_narrow_state[symbol][position_type] = lock_on
+            # # 保存
+            # self.opposite_narrow_state[symbol][position_type] = lock_on
 
-            # ---- 適用 ----
-            opposite_streak_factor = 0.70  # 狭め係数（必要に応じて調整）
-            if lock_on:
-                sl_pct *= opposite_streak_factor
-            # ======================================================================
+            # # ---- 適用 ----
+            # opposite_streak_factor = 0.90  # 狭め係数（必要に応じて調整）
+            # if lock_on:
+            #     sl_pct *= opposite_streak_factor
+            # # ======================================================================
 
 
             # エグジット価格計算
