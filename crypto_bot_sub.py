@@ -2857,8 +2857,14 @@ class CryptoTradingBot:
 
 
     def backtest(self, days_to_test, live_mode=False):
-        """複数通貨ペアのバックテスト実行（スレッドセーフ版）"""
+        """複数通貨ペアのバックテスト実行（方式A: 直近2本True→次バー始値エントリー／スレッドセーフ）"""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import threading
+        import pandas as pd
+        from datetime import datetime, timedelta
+
         self.logger.info(f"=== バックテスト開始 ({days_to_test}日間) ===")
+
         results = {}
         start_profit = self.total_profit  # バックテスト開始時の利益
 
@@ -2866,7 +2872,7 @@ class CryptoTradingBot:
         balance_lock = threading.Lock()
         trade_logs_lock = threading.Lock()
         entry_sizes_lock = threading.Lock()
-        
+
         # 共有変数
         total_balance = self.initial_capital + self.total_profit
         trade_logs = []  # 全取引ログを格納
@@ -2875,6 +2881,8 @@ class CryptoTradingBot:
         signal_rows = {symbol: [] for symbol in self.symbols}
 
         def run_backtest(symbol):
+            nonlocal total_balance  # ← 外側スコープの total_balance を更新するために必要
+
             # 各通貨ペア専用の変数（スレッドローカル）
             total_trades = 0
             symbol_profit = 0
@@ -2885,23 +2893,20 @@ class CryptoTradingBot:
             short_trades = 0
             short_wins = 0
             short_profit = 0
-            
+
             # このスレッド専用の取引ログ
             thread_trade_logs = []
 
             self.logger.info(f"=== {symbol.upper()} のバックテスト ===")
 
-            # 日付範囲の設定
-            if live_mode:
-                day_range = range(days_to_test, 0, -1)
-            else:
-                day_range = range(days_to_test, 0, -1)
+            # 日付範囲の設定（live_mode でも同一のロジック）
+            day_range = range(days_to_test, 0, -1)
 
             for day_offset in day_range:
                 current_date = datetime.now() - timedelta(days=day_offset)
                 date_str = current_date.strftime('%Y%m%d')
-                
-                # 前日の日付を計算
+
+                # 前日
                 previous_date = current_date - timedelta(days=1)
                 previous_date_str = previous_date.strftime('%Y%m%d')
 
@@ -2910,20 +2915,19 @@ class CryptoTradingBot:
                 if df_5min_current.empty:
                     self.logger.warning(f"{date_str}の{symbol}の15分足データを取得できませんでした。")
                     continue
-                
-                # 前日の15分足データを取得
+
+                # 前日の15分足
                 df_5min_previous = self.get_cached_data(symbol, '15min', previous_date_str)
-                
-                # 前日データと当日データを結合（前日データが取得できた場合）
+
+                # 前日＋当日の結合→ソート→重複除去→特徴量
                 if not df_5min_previous.empty:
                     df_5min_combined = pd.concat([df_5min_previous, df_5min_current])
                     df_5min_combined = df_5min_combined.sort_values('timestamp')
                     df_5min_combined = df_5min_combined.drop_duplicates(subset=['timestamp'])
-                    
                     self.logger.info(f"{symbol}の結合データ: 前日={len(df_5min_previous)}本 + 当日={len(df_5min_current)}本 = 合計{len(df_5min_combined)}本")
                     df_5min_full = self.build_features(df_5min_combined.copy())
                 else:
-                    self.logger.warning(f"{previous_date_str}の{symbol}の前日データを取得できなかったため、当日データのみで処理します。")
+                    self.logger.warning(f"{previous_date_str}の{symbol}の前日データが欠損のため、当日データのみで処理します。")
                     df_5min_full = self.build_features(df_5min_current.copy())
 
                 # 1時間足データの取得（3日分）
@@ -2938,14 +2942,16 @@ class CryptoTradingBot:
                     self.logger.warning(f"{date_str}の{symbol}の時間足データを取得できませんでした。")
                     continue
 
-                expected_records = 96  # 24時間分の15分足データ
+                expected_records = 96  # 24時間分の15分足（4本/時 × 24）
 
                 try:
                     df_hourly = pd.concat(hourly_candles).sort_values('timestamp')
                     df_hourly = self.build_features(df_hourly)
+
+                    # シグナル生成（※この時点で buy/sell_signal が確定している想定）
                     df_5min_full = self.generate_signals_with_sentiment(symbol, df_5min_full, df_hourly)
-                    
-                    # データフレームを時間順にソートしてから最新の96レコードを抽出
+
+                    # 時間順ソート→最新24h（96本）を抽出
                     if 'timestamp' in df_5min_full.columns:
                         df_5min_full = df_5min_full.sort_values('timestamp').reset_index(drop=True)
                         if len(df_5min_full) > expected_records:
@@ -2961,197 +2967,209 @@ class CryptoTradingBot:
                         else:
                             df_5min = df_5min_full.copy().reset_index(drop=True)
                         self.logger.warning(f"タイムスタンプカラムがないため、インデックスで最新データを抽出: {len(df_5min)}本")
-                    
+
                     if df_5min.empty:
                         self.logger.error(f"データ抽出後にデータフレームが空になりました: {symbol}")
                         continue
-                        
+
                     required_columns = ['buy_signal', 'sell_signal']
-                    missing_columns = [col for col in required_columns if col not in df_5min.columns]
+                    missing_columns = [c for c in required_columns if c not in df_5min.columns]
                     if missing_columns:
                         self.logger.error(f"必要なカラムが不足しています ({symbol}): {missing_columns}")
                         continue
-                        
+
+                    # NaN 安全化
+                    df_5min['buy_signal'] = df_5min['buy_signal'].fillna(False).astype(bool)
+                    df_5min['sell_signal'] = df_5min['sell_signal'].fillna(False).astype(bool)
+
                     self.logger.info(f"データ抽出完了: {symbol}, 最終データ数: {len(df_5min)}")
 
-                    # NaN 安全化（既存の最終確認と同趣旨）
-                    if 'buy_signal' in df_5min.columns and pd.isna(df_5min['buy_signal']).any():
-                        df_5min['buy_signal'] = df_5min['buy_signal'].fillna(False)
-                    if 'sell_signal' in df_5min.columns and pd.isna(df_5min['sell_signal']).any():
-                        df_5min['sell_signal'] = df_5min['sell_signal'].fillna(False)
-
-                    # 追加：その日のシグナルを rows に蓄積
+                    # その日のシグナルを蓄積（Excel側での集計用）
                     if 'timestamp' in df_5min.columns:
                         sig_day = df_5min[['timestamp', 'buy_signal', 'sell_signal']].copy()
                     else:
-                        # timestamp 列がない場合はインデックスを時刻として使う
-                        sig_day = df_5min.copy()
-                        sig_day = sig_day.reset_index().rename(columns={'index': 'timestamp'})
-                        sig_day = sig_day[['timestamp', 'buy_signal', 'sell_signal']]
-
-                    # 型を揃える（Excel 側のリサンプリングで都合が良いように）
+                        sig_day = df_5min.reset_index().rename(columns={'index': 'timestamp'})[['timestamp', 'buy_signal', 'sell_signal']]
                     sig_day['timestamp'] = pd.to_datetime(sig_day['timestamp'], errors='coerce')
-                    sig_day['buy_signal'] = sig_day['buy_signal'].fillna(False).astype(bool)
-                    sig_day['sell_signal'] = sig_day['sell_signal'].fillna(False).astype(bool)
-
                     signal_rows[symbol].append(sig_day)
 
-                    # バックテスト処理
+                    # バックテストの主要ループ
                     position = None
-                    entry_price = 0
+                    entry_price = 0.0
                     entry_time = None
                     entry_rsi = None
                     entry_cci = None
                     entry_sentiment = {}
                     entry_scores = {}
-                    order_size = 0  # スレッドローカルな注文サイズ
+                    order_size = 0.0  # スレッドローカルな注文サイズ
 
-                    # バックテストの主要ループ
                     for i in range(len(df_5min)):
                         row = df_5min.iloc[i]
-                        price = row['close']
-                        timestamp = row['timestamp'] if 'timestamp' in row else df_5min.index[i]
+                        price_close = row.get('close', None)
+                        price_open  = row.get('open', price_close)  # open欠損時はclose代用
+                        timestamp   = row['timestamp'] if 'timestamp' in df_5min.columns else df_5min.index[i]
 
-                        current_rsi = row['RSI'] if 'RSI' in row else None
-                        current_cci = row['CCI'] if 'CCI' in row else None
+                        current_rsi = row.get('RSI', None)
+                        current_cci = row.get('CCI', None)
 
-                        # ポジションがない場合のエントリー判断
+                        # === エントリー判定（方式A：直近2本がTrue → 次バーで入る） ===
                         if position is None:
-                            if i > 0:
-                                previous_row = df_5min.iloc[i-1]
-                                
-                                # 買いシグナル
-                                if row['buy_signal'] and previous_row['buy_signal']:
-                                    order_size = self.TRADE_SIZE / price
+                            # i-2, i-1（確定済バー）を見る。i は「約定バー」
+                            if i >= 2:
+                                prev1 = df_5min.iloc[i-1]
+                                prev2 = df_5min.iloc[i-2]
+
+                                prev_buy_1  = bool(prev1.get('buy_signal', False))
+                                prev_buy_2  = bool(prev2.get('buy_signal', False))
+                                prev_sell_1 = bool(prev1.get('sell_signal', False))
+                                prev_sell_2 = bool(prev2.get('sell_signal', False))
+
+                                # 直近2本で同方向 buy が点灯、かつ反対シグナルは消灯
+                                cond_long = (prev_buy_1 and prev_buy_2 and not prev_sell_1 and not prev_sell_2)
+                                cond_short = (prev_sell_1 and prev_sell_2 and not prev_buy_1 and not prev_buy_2)
+
+                                # ロングエントリー
+                                if cond_long:
+                                    entry_price = price_open  # 次バーの始値で約定
+                                    if entry_price is None or entry_price <= 0:
+                                        # openもcloseも欠損の場合はスキップ
+                                        continue
+
+                                    order_size = self.TRADE_SIZE / entry_price
                                     order_size = self.adjust_order_size(symbol, order_size)
-                                    entry_amount = order_size * price
+                                    entry_amount = order_size * entry_price
 
                                     position = 'long'
-                                    entry_price = price
                                     entry_time = timestamp
-                                    entry_rsi = current_rsi
-                                    entry_cci = current_cci
-                                    entry_sentiment = self.sentiment.copy()
-                                    
-                                    # エントリー時のスコア情報を保存
+                                    entry_rsi = prev1.get('RSI', None)  # 判定に使った直近確定バーの値を記録
+                                    entry_cci = prev1.get('CCI', None)
+                                    entry_sentiment = self.sentiment.copy() if hasattr(self, 'sentiment') else {}
+
+                                    # スコア類も prev1 から記録
                                     entry_scores = {
-                                        'buy_score_scaled': row.get('buy_score_scaled', 0),
-                                        'sell_score_scaled': row.get('sell_score_scaled', 0),
-                                        'rsi_score_long': row.get('rsi_score_long', 0),
-                                        'rsi_score_short': row.get('rsi_score_short', 0),
-                                        'cci_score_long': row.get('cci_score_long', 0),
-                                        'cci_score_short': row.get('cci_score_short', 0),
-                                        'volume_score': row.get('volume_score', 0),
-                                        'bb_score_long': row.get('bb_score_long', 0),
-                                        'bb_score_short': row.get('bb_score_short', 0),
-                                        'ma_score_long': row.get('ma_score_long', 0),
-                                        'ma_score_short': row.get('ma_score_short', 0),
-                                        'adx_score_long': row.get('adx_score_long', 0),
-                                        'adx_score_short': row.get('adx_score_short', 0),
-                                        'mfi_score_long': row.get('mfi_score_long', 0),
-                                        'mfi_score_short': row.get('mfi_score_short', 0),
-                                        'atr_score_long': row.get('atr_score_long', 0),
-                                        'atr_score_short': row.get('atr_score_short', 0),
-                                        'macd_score_long': row.get('macd_score_long', 0),
-                                        'macd_score_short': row.get('macd_score_short', 0),
-                                        'ema_deviation': row.get('ema_deviation', 0),
-                                        'entry_atr': row.get('ATR', 0),
-                                        'entry_adx': row.get('ADX', 0)
+                                        'buy_score_scaled': prev1.get('buy_score_scaled', 0),
+                                        'sell_score_scaled': prev1.get('sell_score_scaled', 0),
+                                        'rsi_score_long': prev1.get('rsi_score_long', 0),
+                                        'rsi_score_short': prev1.get('rsi_score_short', 0),
+                                        'cci_score_long': prev1.get('cci_score_long', 0),
+                                        'cci_score_short': prev1.get('cci_score_short', 0),
+                                        'volume_score': prev1.get('volume_score', 0),
+                                        'bb_score_long': prev1.get('bb_score_long', 0),
+                                        'bb_score_short': prev1.get('bb_score_short', 0),
+                                        'ma_score_long': prev1.get('ma_score_long', 0),
+                                        'ma_score_short': prev1.get('ma_score_short', 0),
+                                        'adx_score_long': prev1.get('adx_score_long', 0),
+                                        'adx_score_short': prev1.get('adx_score_short', 0),
+                                        'mfi_score_long': prev1.get('mfi_score_long', 0),
+                                        'mfi_score_short': prev1.get('mfi_score_short', 0),
+                                        'atr_score_long': prev1.get('atr_score_long', 0),
+                                        'atr_score_short': prev1.get('atr_score_short', 0),
+                                        'macd_score_long': prev1.get('macd_score_long', 0),
+                                        'macd_score_short': prev1.get('macd_score_short', 0),
+                                        'ema_deviation': prev1.get('ema_deviation', 0),
+                                        'entry_atr': prev1.get('ATR', 0),
+                                        'entry_adx': prev1.get('ADX', 0)
                                     }
-                                    
-                                    # スレッドセーフな操作
+
                                     with entry_sizes_lock:
                                         self.entry_sizes[symbol] = order_size
-                                    
+
                                     with balance_lock:
-                                        nonlocal total_balance
                                         balance_before_entry = total_balance
                                         total_balance -= entry_amount
                                         balance_after_entry = total_balance
 
-                                    self.log_entry(symbol, 'long', entry_price, entry_time, entry_rsi, entry_cci, row.get('ATR', 0), row.get('ADX', 0), entry_sentiment)
+                                    self.log_entry(symbol, 'long', entry_price, entry_time, entry_rsi, entry_cci,
+                                                prev1.get('ATR', 0), prev1.get('ADX', 0), entry_sentiment)
 
-                                # 売りシグナル
-                                elif row['sell_signal'] and previous_row['sell_signal']:
-                                    order_size = self.TRADE_SIZE / price
+                                # ショートエントリー
+                                elif cond_short:
+                                    entry_price = price_open
+                                    if entry_price is None or entry_price <= 0:
+                                        continue
+
+                                    order_size = self.TRADE_SIZE / entry_price
                                     order_size = self.adjust_order_size(symbol, order_size)
-                                    entry_amount = order_size * price
-                                    
+                                    entry_amount = order_size * entry_price
+
                                     position = 'short'
-                                    entry_price = price
                                     entry_time = timestamp
-                                    entry_rsi = current_rsi
-                                    entry_cci = current_cci
-                                    entry_sentiment = self.sentiment.copy()
-                                    
-                                    # エントリー時のスコア情報を保存
+                                    entry_rsi = prev1.get('RSI', None)
+                                    entry_cci = prev1.get('CCI', None)
+                                    entry_sentiment = self.sentiment.copy() if hasattr(self, 'sentiment') else {}
+
                                     entry_scores = {
-                                        'buy_score_scaled': row.get('buy_score_scaled', 0),
-                                        'sell_score_scaled': row.get('sell_score_scaled', 0),
-                                        'rsi_score_long': row.get('rsi_score_long', 0),
-                                        'rsi_score_short': row.get('rsi_score_short', 0),
-                                        'cci_score_long': row.get('cci_score_long', 0),
-                                        'cci_score_short': row.get('cci_score_short', 0),
-                                        'volume_score': row.get('volume_score', 0),
-                                        'bb_score_long': row.get('bb_score_long', 0),
-                                        'bb_score_short': row.get('bb_score_short', 0),
-                                        'ma_score_long': row.get('ma_score_long', 0),
-                                        'ma_score_short': row.get('ma_score_short', 0),
-                                        'adx_score_long': row.get('adx_score_long', 0),
-                                        'adx_score_short': row.get('adx_score_short', 0),
-                                        'mfi_score_long': row.get('mfi_score_long', 0),
-                                        'mfi_score_short': row.get('mfi_score_short', 0),
-                                        'atr_score_long': row.get('atr_score_long', 0),
-                                        'atr_score_short': row.get('atr_score_short', 0),
-                                        'macd_score_long': row.get('macd_score_long', 0),
-                                        'macd_score_short': row.get('macd_score_short', 0),
-                                        'ema_deviation': row.get('ema_deviation', 0),
-                                        'entry_atr': row.get('ATR', 0),
-                                        'entry_adx': row.get('ADX', 0)
+                                        'buy_score_scaled': prev1.get('buy_score_scaled', 0),
+                                        'sell_score_scaled': prev1.get('sell_score_scaled', 0),
+                                        'rsi_score_long': prev1.get('rsi_score_long', 0),
+                                        'rsi_score_short': prev1.get('rsi_score_short', 0),
+                                        'cci_score_long': prev1.get('cci_score_long', 0),
+                                        'cci_score_short': prev1.get('cci_score_short', 0),
+                                        'volume_score': prev1.get('volume_score', 0),
+                                        'bb_score_long': prev1.get('bb_score_long', 0),
+                                        'bb_score_short': prev1.get('bb_score_short', 0),
+                                        'ma_score_long': prev1.get('ma_score_long', 0),
+                                        'ma_score_short': prev1.get('ma_score_short', 0),
+                                        'adx_score_long': prev1.get('adx_score_long', 0),
+                                        'adx_score_short': prev1.get('adx_score_short', 0),
+                                        'mfi_score_long': prev1.get('mfi_score_long', 0),
+                                        'mfi_score_short': prev1.get('mfi_score_short', 0),
+                                        'atr_score_long': prev1.get('atr_score_long', 0),
+                                        'atr_score_short': prev1.get('atr_score_short', 0),
+                                        'macd_score_long': prev1.get('macd_score_long', 0),
+                                        'macd_score_short': prev1.get('macd_score_short', 0),
+                                        'ema_deviation': prev1.get('ema_deviation', 0),
+                                        'entry_atr': prev1.get('ATR', 0),
+                                        'entry_adx': prev1.get('ADX', 0)
                                     }
-                                    
-                                    # スレッドセーフな操作
+
                                     with entry_sizes_lock:
                                         self.entry_sizes[symbol] = order_size
-                                    
+
                                     with balance_lock:
                                         balance_before_entry = total_balance
                                         total_balance -= entry_amount
                                         balance_after_entry = total_balance
 
-                                    self.log_entry(symbol, 'short', entry_price, entry_time, entry_rsi, entry_cci, row.get('ATR', 0), row.get('ADX', 0), entry_sentiment)
+                                    self.log_entry(symbol, 'short', entry_price, entry_time, entry_rsi, entry_cci,
+                                                prev1.get('ATR', 0), prev1.get('ADX', 0), entry_sentiment)
 
-                        # ロングポジションのイグジット
+                        # === イグジット判定 ===
                         elif position == 'long':
-                            exit_levels = self.calculate_dynamic_exit_levels(symbol, df_5min, 'long', entry_price)
-                            
-                            if price >= exit_levels['take_profit_price'] or price <= exit_levels['stop_loss_price']:
-                                exit_price = exit_levels['take_profit_price'] if price >= exit_levels['take_profit_price'] else exit_levels['stop_loss_price']
+                            # 先読みを避けるため、利用可能なデータは i までに限定
+                            exit_levels = self.calculate_dynamic_exit_levels(symbol, df_5min.iloc[:i+1], 'long', entry_price)
+
+                            tp = exit_levels['take_profit_price']
+                            sl = exit_levels['stop_loss_price']
+                            price = price_close if price_close is not None else price_open
+
+                            # 旧仕様に合わせて「close 判定」のまま（OHLC貫通は別パッチで用意可能）
+                            do_exit = (price >= tp) or (price <= sl)
+                            if do_exit:
+                                exit_price = tp if price >= tp else sl
                                 profit = (exit_price - entry_price) / entry_price * self.TRADE_SIZE
-                                profit_pct = (exit_price - entry_price) / entry_price * 100
-                                
+                                profit_pct = (exit_price - entry_price) / entry_price * 100.0
+
                                 entry_amount = order_size * entry_price
                                 exit_amount = order_size * exit_price
-                                
-                                # スレッドセーフな残高更新
+
                                 with balance_lock:
                                     balance_before_exit = total_balance
                                     total_balance += exit_amount
                                     balance_after_exit = total_balance
 
-                                # 保有時間の計算
+                                # 保有時間
                                 if isinstance(timestamp, pd.Timestamp) and isinstance(entry_time, pd.Timestamp):
                                     holding_time = timestamp - entry_time
-                                    hours = holding_time.total_seconds() / 3600
+                                    hours = holding_time.total_seconds() / 3600.0
                                 else:
-                                    hours = 0
+                                    hours = 0.0
 
                                 exit_reason = "利益確定" if profit > 0 else "損切り"
-                                self.log_exit(symbol, 'long', exit_price, entry_price, timestamp, profit, profit_pct, exit_reason, hours, entry_sentiment)
+                                self.log_exit(symbol, 'long', exit_price, entry_price, timestamp, profit, profit_pct,
+                                            exit_reason, hours, entry_sentiment)
 
                                 buy5, sell5 = self._last5_flags_str(df_5min, i)
 
-                                # 取引記録（スレッドローカル）
                                 trade_data = {
                                     'symbol': symbol,
                                     'type': 'long',
@@ -3199,46 +3217,51 @@ class CryptoTradingBot:
                                 }
                                 thread_trade_logs.append(trade_data)
 
-                                # 統計更新（スレッドローカル）
+                                # 統計更新
                                 symbol_profit += profit
                                 long_profit += profit
                                 total_trades += 1
                                 long_trades += 1
-                                wins += profit > 0
-                                long_wins += profit > 0
+                                wins += (profit > 0)
+                                long_wins += (profit > 0)
+
+                                # リセット
                                 position = None
                                 entry_scores = {}
 
-                        # ショートポジションのイグジット
                         elif position == 'short':
-                            exit_levels = self.calculate_dynamic_exit_levels(symbol, df_5min, 'short', entry_price)
-                            
-                            if price <= exit_levels['take_profit_price'] or price >= exit_levels['stop_loss_price']:
-                                exit_price = exit_levels['take_profit_price'] if price <= exit_levels['take_profit_price'] else exit_levels['stop_loss_price']
+                            exit_levels = self.calculate_dynamic_exit_levels(symbol, df_5min.iloc[:i+1], 'short', entry_price)
+
+                            tp = exit_levels['take_profit_price']
+                            sl = exit_levels['stop_loss_price']
+                            price = price_close if price_close is not None else price_open
+
+                            do_exit = (price <= tp) or (price >= sl)
+                            if do_exit:
+                                exit_price = tp if price <= tp else sl
                                 profit = (entry_price - exit_price) / entry_price * self.TRADE_SIZE
-                                profit_pct = (entry_price - exit_price) / entry_price * 100
-                                
+                                profit_pct = (entry_price - exit_price) / entry_price * 100.0
+
                                 entry_amount = order_size * entry_price
-                                
-                                # スレッドセーフな残高更新
+
                                 with balance_lock:
                                     balance_before_exit = total_balance
-                                    total_balance += entry_amount + profit
+                                    # 既存仕様：ショートは entry_amount + profit を現金側に反映
+                                    total_balance += (entry_amount + profit)
                                     balance_after_exit = total_balance
 
-                                # 保有時間の計算
                                 if isinstance(timestamp, pd.Timestamp) and isinstance(entry_time, pd.Timestamp):
                                     holding_time = timestamp - entry_time
-                                    hours = holding_time.total_seconds() / 3600
+                                    hours = holding_time.total_seconds() / 3600.0
                                 else:
-                                    hours = 0
+                                    hours = 0.0
 
                                 exit_reason = "利益確定" if profit > 0 else "損切り"
-                                self.log_exit(symbol, 'short', exit_price, entry_price, timestamp, profit, profit_pct, exit_reason, hours, entry_sentiment)
+                                self.log_exit(symbol, 'short', exit_price, entry_price, timestamp, profit, profit_pct,
+                                            exit_reason, hours, entry_sentiment)
 
                                 buy5, sell5 = self._last5_flags_str(df_5min, i)
 
-                                # 取引記録（スレッドローカル）
                                 trade_data = {
                                     'symbol': symbol,
                                     'type': 'short',
@@ -3278,21 +3301,22 @@ class CryptoTradingBot:
                                     'adx_score_short': entry_scores.get('adx_score_short', 0),
                                     'mfi_score_long': entry_scores.get('mfi_score_long', 0),
                                     'mfi_score_short': entry_scores.get('mfi_score_short', 0),
-                                    'atr_score_long': entry_scores.get('atr_score_long', 0), 
-                                    'atr_score_short': entry_scores.get('atr_score_short', 0), 
+                                    'atr_score_long': entry_scores.get('atr_score_long', 0),
+                                    'atr_score_short': entry_scores.get('atr_score_short', 0),
                                     'macd_score_long': entry_scores.get('macd_score_long', 0),
                                     'macd_score_short': entry_scores.get('macd_score_short', 0),
                                     'ema_deviation': entry_scores.get('ema_deviation', 0)
                                 }
                                 thread_trade_logs.append(trade_data)
 
-                                # 統計更新（スレッドローカル）
+                                # 統計更新
                                 symbol_profit += profit
                                 short_profit += profit
                                 total_trades += 1
                                 short_trades += 1
-                                wins += profit > 0
-                                short_wins += profit > 0
+                                wins += (profit > 0)
+                                short_wins += (profit > 0)
+
                                 position = None
                                 entry_scores = {}
 
@@ -3310,15 +3334,15 @@ class CryptoTradingBot:
 
             # 結果の集計
             if total_trades > 0:
-                win_rate = wins / total_trades * 100
+                win_rate = wins / total_trades * 100.0
                 avg_profit = symbol_profit / total_trades
 
                 self.logger.info(f"・トレード回数: {total_trades} 回（ロング: {long_trades}回、ショート: {short_trades}回）")
                 self.logger.info(f"・勝率: {win_rate:.2f}%")
                 if long_trades > 0:
-                    self.logger.info(f"・ロング勝率: {(long_wins / long_trades * 100):.2f}%")
+                    self.logger.info(f"・ロング勝率: {(long_wins / long_trades * 100.0):.2f}%")
                 if short_trades > 0:
-                    self.logger.info(f"・ショート勝率: {(short_wins / short_trades * 100):.2f}%")
+                    self.logger.info(f"・ショート勝率: {(short_wins / short_trades * 100.0):.2f}%")
                 self.logger.info(f"・平均利益: {avg_profit:.2f} 円")
                 self.logger.info(f"・トータル利益: {symbol_profit:.2f} 円（ロング: {long_profit:.2f}円、ショート: {short_profit:.2f}円）")
 
@@ -3328,17 +3352,18 @@ class CryptoTradingBot:
                     'avg_profit': avg_profit,
                     'symbol_profit': symbol_profit,
                     'long_trades': long_trades,
-                    'long_win_rate': (long_wins / long_trades * 100) if long_trades > 0 else 0,
+                    'long_win_rate': (long_wins / long_trades * 100.0) if long_trades > 0 else 0.0,
                     'long_profit': long_profit,
                     'short_trades': short_trades,
-                    'short_win_rate': (short_wins / short_trades * 100) if short_trades > 0 else 0,
+                    'short_win_rate': (short_wins / short_trades * 100.0) if short_trades > 0 else 0.0,
                     'short_profit': short_profit
                 }
             else:
                 self.logger.info("😅 トレードが発生しませんでした")
                 return {'trades': 0}
 
-        # マルチスレッディングでバックテストを並列実行
+        # ===== マルチスレッディングでバックテストを並列実行 =====
+        from concurrent.futures import ThreadPoolExecutor, as_completed
         with ThreadPoolExecutor() as executor:
             futures = {executor.submit(run_backtest, symbol): symbol for symbol in self.symbols}
             for future in as_completed(futures):
@@ -3352,6 +3377,7 @@ class CryptoTradingBot:
         # 取引詳細の最終サマリー出力
         self.output_trade_summary(trade_logs)
 
+        # シグナル履歴の作成（Excel用）
         signal_history = {}
         for sym, parts in signal_rows.items():
             if not parts:
@@ -3361,22 +3387,19 @@ class CryptoTradingBot:
             # timestamp 整理
             df = df.dropna(subset=['timestamp'])
             df = df.sort_values('timestamp').drop_duplicates(subset=['timestamp'], keep='last').reset_index(drop=True)
-
-            # DatetimeIndex 化
             df = df.set_index('timestamp')
 
-            # 必須2列だけ渡す
+            # 必須2列のみ
             signal_history[sym] = df[['buy_signal', 'sell_signal']]
 
         # Excelファイルに取引ログを保存
         if trade_logs:
             try:
-                self.save_trade_logs_to_excel(trade_logs, signal_history)  # ← 変更点
+                self.save_trade_logs_to_excel(trade_logs, signal_history)  # ← 変更点：signal_history を渡す
             except Exception as e:
                 self.logger.error(f"取引ログExcelの保存に失敗: {e}")
 
-
-        # バックテストの全体結果
+        # バックテスト全体結果
         backtest_profit = self.total_profit - start_profit
         self.logger.info(f"\n=== バックテスト全体結果 ===")
         self.logger.info(f"・バックテスト収益: {backtest_profit:,.2f} 円")
@@ -3389,35 +3412,30 @@ class CryptoTradingBot:
             self.logger.info("Excel評価レポートを生成中...")
             try:
                 excel_report_path = self._generate_excel_report_from_trade_logs(trade_logs, days_to_test)
-                
                 if excel_report_path:
                     self.logger.info(f"Excel評価レポートが生成されました: {excel_report_path}")
-                    
-                    # Excelファイルを自動で開く
+                    # OSごとの自動オープン（失敗しても致命ではない）
                     try:
                         import subprocess
                         import platform
-                        
                         if platform.system() == "Windows":
                             subprocess.run(['start', 'excel', excel_report_path], shell=True, check=False)
-                        elif platform.system() == "Darwin":  # macOS
+                        elif platform.system() == "Darwin":
                             subprocess.run(['open', excel_report_path], check=False)
-                        else:  # Linux
+                        else:
                             subprocess.run(['xdg-open', excel_report_path], check=False)
-                        
                         self.logger.info("Excelでレポートを開きました")
                     except:
                         self.logger.info("手動でExcelファイルを開いてください")
-                    
                 else:
                     self.logger.warning("Excel評価レポートの生成に失敗しました")
-                    
             except Exception as e:
                 self.logger.error(f"Excel評価レポート生成エラー: {str(e)}", exc_info=True)
         else:
             self.logger.info("取引データがないためExcel評価レポートは生成されませんでした")
 
         return results
+
 
     def log_entry(self, symbol, position_type, entry_price, entry_time, entry_rsi, entry_cci, entry_atr, entry_adx, entry_sentiment):
         """エントリー情報のログ出力"""
