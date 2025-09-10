@@ -232,6 +232,7 @@ class CryptoTradingBot:
             # 各シートを追加
             report_generator.add_summary_sheet()
             report_generator.add_score_analysis_sheet()
+            report_generator.add_indicator_tables_like_scores()
             report_generator.add_market_condition_sheet()
             report_generator.add_charts_sheet()
             report_generator.add_symbol_sheets()
@@ -2358,21 +2359,21 @@ class CryptoTradingBot:
         }
         # signal_thresholds = {
         #     'doge_jpy': {'buy': 0.51, 'sell': 0.51},
-        #     'sol_jpy':  {'buy': 0.55, 'sell': 0.45},
+        #     'sol_jpy':  {'buy': 0.20, 'sell': 0.30},
         #     'xrp_jpy':  {'buy': 0.40, 'sell': 0.40},
-        #     'ltc_jpy':  {'buy': 0.55, 'sell': 0.55},
+        #     'ltc_jpy':  {'buy': 0.60, 'sell': 0.60},
         #     'ada_jpy':  {'buy': 0.45, 'sell': 0.45},
         #     'eth_jpy':  {'buy': 0.51, 'sell': 0.51},
-        #     'bcc_jpy':  {'buy': 0.55, 'sell': 0.55},
+        #     'bcc_jpy':  {'buy': 0.60, 'sell': 0.55},
         # }
         signal_thresholds = {
-            'doge_jpy': {'buy': 0.51, 'sell': 0.51},
-            'sol_jpy':  {'buy': 0.20, 'sell': 0.30},
-            'xrp_jpy':  {'buy': 0.40, 'sell': 0.40},
-            'ltc_jpy':  {'buy': 0.60, 'sell': 0.60},
-            'ada_jpy':  {'buy': 0.45, 'sell': 0.45},
-            'eth_jpy':  {'buy': 0.51, 'sell': 0.51},
-            'bcc_jpy':  {'buy': 0.60, 'sell': 0.55},
+            'doge_jpy': {'buy': 0.0, 'sell': 0.0},
+            'sol_jpy':  {'buy': 0.0, 'sell': 0.0},
+            'xrp_jpy':  {'buy': 0.0, 'sell': 0.0},
+            'ltc_jpy':  {'buy': 0.0, 'sell': 0.0},
+            'ada_jpy':  {'buy': 0.0, 'sell': 0.0},
+            'eth_jpy':  {'buy': 0.0, 'sell': 0.0},
+            'bcc_jpy':  {'buy': 0.0, 'sell': 0.0},
         }
 
         # デフォルト閾値（上記に含まれていない通貨ペア用）
@@ -2657,57 +2658,145 @@ class CryptoTradingBot:
         df_5min['sell_signal'] = df_5min['sell_score_scaled'] >= sell_signal_threshold
 
         if symbol == 'bcc_jpy':
-            df_5min.loc[df_5min['mfi_score_long'] > 0.672, 'buy_signal'] = False
-            df_5min.loc[df_5min['mfi_score_short'] > 0.642, 'sell_signal'] = False
-
-            df_5min.loc[df_5min['cci_score_long'] < 0.255, 'buy_signal'] = False
+        #     df_5min.loc[df_5min['mfi_score_long'] > 0.672, 'buy_signal'] = False
+        #     df_5min.loc[df_5min['mfi_score_short'] > 0.642, 'sell_signal'] = False
+            df_5min.loc[df_5min['atr_score_long'].between(0.675, 0.95),'buy_signal'] = False
+            df_5min.loc[df_5min['adx_score_short'] < 0.0000797, 'sell_signal'] = False
+            df_5min.loc[df_5min['cci_score_long'] > 0.788, 'buy_signal'] = False
+            df_5min.loc[df_5min['ma_score_long'].between(0.0367, 0.0546),'buy_signal'] = False
+            df_5min.loc[df_5min['ma_score_long'].between(0.155, 0.173),'buy_signal'] = False
+            df_5min.loc[df_5min['ma_score_long'].between(0.186, 0.222),'buy_signal'] = False
+            df_5min.loc[df_5min['ma_score_short'].between(0.129, 0.152),'sell_signal'] = False
+            df_5min.loc[df_5min['bb_score_long'] > 0.75, 'buy_signal'] = False
+            df_5min.loc[df_5min['bb_score_long'].between(0.4, 0.48),'buy_signal'] = False
+            df_5min.loc[df_5min['bb_score_short'] > 0.74, 'sell_signal'] = False
+            df_5min.loc[df_5min['mfi_score_long'].between(0.1, 0.154),'buy_signal'] = False
+            df_5min.loc[df_5min['mfi_score_long'].between(0.456, 0.536),'buy_signal'] = False
+            df_5min.loc[df_5min['mfi_score_short'].between(0.657, 0.751),'sell_signal'] = False
+            df_5min.loc[df_5min['rsi_score_short'].between(0.33, 0.42),'sell_signal'] = False
+            df_5min.loc[df_5min['rsi_score_short'].between(0.556, 0.645),'sell_signal'] = False
 
         if symbol == 'doge_jpy':
-            df_5min.loc[df_5min['bb_score_short'] > 0.955, 'sell_signal'] = False
-            df_5min.loc[df_5min['mfi_score_short'] > 0.7, 'sell_signal'] = False
+        #     df_5min.loc[df_5min['bb_score_short'] > 0.955, 'sell_signal'] = False
+        #     df_5min.loc[df_5min['mfi_score_short'] > 0.7, 'sell_signal'] = False
 
-            df_5min.loc[df_5min['ma_score_short'] > 0.31, 'sell_signal'] = False
+        #     df_5min.loc[df_5min['ma_score_short'] > 0.31, 'sell_signal'] = False
+            df_5min.loc[df_5min['atr_score_short'].between(0.0385, 0.15),'sell_signal'] = False
+            df_5min.loc[df_5min['adx_score_short'] < 0.03741, 'sell_signal'] = False
+            df_5min.loc[df_5min['adx_score_short'].between(0.228, 0.297),'sell_signal'] = False
+            df_5min.loc[df_5min['adx_score_short'].between(0.33, 0.382),'sell_signal'] = False
+            df_5min.loc[df_5min['adx_score_short'].between(0.437, 0.582),'sell_signal'] = False
+            df_5min.loc[df_5min['ma_score_long'].between(0.151, 0.165),'buy_signal'] = False
+            df_5min.loc[df_5min['ma_score_short'].between(0.191, 0.225),'sell_signal'] = False
+            df_5min.loc[df_5min['cci_score_short'] > 0.933, 'sell_signal'] = False
+            df_5min.loc[df_5min['cci_score_short'].between(0.34, 0.35),'sell_signal'] = False
+            df_5min.loc[df_5min['adx_score_long'] > 0.997, 'buy_signal'] = False
+            df_5min.loc[df_5min['bb_score_long'].between(0.143, 0.21),'buy_signal'] = False
+            df_5min.loc[df_5min['bb_score_long'].between(0.413, 0.444),'buy_signal'] = False
+            df_5min.loc[df_5min['bb_score_long'].between(0.468, 0.51),'buy_signal'] = False
+            df_5min.loc[df_5min['bb_score_long'].between(0.565, 0.605),'buy_signal'] = False
+            df_5min.loc[df_5min['rsi_score_short'] < 0.15, 'sell_signal'] = False
+            df_5min.loc[df_5min['mfi_score_short'] > 0.6, 'sell_signal'] = False
 
         if symbol == 'sol_jpy':
-            df_5min.loc[df_5min['cci_score_long'] < 0.18, 'buy_signal'] = False
+        #     df_5min.loc[df_5min['cci_score_long'] < 0.18, 'buy_signal'] = False
 
-            df_5min.loc[df_5min['bb_score_long'] < 0.131, 'buy_signal'] = False
+        #     df_5min.loc[df_5min['bb_score_long'] < 0.131, 'buy_signal'] = False
 
-            df_5min.loc[df_5min['mfi_score_long'].between(0.30, 0.36),'buy_signal'] = False
+        #     df_5min.loc[df_5min['mfi_score_long'].between(0.30, 0.36),'buy_signal'] = False
 
-            df_5min.loc[df_5min['adx_score_short'] < 0.163, 'sell_signal'] = False
+        #     df_5min.loc[df_5min['adx_score_short'] < 0.163, 'sell_signal'] = False
+            df_5min.loc[df_5min['atr_score_short'].between(0.41, 0.69),'sell_signal'] = False
+            df_5min.loc[df_5min['rsi_score_long'].between(0.573, 0.61),'buy_signal'] = False
+            df_5min.loc[df_5min['cci_score_long'].between(0.17, 0.264),'buy_signal'] = False
+            df_5min.loc[df_5min['adx_score_long'].between(0.444, 0.56),'buy_signal'] = False
+            df_5min.loc[df_5min['adx_score_short'] < 0.15, 'sell_signal'] = False
+            df_5min.loc[df_5min['cci_score_short'].between(0.3, 0.355),'sell_signal'] = False
+            df_5min.loc[df_5min['cci_score_short'].between(0.428, 0.496),'sell_signal'] = False
+            df_5min.loc[df_5min['bb_score_short'].between(0.457, 0.552),'sell_signal'] = False
+            df_5min.loc[df_5min['bb_score_short'] > 0.571, 'sell_signal'] = False
 
         if symbol == 'ada_jpy':
-            df_5min.loc[df_5min['rsi_score_long'] > 0.8, 'buy_signal'] = False
+            # df_5min.loc[df_5min['rsi_score_long'] > 0.8, 'buy_signal'] = False
 
-            df_5min.loc[df_5min['bb_score_long'] > 0.95, 'buy_signal'] = False
-            df_5min.loc[df_5min['bb_score_short'] > 0.73, 'sell_signal'] = False
+            # df_5min.loc[df_5min['bb_score_long'] > 0.95, 'buy_signal'] = False
+            # df_5min.loc[df_5min['bb_score_short'] > 0.73, 'sell_signal'] = False
 
-            df_5min.loc[df_5min['rsi_score_short'] < 0.46, 'sell_signal'] = False
-            df_5min.loc[df_5min['rsi_score_short'] > 0.75, 'sell_signal'] = False
+            # df_5min.loc[df_5min['rsi_score_short'] < 0.46, 'sell_signal'] = False
+            # df_5min.loc[df_5min['rsi_score_short'] > 0.75, 'sell_signal'] = False
+            df_5min.loc[df_5min['atr_score_short'].between(0.235, 0.296),'sell_signal'] = False
+            df_5min.loc[df_5min['adx_score_long'].between(0.53, 0.63),'buy_signal'] = False
+            df_5min.loc[df_5min['adx_score_long'].between(0.8, 0.95),'buy_signal'] = False
+            df_5min.loc[df_5min['adx_score_short'] < 0.0011, 'sell_signal'] = False
+            df_5min.loc[df_5min['rsi_score_long'].between(0.105, 0.138),'buy_signal'] = False
+            df_5min.loc[df_5min['rsi_score_long'].between(0.233, 0.286),'buy_signal'] = False
+            df_5min.loc[df_5min['rsi_score_long'].between(0.691, 0.743),'buy_signal'] = False
+            df_5min.loc[df_5min['rsi_score_long'] > 0.768, 'buy_signal'] = False
+            df_5min.loc[df_5min['rsi_score_short'].between(0.247, 0.372),'sell_signal'] = False
+            df_5min.loc[df_5min['bb_score_short'] > 0.534, 'sell_signal'] = False
+            df_5min.loc[df_5min['mfi_score_short'] > 0.62, 'sell_signal'] = False
+            df_5min.loc[df_5min['cci_score_long'].between(0.57, 0.616),'buy_signal'] = False
+            df_5min.loc[df_5min['cci_score_short'].between(0.446, 0.482),'sell_signal'] = False
+            df_5min.loc[df_5min['cci_score_short'].between(0.6, 0.685),'sell_signal'] = False
+            df_5min.loc[df_5min['ma_score_long'].between(0.173, 0.2),'buy_signal'] = False
 
         if symbol == 'ltc_jpy':
-            df_5min.loc[df_5min['rsi_score_long'] < 0.395, 'buy_signal'] = False
+            # df_5min.loc[df_5min['rsi_score_long'] < 0.395, 'buy_signal'] = False
 
-            df_5min.loc[df_5min['cci_score_long'] < 0.457, 'buy_signal'] = False
+            # df_5min.loc[df_5min['cci_score_long'] < 0.457, 'buy_signal'] = False
+            df_5min.loc[df_5min['atr_score_long'].between(0.61, 0.727),'buy_signal'] = False
+            df_5min.loc[df_5min['cci_score_long'].between(0.20, 0.30),'buy_signal'] = False
+            df_5min.loc[df_5min['cci_score_short'] < 0.12, 'sell_signal'] = False
+            df_5min.loc[df_5min['atr_score_short'].between(0.11, 0.225),'sell_signal'] = False
+            df_5min.loc[df_5min['atr_score_short'].between(0.239, 0.408),'sell_signal'] = False
+            df_5min.loc[df_5min['bb_score_long'].between(0.156, 0.23),'buy_signal'] = False
+            df_5min.loc[df_5min['bb_score_long'] > 0.686, 'buy_signal'] = False
+            df_5min.loc[df_5min['bb_score_short'].between(0.566, 0.72),'sell_signal'] = False
+            df_5min.loc[df_5min['ma_score_long'].between(0.165, 0.184),'buy_signal'] = False
+            df_5min.loc[df_5min['ma_score_short'].between(0.0369, 0.0806),'sell_signal'] = False
+            df_5min.loc[df_5min['ma_score_short'].between(0.13, 0.162),'sell_signal'] = False
+            df_5min.loc[df_5min['adx_score_long'].between(0.321, 0.395),'buy_signal'] = False
+            df_5min.loc[df_5min['rsi_score_long'].between(0.446, 0.485),'buy_signal'] = False
+            df_5min.loc[df_5min['rsi_score_short'].between(0.12, 0.21),'sell_signal'] = False
+            df_5min.loc[df_5min['mfi_score_long'].between(0.15, 0.23),'buy_signal'] = False
+            df_5min.loc[df_5min['mfi_score_short'] > 0.71, 'sell_signal'] = False
 
         if symbol == 'eth_jpy':
-            df_5min.loc[df_5min['bb_score_long'] > 0.765, 'buy_signal'] = False
-            df_5min.loc[df_5min['bb_score_short'] > 0.547, 'sell_signal'] = False
+        #     df_5min.loc[df_5min['bb_score_long'] > 0.765, 'buy_signal'] = False
+            df_5min.loc[df_5min['bb_score_short'] > 0.551, 'sell_signal'] = False
+            df_5min.loc[df_5min['mfi_score_long'].between(0.27, 0.29),'buy_signal'] = False
+            df_5min.loc[df_5min['mfi_score_short'].between(0.285, 0.31),'sell_signal'] = False
+            df_5min.loc[df_5min['ma_score_long'].between(0.0758, 0.09),'buy_signal'] = False
+            df_5min.loc[df_5min['ma_score_short'].between(0.15, 0.17),'sell_signal'] = False
+            df_5min.loc[df_5min['adx_score_long'].between(0.4, 0.5),'buy_signal'] = False
 
-            df_5min.loc[df_5min['adx_score_long'] > 0.921, 'buy_signal'] = False
-            df_5min.loc[df_5min['adx_score_short'] < 0.0724, 'sell_signal'] = False
+        #     df_5min.loc[df_5min['adx_score_long'] > 0.921, 'buy_signal'] = False
+        #     df_5min.loc[df_5min['adx_score_short'] < 0.0724, 'sell_signal'] = False
 
-            df_5min.loc[df_5min['cci_score_long'] > 0.934, 'buy_signal'] = False
+        #     df_5min.loc[df_5min['cci_score_long'] > 0.934, 'buy_signal'] = False
 
         if symbol == 'xrp_jpy':
-            df_5min.loc[df_5min['rsi_score_long'] > 0.712, 'buy_signal'] = False
+        #     df_5min.loc[df_5min['rsi_score_long'] > 0.712, 'buy_signal'] = False
 
-            df_5min.loc[df_5min['ma_score_long'] > 0.285, 'buy_signal'] = False
+        #     df_5min.loc[df_5min['ma_score_long'] > 0.285, 'buy_signal'] = False
 
-            df_5min.loc[df_5min['mfi_score_short'] < 0.164, 'sell_signal'] = False
+        #     df_5min.loc[df_5min['mfi_score_short'] < 0.164, 'sell_signal'] = False
 
-            df_5min.loc[df_5min['cci_score_short'] > 0.939, 'sell_signal'] = False
+        #     df_5min.loc[df_5min['cci_score_short'] > 0.939, 'sell_signal'] = False
+            df_5min.loc[df_5min['atr_score_long'].between(0.15, 0.228),'buy_signal'] = False
+            df_5min.loc[df_5min['rsi_score_long'].between(0.31, 0.42),'buy_signal'] = False
+            df_5min.loc[df_5min['rsi_score_short'].between(0.228, 0.5),'sell_signal'] = False
+            df_5min.loc[df_5min['rsi_score_short'].between(0.572, 0.593),'sell_signal'] = False
+            df_5min.loc[df_5min['rsi_score_short'].between(0.702, 0.724),'sell_signal'] = False
+            df_5min.loc[df_5min['adx_score_long'].between(0.0348, 0.1),'buy_signal'] = False
+            df_5min.loc[df_5min['adx_score_long'].between(0.382, 0.481),'buy_signal'] = False
+            df_5min.loc[df_5min['adx_score_long'].between(0.66, 0.78),'buy_signal'] = False
+            df_5min.loc[df_5min['adx_score_short'] < 0.141, 'sell_signal'] = False
+            df_5min.loc[df_5min['adx_score_short'].between(0.7, 0.763),'sell_signal'] = False
+            df_5min.loc[df_5min['ma_score_long'] > 0.293, 'buy_signal'] = False
+            df_5min.loc[df_5min['ma_score_short'].between(0.032, 0.077),'sell_signal'] = False
+            df_5min.loc[df_5min['bb_score_long'].between(0.478, 0.573),'buy_signal'] = False
+            df_5min.loc[df_5min['bb_score_short'] > 0.78, 'sell_signal'] = False
 
 
         if 'EMA_long' in df_5min.columns and len(df_5min) > 1:
@@ -5293,79 +5382,79 @@ class CryptoTradingBot:
                     tp_pct *= 0.90
                     sl_pct *= 0.95
 
-            # # ========== 逆方向 4本中3本で開始、同方向 2本連続で解除（ロック継続版） ==========
-            # # 対象バー：確定足のみ（-1 は含めない）
-            # score_true_thresh = 0.5
-            # has_buy_sig  = 'buy_signal'  in df_5min.columns
-            # has_sell_sig = 'sell_signal' in df_5min.columns
-            # has_buy_scr  = 'buy_score'   in df_5min.columns
-            # has_sell_scr = 'sell_score'  in df_5min.columns
+            # ========== 逆方向 4本中3本で開始、同方向 2本連続で解除（ロック継続版） ==========
+            # 対象バー：確定足のみ（-1 は含めない）
+            score_true_thresh = 0.5
+            has_buy_sig  = 'buy_signal'  in df_5min.columns
+            has_sell_sig = 'sell_signal' in df_5min.columns
+            has_buy_scr  = 'buy_score'   in df_5min.columns
+            has_sell_scr = 'sell_score'  in df_5min.columns
 
-            # def lastN_bool(series_or_boollike, N):
-            #     """確定N本（終値確定済み）を True/False 配列で取得（不足・NaNは False 扱い）"""
-            #     seq = series_or_boollike.iloc[-(N+1):-1]  # 例: N=4 → -5:-1（-5,-4,-3,-2）
-            #     return seq.fillna(False).astype(bool)
+            def lastN_bool(series_or_boollike, N):
+                """確定N本（終値確定済み）を True/False 配列で取得（不足・NaNは False 扱い）"""
+                seq = series_or_boollike.iloc[-(N+1):-1]  # 例: N=4 → -5:-1（-5,-4,-3,-2）
+                return seq.fillna(False).astype(bool)
 
-            # # ---- True/False 配列の用意（フォールバック：score >= 0.5） ----
-            # if has_buy_sig:
-            #     buy_seq4 = lastN_bool(df_5min['buy_signal'], 4)
-            #     buy_seq2 = lastN_bool(df_5min['buy_signal'], 2)
-            # elif has_buy_scr:
-            #     buy_seq4 = lastN_bool(df_5min['buy_score'] >= score_true_thresh, 4)
-            #     buy_seq2 = lastN_bool(df_5min['buy_score'] >= score_true_thresh, 2)
-            # else:
-            #     buy_seq4 = buy_seq2 = None
+            # ---- True/False 配列の用意（フォールバック：score >= 0.5） ----
+            if has_buy_sig:
+                buy_seq4 = lastN_bool(df_5min['buy_signal'], 4)
+                buy_seq2 = lastN_bool(df_5min['buy_signal'], 2)
+            elif has_buy_scr:
+                buy_seq4 = lastN_bool(df_5min['buy_score'] >= score_true_thresh, 4)
+                buy_seq2 = lastN_bool(df_5min['buy_score'] >= score_true_thresh, 2)
+            else:
+                buy_seq4 = buy_seq2 = None
 
-            # if has_sell_sig:
-            #     sell_seq4 = lastN_bool(df_5min['sell_signal'], 4)
-            #     sell_seq2 = lastN_bool(df_5min['sell_signal'], 2)
-            # elif has_sell_scr:
-            #     sell_seq4 = lastN_bool(df_5min['sell_score'] >= score_true_thresh, 4)
-            #     sell_seq2 = lastN_bool(df_5min['sell_score'] >= score_true_thresh, 2)
-            # else:
-            #     sell_seq4 = sell_seq2 = None
+            if has_sell_sig:
+                sell_seq4 = lastN_bool(df_5min['sell_signal'], 4)
+                sell_seq2 = lastN_bool(df_5min['sell_signal'], 2)
+            elif has_sell_scr:
+                sell_seq4 = lastN_bool(df_5min['sell_score'] >= score_true_thresh, 4)
+                sell_seq2 = lastN_bool(df_5min['sell_score'] >= score_true_thresh, 2)
+            else:
+                sell_seq4 = sell_seq2 = None
 
-            # def is_three_of_four(seq):
-            #     return (seq is not None) and (len(seq) == 4) and (int(seq.sum()) >= 3)
+            def is_three_of_four(seq):
+                return (seq is not None) and (len(seq) == 4) and (int(seq.sum()) >= 3)
 
-            # def is_two_streak_true(seq):
-            #     return (seq is not None) and (len(seq) == 2) and bool(seq.iloc[0]) and bool(seq.iloc[1])
+            def is_two_streak_true(seq):
+                return (seq is not None) and (len(seq) == 2) and bool(seq.iloc[0]) and bool(seq.iloc[1])
 
-            # # ---- 開始（逆方向3/4）／解除（同方向2連続）の判定 ----
-            # if position_type == 'long':
-            #     opp_start   = is_three_of_four(sell_seq4)   # 逆方向（ロング時は sell）が4本中3本
-            #     same_unlock = is_two_streak_true(buy_seq2)  # 同方向（ロング時は buy）が2本連続
-            # else:  # short
-            #     opp_start   = is_three_of_four(buy_seq4)    # 逆方向（ショート時は buy）が4本中3本
-            #     same_unlock = is_two_streak_true(sell_seq2) # 同方向（ショート時は sell）が2本連続
+            # ---- 開始（逆方向3/4）／解除（同方向2連続）の判定 ----
+            if position_type == 'long':
+                opp_start   = is_three_of_four(sell_seq4)   # 逆方向（ロング時は sell）が4本中3本
+                same_unlock = is_two_streak_true(buy_seq2)  # 同方向（ロング時は buy）が2本連続
+            else:  # short
+                opp_start   = is_three_of_four(buy_seq4)    # 逆方向（ショート時は buy）が4本中3本
+                same_unlock = is_two_streak_true(sell_seq2) # 同方向（ショート時は sell）が2本連続
 
-            # # ---- 状態辞書の安全初期化 ----
-            # if not hasattr(self, 'opposite_narrow_state'):
-            #     self.opposite_narrow_state = {}
-            # if symbol not in self.opposite_narrow_state:
-            #     self.opposite_narrow_state[symbol] = {'long': False, 'short': False}
-            # if position_type not in self.opposite_narrow_state[symbol]:
-            #     self.opposite_narrow_state[symbol][position_type] = False
+            # ---- 状態辞書の安全初期化 ----
+            if not hasattr(self, 'opposite_narrow_state'):
+                self.opposite_narrow_state = {}
+            if symbol not in self.opposite_narrow_state:
+                self.opposite_narrow_state[symbol] = {'long': False, 'short': False}
+            if position_type not in self.opposite_narrow_state[symbol]:
+                self.opposite_narrow_state[symbol][position_type] = False
 
-            # lock_on = self.opposite_narrow_state[symbol][position_type]
+            lock_on = self.opposite_narrow_state[symbol][position_type]
 
-            # # ---- 状態更新ロジック ----
-            # # 解除：同方向が2本連続で出たらロックOFF
-            # if same_unlock:
-            #     lock_on = False
-            # # 開始：逆方向が4本中3本 かつ 解除条件は出ていない → ロックON
-            # elif opp_start and not same_unlock:
-            #     lock_on = True
-            # # それ以外：状態維持
+            # ---- 状態更新ロジック ----
+            # 解除：同方向が2本連続で出たらロックOFF
+            if same_unlock:
+                lock_on = False
+            # 開始：逆方向が4本中3本 かつ 解除条件は出ていない → ロックON
+            elif opp_start and not same_unlock:
+                lock_on = True
+            # それ以外：状態維持
 
-            # # 保存
-            # self.opposite_narrow_state[symbol][position_type] = lock_on
+            # 保存
+            self.opposite_narrow_state[symbol][position_type] = lock_on
 
-            # # ---- 適用 ----
-            # opposite_streak_factor = 0.90  # 狭め係数（必要に応じて調整）
-            # if lock_on:
-            #     sl_pct *= opposite_streak_factor
-            # # ======================================================================
+            # ---- 適用 ----
+            opposite_streak_factor = 0.90  # 狭め係数（必要に応じて調整）
+            if lock_on:
+                sl_pct *= opposite_streak_factor
+            # ======================================================================
 
 
             # エグジット価格計算
