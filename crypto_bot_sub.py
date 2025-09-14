@@ -22,6 +22,10 @@ import concurrent.futures
 import math
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import socket
+
 
 # 既存のimport文の後に追加
 try:
@@ -31,6 +35,36 @@ try:
 except ImportError:
     EXCEL_REPORT_AVAILABLE = False
     print("⚠️ Excel自動評価レポート機能が利用できません（excel_report_generator.pyが見つかりません）")
+
+def _make_session():
+    s = requests.Session()
+    retry = Retry(
+        total=5,
+        read=5,
+        connect=5,
+        backoff_factor=0.8,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=frozenset(['GET', 'POST']),
+        raise_on_status=False,
+    )
+    s.mount("https://", HTTPAdapter(max_retries=retry))
+    s.mount("http://",  HTTPAdapter(max_retries=retry))
+    return s
+
+HTTP_SESSION = _make_session()
+
+def _is_dns_temp_failure(err: Exception) -> bool:
+    """
+    DNS一時失敗（EAI_AGAINなど）を検出
+    """
+    # requests -> urllib3 -> socket.gaierror が cause に入ることがある
+    e = err
+    while e:
+        if isinstance(e, socket.gaierror):
+            # Linux系で Errno -3 が "Temporary failure in name resolution"
+            return True
+        e = getattr(e, "__cause__", None)
+    return False
 
 class GMOCoinAPI:
     """GMOコインの信用取引APIラッパー"""
@@ -50,54 +84,66 @@ class GMOCoinAPI:
             hashlib.sha256
         ).hexdigest()
     
-    def _request(self, method, path, params=None, data=None):
-        """APIリクエストの共通処理"""
-        url = self.base_url + path
-        
-        # デバッグ：パラメータを確認
-        if params:
-            print(f"DEBUG: _request params: {params}")
-        
-        # GETメソッドの場合、パラメータをクエリストリングとして追加
+    def _request(self, method, path, params=None, data=None, *, timeout=8):
+        """
+        APIリクエスト共通処理（署名は送信直前に毎回生成。リトライごとにtimestampを更新）
+        """
+        base_url = self.base_url + path
+
+        # GETクエリをURLへ付与（署名には含めない：pathのみでOK）
+        url = base_url
         if method == "GET" and params:
-            query_params = []
-            for key, value in params.items():
-                query_params.append(f"{key}={value}")
-            if query_params:
-                parameters = "?" + "&".join(query_params)
-                url += parameters
-        
-        timestamp = str(int(time.time() * 1000))
-        
-        body = ""
-        if data:
-            body = json.dumps(data, separators=(',', ':'))
-        
-        # 署名生成（pathのみを使用 - パラメータは含めない）
-        headers = {
-            "API-KEY": self.api_key,
-            "API-TIMESTAMP": timestamp,
-            "API-SIGN": self._sign(method, timestamp, path, body)  # パラメータを含めない
-        }
-        
-        # デバッグログの詳細化
-        print(f"DEBUG: URL: {url}")
-        print(f"DEBUG: Method: {method}")
-        print(f"DEBUG: Path for signature: {path}")  # パラメータなしのパス
-        print(f"DEBUG: Headers: {headers}")
-        
-        try:
-            if method == "GET":
-                response = requests.get(url, headers=headers)
-            else:
+            q = "&".join(f"{k}={v}" for k, v in params.items())
+            url = f"{base_url}?{q}"
+
+        body_str = json.dumps(data, separators=(',', ':')) if data else ""
+
+        # 最大3回リトライ（HTTP_SESSION側にもRetryはあるが、ここではtimestamp再生成のため明示）
+        for attempt in range(3):
+            ts = str(int(time.time() * 1000))  # ← 毎回作り直す（Timestamp too late対策）
+            headers = {
+                "API-KEY": self.api_key,
+                "API-TIMESTAMP": ts,
+                "API-SIGN": self._sign(method, ts, path, body_str),
+            }
+            if method != "GET":
                 headers["Content-Type"] = "application/json"
-                response = requests.post(url, headers=headers, data=body)
-            
-            result = response.json()
-            print(f"DEBUG: Response: {result}")
-            return result
-        except Exception as e:
-            return {"status": -1, "messages": [{"message_string": str(e)}]}
+
+            try:
+                if method == "GET":
+                    with HTTP_SESSION.get(url, headers=headers, timeout=timeout) as r:
+                        r.raise_for_status()
+                        return r.json()
+                else:
+                    with HTTP_SESSION.post(url, headers=headers, data=body_str, timeout=timeout) as r:
+                        r.raise_for_status()
+                        return r.json()
+
+            except requests.exceptions.RequestException as e:
+                # DNS一時失敗は少し待って再試行
+                if _is_dns_temp_failure(e):
+                    time.sleep(1.2 * (attempt + 1))
+                    continue
+
+                # GMO特有の "Timestamp for this request is too late." は再署名して再送
+                msg = str(e)
+                if "Timestamp for this request is too late" in msg or "status code: 400" in msg:
+                    time.sleep(0.8 * (attempt + 1))
+                    continue
+
+                # それ以外は最後にJSON化エラーに備えて安全に返す
+                if attempt == 2:
+                    return {"status": -1, "messages": [{"message_string": f"{type(e).__name__}: {e}"}]}
+                time.sleep(0.6 * (attempt + 1))
+                continue
+
+            except Exception as e:
+                if attempt == 2:
+                    return {"status": -1, "messages": [{"message_string": f"{type(e).__name__}: {e}"}]}
+                time.sleep(0.6 * (attempt + 1))
+
+        # ここには基本来ない
+        return {"status": -1, "messages": [{"message_string": "unknown error"}]}
 
     def get_margin_positions(self, symbol):
         """信用取引のポジション情報を取得
@@ -389,9 +435,9 @@ class CryptoTradingBot:
         
         # 取引サイズ設定
         if self.test_mode:
-            self.TRADE_SIZE = 40000  # テストモード
+            self.TRADE_SIZE = 10000  # テストモード
         else:
-            self.TRADE_SIZE = 40000  # 通常取引額
+            self.TRADE_SIZE = 10000  # 通常取引額
             
         # API呼び出し制限管理
         self.last_api_call = time.time() - 1
@@ -779,91 +825,58 @@ class CryptoTradingBot:
             self.logger.info("現在ポジションはありません")
 
     def get_current_price(self, symbol):
-        """GMOコインから最新の価格を取得
-        
-        Parameters:
-        symbol (str): BitBank形式の通貨ペア (例: 'btc_jpy')
-        
-        Returns:
-        float: 最新価格（取得失敗時は0）
-        """
         try:
-            # シンボルをGMOコイン形式に変換（例: 'btc_jpy' -> 'BTC_JPY'）
             gmo_symbol = self.symbol_mapping.get(symbol, symbol.upper())
-            
-            # GMOコインの公開APIを使用
             url = f'https://api.coin.z.com/public/v1/ticker?symbol={gmo_symbol}'
-            
-            # リクエストヘッダー（オプション）
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-            }
-            
-            # API制限を考慮した遅延
+            headers = {'User-Agent': 'Mozilla/5.0'}
+
+            # レート制限ウェイト
             elapsed = time.time() - self.last_api_call
             if elapsed < self.rate_limit_delay:
-                sleep_time = self.rate_limit_delay - elapsed
-                time.sleep(sleep_time)
-            
-            # リクエスト実行
-            response = requests.get(url, headers=headers, timeout=10)
-            self.last_api_call = time.time()
-            
-            # レスポンスを処理
-            data = response.json()
-            
-            if data.get('status') == 0 and 'data' in data:
-                # dataがリスト形式の場合の処理
-                ticker_data = data['data']
-                if isinstance(ticker_data, list):
-                    # リストから該当する通貨ペアのデータを見つける
-                    for item in ticker_data:
-                        if item.get('symbol') == gmo_symbol:
-                            last_price = float(item.get('last', 0))
-                            self.logger.info(f"{symbol} 現在価格: {last_price}")
-                            return last_price
-                    
-                    # 該当する通貨ペアが見つからなかった場合
-                    self.logger.warning(f"{symbol}（{gmo_symbol}）の価格データが見つかりません")
-                    return 0
-                else:
-                    # リストでない場合（単一オブジェクトの場合）
-                    last_price = float(ticker_data.get('last', 0))
-                    return last_price
-            else:
-                error_msg = data.get('messages', [{"message_string": "不明なエラー"}])[0].get("message_string", "不明なエラー") if data.get('messages') else "不明なエラー"
-                self.logger.error(f"GMOコイン価格取得エラー: {error_msg}")
-                return 0
-                
-        except requests.exceptions.RequestException as e:
-            self.logger.error(f"価格取得APIリクエストエラー: {e}")
-            # リトライを試みる（1回のみ）
-            try:
-                time.sleep(2)  # 2秒待機
-                response = requests.get(url, headers=headers, timeout=10)
-                self.last_api_call = time.time()
-                data = response.json()
-                
-                if data.get('status') == 0 and 'data' in data:
-                    ticker_data = data['data']
-                    if isinstance(ticker_data, list):
-                        # リストから該当する通貨ペアのデータを見つける
-                        for item in ticker_data:
-                            if item.get('symbol') == gmo_symbol:
-                                last_price = float(item.get('last', 0))
-                                return last_price
-                    else:
-                        last_price = float(ticker_data.get('last', 0))
-                        return last_price
-            except Exception:
-                pass
-            return 0
+                time.sleep(self.rate_limit_delay - elapsed)
+
+            # 最大3回の明示再試行（HTTP_SESSION側のRetryとは別にDNS対策）
+            last_exc = None
+            for attempt in range(3):
+                try:
+                    with HTTP_SESSION.get(url, headers=headers, timeout=10) as response:
+                        self.last_api_call = time.time()
+                        data = response.json()
+                        if data.get('status') == 0 and 'data' in data:
+                            ticker_data = data['data']
+                            if isinstance(ticker_data, list):
+                                for item in ticker_data:
+                                    if item.get('symbol') == gmo_symbol:
+                                        last_price = float(item.get('last', 0))
+                                        self.logger.info(f"{symbol} 現在価格: {last_price}")
+                                        return last_price
+                                self.logger.warning(f"{symbol}（{gmo_symbol}）の価格データが見つかりません")
+                                return 0.0
+                            else:
+                                return float(ticker_data.get('last', 0))
+                        else:
+                            err = data.get('messages', [{"message_string": "不明なエラー"}])[0].get("message_string", "不明なエラー") if data.get('messages') else "不明なエラー"
+                            self.logger.error(f"GMOコイン価格取得エラー: {err}")
+                            return 0.0
+                except requests.exceptions.RequestException as e:
+                    last_exc = e
+                    if _is_dns_temp_failure(e):
+                        time.sleep(1.2 * (attempt + 1))
+                        continue
+                    time.sleep(0.6 * (attempt + 1))
+                    continue
+
+            if last_exc:
+                self.logger.error(f"価格取得APIリクエストエラー: {last_exc}")
+            return 0.0
+
         except ValueError as e:
             self.logger.error(f"価格取得JSONパースエラー: {e}")
-            return 0
+            return 0.0
         except Exception as e:
             self.logger.error(f"価格取得未知のエラー: {e}")
-            return 0
+            return 0.0
+
     
     def create_backup(self):
         """データのバックアップを作成"""
