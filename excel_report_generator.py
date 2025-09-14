@@ -16,6 +16,7 @@ from sklearn.preprocessing import StandardScaler
 
 from openpyxl import Workbook
 from openpyxl.utils.dataframe import dataframe_to_rows
+from openpyxl.formatting.rule import ColorScaleRule
 from openpyxl.drawing.image import Image as ExcelImage
 from tempfile import NamedTemporaryFile
 
@@ -42,6 +43,116 @@ class ExcelReportGenerator:
 
         for row in dataframe_to_rows(summary, index=False, header=True):
             sheet.append(row)
+
+    def add_indicator_tables_like_scores(self):
+        """
+        Score_vs_Profit と全く同じ作りで、生指標の値幅ビンごとの
+        勝率・平均利益・件数などをまとめた表を出力する。
+        シート名: Indicator_vs_Profit
+        """
+        sheet = self.wb.create_sheet("Indicator_vs_Profit")
+        df = self.df.copy()
+
+        # 対象となる“生指標”候補（存在する列だけ使う）
+        indicator_cols = [
+            "RSI", "CCI", "MFI", "ADX", "ATR",
+            "BB_width", "MACD_histogram", "MACD", "MACD_signal",
+            "EMA_short", "EMA_long", "MA25", "plus_di14", "minus_di14"
+        ]
+        indicator_cols = [c for c in indicator_cols if c in df.columns]
+
+        if not indicator_cols:
+            sheet.append(["対象となる指標列が見つかりません"])
+            return
+
+        summary_data = []
+
+        # Score_vs_Profit と同様：銘柄ごと
+        for symbol in df["symbol"].dropna().unique():
+            df_symbol = df[df["symbol"] == symbol]
+
+            # Score_vs_Profit の実装はスコア名でロング/ショートを切り分けていましたが、
+            # 生指標版は“ポジション別の成績も見たい”前提で long/short/all の3通りを出します。
+            for position_label, position_filter in [
+                ("long",  df_symbol["type"] == "long"),
+                ("short", df_symbol["type"] == "short"),
+                ("all",   pd.Series([True] * len(df_symbol), index=df_symbol.index))
+            ]:
+                filtered_df = df_symbol[position_filter]
+
+                # 各生指標ごとに qcut=30（重複時は縮退）でビンを作成し、同じ集計形にする
+                for col in indicator_cols:
+                    if col not in filtered_df.columns:
+                        continue
+
+                    sub_df = filtered_df[[col, "profit"]].dropna()
+                    if len(sub_df) < 10:
+                        continue
+
+                    try:
+                        bins = pd.qcut(sub_df[col], q=30, duplicates='drop')
+                    except ValueError:
+                        # ユニーク値が足りない場合は Score_vs_Profit と同じ方針で縮退
+                        unique_values = sub_df[col].nunique()
+                        if unique_values < 20:
+                            try:
+                                bins = pd.qcut(sub_df[col], q=min(unique_values, 10), duplicates='drop')
+                            except ValueError:
+                                continue
+                        else:
+                            continue
+
+                    grouped = sub_df.groupby(bins).agg(
+                        avg_indicator=(col, "mean"),
+                        avg_profit=("profit", "mean"),
+                        win_rate=("profit", lambda x: np.mean(x > 0)),
+                        count=("profit", "count")
+                    ).reset_index()
+
+                    # Score_vs_Profit と同じようにメタ列を追加
+                    grouped.insert(0, "symbol", symbol)
+                    grouped.insert(1, "indicator_feature", col)  # Score_vs_Profit の score_feature 相当
+                    grouped.insert(2, "position_type", position_label)
+
+                    summary_data.append(grouped)
+
+        if not summary_data:
+            sheet.append(["十分なデータが無く、表を作成できませんでした"])
+            return
+
+        final_df = pd.concat(summary_data, ignore_index=True)
+
+        # Interval を文字列へ（Score_vs_Profit と同様に str() に任せる）
+        def safe_convert(val):
+            if isinstance(val, pd.Interval):
+                return str(val)  # "(0.0906, 0.183]" のような表記
+            return val
+
+        # 出力時の列入れ替えも Score_vs_Profit と完全一致させる：
+        # （clean_row[:3] + clean_row[4:8] + [clean_row[3]] + clean_row[8:]）
+        # 元の列順: ["symbol","indicator_feature","position_type","bin","avg_indicator","avg_profit","win_rate","count", ...]
+        # 出力後:   symbol / indicator_feature / position_type / avg_indicator / avg_profit / win_rate / count / bin / ...
+        for i, row in enumerate(dataframe_to_rows(final_df, index=False, header=True)):
+            clean_row = [safe_convert(cell) for cell in row]
+            if len(clean_row) >= 8:
+                rearranged = clean_row[:3] + clean_row[4:8] + [clean_row[3]] + clean_row[8:]
+                sheet.append(rearranged)
+            else:
+                sheet.append(clean_row)
+
+        # 条件付き書式の追加（★Score_vs_Profit と全く同じ列指定★）
+        # コメント上は「勝率→E列 / 平均利益→F列」と書いてある実装に合わせます
+        from openpyxl.formatting.rule import ColorScaleRule
+        rule_win = ColorScaleRule(start_type='percentile', start_value=0, start_color='FFAAAA',
+                                mid_type='percentile', mid_value=50, mid_color='FFFFAA',
+                                end_type='percentile', end_value=100, end_color='AAFFAA')
+        rule_profit = ColorScaleRule(start_type='percentile', start_value=0, start_color='FFAAAA',
+                                    mid_type='percentile', mid_value=50, mid_color='FFFFAA',
+                                    end_type='percentile', end_value=100, end_color='AAFFAA')
+
+        # E列（5列目）とF列（6列目）に適用（Score_vs_Profit の実装と同じ指定）
+        sheet.conditional_formatting.add(f'E2:E{sheet.max_row}', rule_win)     # 勝率
+        sheet.conditional_formatting.add(f'F2:F{sheet.max_row}', rule_profit)  # 平均利益
 
     def add_charts_sheet(self):
         sheet = self.wb.create_sheet("Charts")
