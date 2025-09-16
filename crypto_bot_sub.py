@@ -25,6 +25,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import socket
+from db import (
+    insert_order, mark_order_executed_with_fill,
+    upsert_position, insert_trade, insert_balance_snapshot, utcnow, insert_error
+)
 
 
 # 既存のimport文の後に追加
@@ -1385,6 +1389,22 @@ class CryptoTradingBot:
                     order_id = str(data)
                 self.logger.info(f"注文成功: {gmo_symbol} {side} {size}, 注文ID: {order_id}")
 
+                # --- DB: 注文レコードを登録（冪等） ---
+                try:
+                    insert_order(
+                        order_id=str(order_id),
+                        symbol=symbol,                       # 直上でも使っている symbol を渡す
+                        side=side,                           # このコードでは "BUY"/"SELL"
+                        type_="MARKET",                      # ここが成行なら MARKET。変数があれば置き換え可
+                        size=float(size),
+                        status="ORDERED",
+                        requested_at=utcnow(),
+                        placed_at=utcnow(),
+                        raw=response                         # GMOのレスポンスをそのまま保存
+                    )
+                except Exception as e:
+                    insert_error("place_order/insert_order", str(e), raw={"order_id": order_id})
+
                 # --- 直後のポジション同期で「建玉の建値」と「実約定サイズ」を取得する ---
                 position_id = None
                 avg_entry = 0.0              # 取得できたら更新
@@ -1441,6 +1461,24 @@ class CryptoTradingBot:
                     self.logger.info(f"ポジションID保存成功: {symbol} = {position_id}")
                 else:
                     self.logger.warning(f"ポジションIDを取得できませんでした: {symbol}（後で verify_positions で同期）")
+
+                # --- DB: ポジションを upsert ---
+                if position_id and executed_size_pos > 0:
+                    try:
+                        upsert_position(
+                            position_id=str(position_id),
+                            symbol=symbol,
+                            side=("long" if side == "BUY" else "short"),
+                            size=float(executed_size_pos),
+                            avg_entry_price=float(avg_entry) if avg_entry else 0.0,
+                            opened_at=utcnow(),
+                            updated_at=utcnow(),
+                            raw={"source": "place_order_sync"}
+                        )
+                    except Exception as e:
+                        insert_error("place_order/upsert_position", str(e),
+                                    raw={"position_id": position_id, "avg_entry": avg_entry, "size": executed_size_pos})
+    
 
                 # 建玉から建値が取れたら entry_prices を更新
                 if avg_entry > 0:
@@ -1764,7 +1802,21 @@ class CryptoTradingBot:
                                 self.entry_prices[symbol] = 0
                                 self.entry_times[symbol] = None
                                 self.entry_sizes[symbol] = 0
-                        
+                        # --- DB: 約定が確認できたので fills 登録＋ orders.status=EXECUTED に更新 ---
+                        try:
+                            exec_price = avg_entry or self.entry_prices.get(symbol) or self.get_current_price(symbol) or 0.0
+                            mark_order_executed_with_fill(
+                                order_id=str(order_id),
+                                executed_size=float(executed_size_return),
+                                price=float(exec_price),
+                                fee=None,
+                                executed_at=utcnow(),
+                                fill_raw={"source": "execute_order_with_confirmation"}
+                            )
+                        except Exception as e:
+                            insert_error("execute_order_with_confirmation/fill", str(e),
+                                        raw={"order_id": order_id, "symbol": symbol})
+
                         return {
                             'success': True, 
                             'order_id': order_id, 
@@ -1786,6 +1838,20 @@ class CryptoTradingBot:
                     net_size = position_details.get('net_size', 0)
                     if abs(net_size) > 0:
                         self.logger.info(f"ポジション情報から建玉を確認: サイズ {net_size}")
+                        try:
+                            exec_price = avg_entry or self.entry_prices.get(symbol) or self.get_current_price(symbol) or 0.0
+                            mark_order_executed_with_fill(
+                                order_id=str(order_id),
+                                executed_size=float(executed_size_return),
+                                price=float(exec_price),
+                                fee=None,
+                                executed_at=utcnow(),
+                                fill_raw={"source": "execute_order_with_confirmation"}
+                            )
+                        except Exception as e:
+                            insert_error("execute_order_with_confirmation/fill", str(e),
+                                        raw={"order_id": order_id, "symbol": symbol})
+
                         return {
                             'success': True, 
                             'order_id': order_id, 
@@ -4595,6 +4661,26 @@ class CryptoTradingBot:
                 'macd_score_short': signal_data.get('macd_score_short', 0) 
             }
             trade_logs.append(trade_log_entry)
+
+            # --- DB: 決済トレードを記録（live用のtrade_log_exitパス） ---
+            try:
+                insert_trade(
+                    trade_id=None,
+                    symbol=trade_log_exit["symbol"],
+                    side=("LONG" if trade_log_exit.get("type") == "long" else "SHORT"),
+                    entry_position_id=str(self.position_ids.get(trade_log_exit["symbol"])) if self.position_ids.get(trade_log_exit["symbol"]) else None,
+                    exit_order_id=None,  # 決済注文の order_id を持っていれば入れる
+                    entry_price=float(trade_log_exit["entry_price"]),
+                    exit_price=float(trade_log_exit["exit_price"]),
+                    size=float(trade_log_exit["size"]),
+                    pnl=float(trade_log_exit["profit"]),
+                    pnl_pct=float(trade_log_exit["profit_pct"]),
+                    holding_hours=float(trade_log_exit.get("holding_hours") or 0.0),
+                    closed_at=utcnow(),
+                    raw=trade_log_exit,
+                )
+            except Exception as e:
+                insert_error("exit/insert_trade", str(e), raw=trade_log_exit)
             
             # ポジション保存
             self.save_positions()
@@ -4918,6 +5004,25 @@ class CryptoTradingBot:
                     'macd_score_short': saved_scores.get('macd_score_short', 0) 
                 }
                 trade_logs.append(trade_log_exit)
+                # --- DB: 決済トレードを記録（live用のtrade_log_exitパス） ---
+                try:
+                    insert_trade(
+                        trade_id=None,
+                        symbol=trade_log_exit["symbol"],
+                        side=("LONG" if trade_log_exit.get("type") == "long" else "SHORT"),
+                        entry_position_id=str(self.position_ids.get(trade_log_exit["symbol"])) if self.position_ids.get(trade_log_exit["symbol"]) else None,
+                        exit_order_id=None,  # 決済注文の order_id を持っていれば入れる
+                        entry_price=float(trade_log_exit["entry_price"]),
+                        exit_price=float(trade_log_exit["exit_price"]),
+                        size=float(trade_log_exit["size"]),
+                        pnl=float(trade_log_exit["profit"]),
+                        pnl_pct=float(trade_log_exit["profit_pct"]),
+                        holding_hours=float(trade_log_exit.get("holding_hours") or 0.0),
+                        closed_at=utcnow(),
+                        raw=trade_log_exit,
+                    )
+                except Exception as e:
+                    insert_error("exit/insert_trade", str(e), raw=trade_log_exit)
                 
                 # ポジション情報をリセット
                 self.positions[symbol] = None
