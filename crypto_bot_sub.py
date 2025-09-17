@@ -4661,26 +4661,6 @@ class CryptoTradingBot:
                 'macd_score_short': signal_data.get('macd_score_short', 0) 
             }
             trade_logs.append(trade_log_entry)
-
-            # --- DB: 決済トレードを記録（live用のtrade_log_exitパス） ---
-            try:
-                insert_trade(
-                    trade_id=None,
-                    symbol=trade_log_exit["symbol"],
-                    side=("LONG" if trade_log_exit.get("type") == "long" else "SHORT"),
-                    entry_position_id=str(self.position_ids.get(trade_log_exit["symbol"])) if self.position_ids.get(trade_log_exit["symbol"]) else None,
-                    exit_order_id=None,  # 決済注文の order_id を持っていれば入れる
-                    entry_price=float(trade_log_exit["entry_price"]),
-                    exit_price=float(trade_log_exit["exit_price"]),
-                    size=float(trade_log_exit["size"]),
-                    pnl=float(trade_log_exit["profit"]),
-                    pnl_pct=float(trade_log_exit["profit_pct"]),
-                    holding_hours=float(trade_log_exit.get("holding_hours") or 0.0),
-                    closed_at=utcnow(),
-                    raw=trade_log_exit,
-                )
-            except Exception as e:
-                insert_error("exit/insert_trade", str(e), raw=trade_log_exit)
             
             # ポジション保存
             self.save_positions()
@@ -5004,14 +4984,14 @@ class CryptoTradingBot:
                     'macd_score_short': saved_scores.get('macd_score_short', 0) 
                 }
                 trade_logs.append(trade_log_exit)
-                # --- DB: 決済トレードを記録（live用のtrade_log_exitパス） ---
+                # --- DB: 決済トレードを記録 ---
                 try:
                     insert_trade(
                         trade_id=None,
                         symbol=trade_log_exit["symbol"],
                         side=("LONG" if trade_log_exit.get("type") == "long" else "SHORT"),
                         entry_position_id=str(self.position_ids.get(trade_log_exit["symbol"])) if self.position_ids.get(trade_log_exit["symbol"]) else None,
-                        exit_order_id=None,  # 決済注文の order_id を持っていれば入れる
+                        exit_order_id=None,  # 決済注文IDがあれば入れる
                         entry_price=float(trade_log_exit["entry_price"]),
                         exit_price=float(trade_log_exit["exit_price"]),
                         size=float(trade_log_exit["size"]),
