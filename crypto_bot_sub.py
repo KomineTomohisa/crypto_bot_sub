@@ -1391,6 +1391,8 @@ class CryptoTradingBot:
 
                 # --- DB: 注文レコードを登録（冪等） ---
                 try:
+                    self.logger.info("[DBHOOK] insert_order about to call: order_id=%s symbol=%s side=%s size=%s",order_id, symbol, side, size)
+
                     insert_order(
                         order_id=str(order_id),
                         symbol=symbol,                       # 直上でも使っている symbol を渡す
@@ -1465,6 +1467,7 @@ class CryptoTradingBot:
                 # --- DB: ポジションを upsert ---
                 if position_id and executed_size_pos > 0:
                     try:
+                        self.logger.info("[DBHOOK] upsert_position: pos_id=%s size=%s avg=%s", position_id, executed_size_pos, avg_entry)
                         upsert_position(
                             position_id=str(position_id),
                             symbol=symbol,
@@ -1805,6 +1808,7 @@ class CryptoTradingBot:
                         # --- DB: 約定が確認できたので fills 登録＋ orders.status=EXECUTED に更新 ---
                         try:
                             exec_price = avg_entry or self.entry_prices.get(symbol) or self.get_current_price(symbol) or 0.0
+                            self.logger.info("[DBHOOK] mark_order_executed_with_fill: order_id=%s exec_size=%s price=%s",order_id, executed_size_return, avg_entry or self.entry_prices.get(symbol))
                             mark_order_executed_with_fill(
                                 order_id=str(order_id),
                                 executed_size=float(executed_size_return),
@@ -4986,6 +4990,7 @@ class CryptoTradingBot:
                 trade_logs.append(trade_log_exit)
                 # --- DB: 決済トレードを記録 ---
                 try:
+                    self.logger.info("[DBHOOK] insert_trade: %s", trade_log_exit)
                     insert_trade(
                         trade_id=None,
                         symbol=trade_log_exit["symbol"],
@@ -5608,6 +5613,13 @@ class CryptoTradingBot:
 
 # メイン実行部分
 if __name__ == "__main__":
+    # DB起動確認（失敗しても落とさない）
+    try:
+        from db import ping_db_once
+        ping_db_once()
+    except Exception as e:
+        logging.getLogger(__name__).warning("DB ping skipped due to error: %s", e)
+
     # コマンドラインからのモード選択
     parser = argparse.ArgumentParser(description='仮想通貨トレーディングボット（ショート対応・改良版）')
     parser.add_argument('mode', choices=['backtest', 'live'], help='実行モード (backtest または live)')
@@ -5650,4 +5662,4 @@ if __name__ == "__main__":
         bot.backtest(days_to_test=args.days)
     elif args.mode == "live":
         print("リアルタイムトレードモードを開始します...")
-        bot.run_live()
+        bot.run_live()  

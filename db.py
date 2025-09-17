@@ -12,6 +12,27 @@ import sqlalchemy as sa
 from sqlalchemy.engine import Engine, Connection
 from sqlalchemy.exc import IntegrityError
 
+# === 起動時に接続先をログ出力（パスワード隠し） ===
+def _redact_url(u: str) -> str:
+    # postgresql+psycopg2://user:***@host:5432/db という形にする
+    try:
+        from urllib.parse import urlparse
+        p = urlparse(u)
+        user = p.username or ""
+        host = p.hostname or ""
+        port = f":{p.port}" if p.port else ""
+        db   = p.path.lstrip("/") if p.path else ""
+        return f"{p.scheme}://{user}:***@{host}{port}/{db}"
+    except Exception:
+        return "unknown"
+
+try:
+    import logging
+    logging.basicConfig(level=logging.INFO)
+    logging.getLogger(__name__).info("DB target: %s", _redact_url(DATABASE_URL or "unset"))
+except Exception:
+    pass
+
 # --- 接続とユーティリティ --------------------------------------------------
 load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -265,3 +286,12 @@ def mark_order_executed_with_fill(
             fill_id=None, order_id=order_id, price=price, size=executed_size,
             fee=fee, executed_at=executed_at, raw=fill_raw, conn=conn
         )
+
+def ping_db_once():
+    try:
+        with engine.begin() as conn:
+            conn.execute(sa.text("SELECT current_database() as db, current_user as usr, now() as ts"))
+        # ここで errors にも 1 行残して「ping OK」を見える化（同じDBに入るか確認用）
+        insert_error("boot/ping", "ping ok", raw={"url": _redact_url(DATABASE_URL)})
+    except Exception as e:
+        insert_error("boot/ping", f"ping failed: {e}")
