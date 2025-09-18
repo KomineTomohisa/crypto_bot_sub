@@ -4975,13 +4975,19 @@ class CryptoTradingBot:
                 self.logger.info("[DBHOOK] insert_trade: %s", trade_log_exit)
 
                 try:
+                    raw_safe = dict(trade_log_exit)
+                    for k in ("entry_time", "exit_time"):
+                        v = raw_safe.get(k)
+                        if hasattr(v, "isoformat"):
+                            raw_safe[k] = v.isoformat()
+
                     # trade_log_exit のキー名 → insert_trade の引数にマッピング
                     insert_trade(
                         trade_id=None,
-                        symbol=trade_log_exit["symbol"],                   # 例: 'ltc_jpy'
-                        side=trade_log_exit.get("type", "long"),           # 'long' / 'short'
-                        entry_position_id=self.position_ids.get(trade_log_exit["symbol"]),  # あれば
-                        exit_order_id=str(order_id) if 'order_id' in locals() else None,    # 決済注文IDが取れているなら
+                        symbol=trade_log_exit["symbol"],
+                        side=trade_log_exit.get("type", "long"),
+                        entry_position_id=self.position_ids.get(trade_log_exit["symbol"]),
+                        exit_order_id=str(order_id) if 'order_id' in locals() else None,
                         entry_price=float(trade_log_exit["entry_price"]),
                         exit_price=float(trade_log_exit["exit_price"]),
                         size=float(trade_log_exit["size"]),
@@ -4989,11 +4995,11 @@ class CryptoTradingBot:
                         pnl_pct=float(trade_log_exit["profit_pct"]),
                         holding_hours=float(trade_log_exit.get("holding_hours") or 0.0),
                         closed_at=utcnow(),
-                        raw=trade_log_exit,                                 # 生ログは jsonb に入る
+                        raw=raw_safe,    # ← セーフ化したものを渡す
                     )
                 except Exception as e:
                     # 何かあれば errors に残す（何が入らなかったか raw も一緒に）
-                    insert_error("exit/insert_trade", str(e), raw=trade_log_exit)
+                    insert_error("exit/insert_trade", str(e), raw=raw_safe)
                 
                 # ポジション情報をリセット
                 self.positions[symbol] = None

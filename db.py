@@ -149,20 +149,20 @@ errors = sa.table(
 )
 
 def _jsonable(v):
-    """
-    dict / list を DB に渡せる形に変換する。
-    - psycopg2 が使える場合: psycopg2.extras.Json で渡す（jsonb に最適）
-    - フォールバック: JSON 文字列にして渡す（カラムは text でも jsonb でも可）
-    それ以外（str/float/int/None 等）はそのまま返す。
-    """
     if v is None:
         return None
+    # ★ 追加：datetime/date は ISO8601 文字列へ
+    if isinstance(v, (datetime, date)):
+        try:
+            return v.isoformat()
+        except Exception:
+            return str(v)
+
     if isinstance(v, (dict, list)):
         if _PsycoJson:
-            # ensure_ascii=False で日本語も読みやすく
-            return _PsycoJson(v, dumps=lambda x: json.dumps(x, ensure_ascii=False))
-        return json.dumps(v, ensure_ascii=False)
-    # Decimal / UUID などが来る場合は必要に応じて追加で整形
+            return _PsycoJson(v, dumps=lambda x: json.dumps(x, ensure_ascii=False, default=_jsonable))
+        # default を噛ませるとネスト内の datetime も救えます
+        return json.dumps(v, ensure_ascii=False, default=_jsonable)
     return v
     
 # --- Upsert/Insert API（冪等） ----------------------------------------------
