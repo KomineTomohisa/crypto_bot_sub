@@ -5,12 +5,31 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 from uuid import uuid4
-
+from pathlib import Path  
 from dotenv import load_dotenv
 from tenacity import retry, stop_after_attempt, wait_exponential_jitter
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine, Connection
 from sqlalchemy.exc import IntegrityError
+try:
+    from psycopg2.extras import Json as _PsycoJson
+except Exception:
+    _PsycoJson = None
+
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")  # ←絶対パスで .env を読む
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+def _json_param(v):
+    if v is None:
+        return None
+    # psycopg2 の Json ラッパーが使えるなら最優先
+    if _PsycoJson and isinstance(v, (dict, list)):
+        return _PsycoJson(v)
+    # フォールバック：文字列化
+    if isinstance(v, (dict, list)):
+        return json.dumps(v, ensure_ascii=False)
+    return v
 
 # === 起動時に接続先をログ出力（パスワード隠し） ===
 def _redact_url(u: str) -> str:
@@ -129,13 +148,23 @@ errors = sa.table(
     sa.column("raw", sa.JSON),
 )
 
-def _jsonable(raw: Any) -> Any:
-    try:
-        json.dumps(raw)
-        return raw
-    except Exception:
-        return {"repr": str(raw)}
-
+def _jsonable(v):
+    """
+    dict / list を DB に渡せる形に変換する。
+    - psycopg2 が使える場合: psycopg2.extras.Json で渡す（jsonb に最適）
+    - フォールバック: JSON 文字列にして渡す（カラムは text でも jsonb でも可）
+    それ以外（str/float/int/None 等）はそのまま返す。
+    """
+    if v is None:
+        return None
+    if isinstance(v, (dict, list)):
+        if _PsycoJson:
+            # ensure_ascii=False で日本語も読みやすく
+            return _PsycoJson(v, dumps=lambda x: json.dumps(x, ensure_ascii=False))
+        return json.dumps(v, ensure_ascii=False)
+    # Decimal / UUID などが来る場合は必要に応じて追加で整形
+    return v
+    
 # --- Upsert/Insert API（冪等） ----------------------------------------------
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential_jitter(0.2, 1.5))
