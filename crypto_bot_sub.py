@@ -1805,34 +1805,21 @@ class CryptoTradingBot:
                                 self.entry_times[symbol] = None
                                 self.entry_sizes[symbol] = 0
 
-                        # --- DB: 約定が確認できたので fills 登録＋ orders.status=EXECUTED に更新 ---
+                        # 決済の約定確認: executed_size > 0 が取れた直後に
                         try:
-                            # 価格は entry_prices に入っていればそれを優先、無ければ現在価格をフォールバック
-                            try:
-                                exec_price = float(self.entry_prices.get(symbol) or 0.0)
-                                if exec_price <= 0:
-                                    exec_price = float(self.get_current_price(symbol) or 0.0)
-                            except Exception:
-                                exec_price = 0.0
-
-                            self.logger.info(
-                                "[DBHOOK] mark_order_executed_with_fill: order_id=%s exec_size=%s price=%s symbol=%s",
-                                order_id, executed_size, exec_price, symbol
-                            )
+                            exec_price = float(exit_price or self.get_current_price(symbol) or 0.0)  # 手元に exit_price があれば最優先
+                            self.logger.info("[DBHOOK] mark_order_executed_with_fill (CLOSE): order_id=%s exec_size=%s price=%s symbol=%s",
+                                            order_id, executed_size, exec_price, symbol)
                             mark_order_executed_with_fill(
                                 order_id=str(order_id),
                                 executed_size=float(executed_size),
-                                price=float(exec_price),
+                                price=exec_price,
                                 fee=None,
                                 executed_at=utcnow(),
-                                fill_raw={"source": "execute_order_with_confirmation", "symbol": symbol}
+                                fill_raw={"source": "exit", "symbol": symbol}
                             )
                         except Exception as e:
-                            insert_error(
-                                "execute_order_with_confirmation/fill",
-                                str(e),
-                                raw={"order_id": order_id, "symbol": symbol, "executed_size": executed_size}
-                            )
+                            insert_error("exit/fill", str(e), raw={"order_id": order_id, "symbol": symbol})
 
                         return {
                             'success': True,
@@ -4985,14 +4972,16 @@ class CryptoTradingBot:
                 }
                 trade_logs.append(trade_log_exit)
                 # --- DB: 決済トレードを記録 ---
+                self.logger.info("[DBHOOK] insert_trade: %s", trade_log_exit)
+
                 try:
-                    self.logger.info("[DBHOOK] insert_trade: %s", trade_log_exit)
+                    # trade_log_exit のキー名 → insert_trade の引数にマッピング
                     insert_trade(
                         trade_id=None,
-                        symbol=trade_log_exit["symbol"],
-                        side=("LONG" if trade_log_exit.get("type") == "long" else "SHORT"),
-                        entry_position_id=str(self.position_ids.get(trade_log_exit["symbol"])) if self.position_ids.get(trade_log_exit["symbol"]) else None,
-                        exit_order_id=None,  # 決済注文IDがあれば入れる
+                        symbol=trade_log_exit["symbol"],                   # 例: 'ltc_jpy'
+                        side=trade_log_exit.get("type", "long"),           # 'long' / 'short'
+                        entry_position_id=self.position_ids.get(trade_log_exit["symbol"]),  # あれば
+                        exit_order_id=str(order_id) if 'order_id' in locals() else None,    # 決済注文IDが取れているなら
                         entry_price=float(trade_log_exit["entry_price"]),
                         exit_price=float(trade_log_exit["exit_price"]),
                         size=float(trade_log_exit["size"]),
@@ -5000,9 +4989,10 @@ class CryptoTradingBot:
                         pnl_pct=float(trade_log_exit["profit_pct"]),
                         holding_hours=float(trade_log_exit.get("holding_hours") or 0.0),
                         closed_at=utcnow(),
-                        raw=trade_log_exit,
+                        raw=trade_log_exit,                                 # 生ログは jsonb に入る
                     )
                 except Exception as e:
+                    # 何かあれば errors に残す（何が入らなかったか raw も一緒に）
                     insert_error("exit/insert_trade", str(e), raw=trade_log_exit)
                 
                 # ポジション情報をリセット
