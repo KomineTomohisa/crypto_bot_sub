@@ -1391,6 +1391,8 @@ class CryptoTradingBot:
 
                 # --- DB: 注文レコードを登録（冪等） ---
                 try:
+                    self.logger.info("[DBHOOK] insert_order about to call: order_id=%s symbol=%s side=%s size=%s",order_id, symbol, side, size)
+
                     insert_order(
                         order_id=str(order_id),
                         symbol=symbol,                       # 直上でも使っている symbol を渡す
@@ -1465,6 +1467,7 @@ class CryptoTradingBot:
                 # --- DB: ポジションを upsert ---
                 if position_id and executed_size_pos > 0:
                     try:
+                        self.logger.info("[DBHOOK] upsert_position: pos_id=%s size=%s avg=%s", position_id, executed_size_pos, avg_entry)
                         upsert_position(
                             position_id=str(position_id),
                             symbol=symbol,
@@ -1767,110 +1770,130 @@ class CryptoTradingBot:
         for attempt in range(max_retries):
             try:
                 self.logger.info(f"注文試行 {attempt+1}/{max_retries}: {symbol} {order_type} {size}")
-                
-                # 現在のポジション状態を確認
+
+                # 現在のポジション状態（決済側かどうかの目安）
                 current_position = self.positions.get(symbol)
 
-                # 注文実行（margin=True は不要）
+                # 1) 注文実行
                 order_result = self.place_order(symbol, order_type, size)
-                
-                if not order_result['success']:
+                if not order_result.get('success'):
                     self.logger.error(f"注文失敗: {order_result.get('error', '不明なエラー')}")
-                    time.sleep(2)  # 再試行前に待機
+                    time.sleep(2)
                     continue
-                        
-                # 注文IDを取得
+
                 order_id = order_result.get('order_id')
                 if not order_id:
                     self.logger.error("注文成功したが注文IDがありません")
                     time.sleep(2)
                     continue
-                
-                # 約定確認（数回試行）
+
+                # 2) 約定確認（数回試行）
                 for check in range(5):
-                    time.sleep(3)  # 約定を待つ
+                    time.sleep(3)
                     executed_size = self.check_order_execution(order_id, symbol)
-                    
+
                     if executed_size > 0:
                         self.logger.info(f"注文約定確認完了: {symbol} {order_type} サイズ:{executed_size}")
-                        
-                        # 決済注文の場合、ポジション情報をクリア
+
+                        # 決済注文ならローカルのポジション情報クリア
                         if current_position is not None:
-                            if (current_position == 'long' and order_type == 'sell') or (current_position == 'short' and order_type == 'buy'):
+                            if (current_position == 'long' and order_type == 'sell') or \
+                            (current_position == 'short' and order_type == 'buy'):
                                 self.logger.info(f"{symbol}のポジションを決済しました")
                                 self.positions[symbol] = None
                                 self.entry_prices[symbol] = 0
                                 self.entry_times[symbol] = None
                                 self.entry_sizes[symbol] = 0
+
                         # --- DB: 約定が確認できたので fills 登録＋ orders.status=EXECUTED に更新 ---
                         try:
-                            exec_price = avg_entry or self.entry_prices.get(symbol) or self.get_current_price(symbol) or 0.0
+                            # 価格は entry_prices に入っていればそれを優先、無ければ現在価格をフォールバック
+                            try:
+                                exec_price = float(self.entry_prices.get(symbol) or 0.0)
+                                if exec_price <= 0:
+                                    exec_price = float(self.get_current_price(symbol) or 0.0)
+                            except Exception:
+                                exec_price = 0.0
+
+                            self.logger.info(
+                                "[DBHOOK] mark_order_executed_with_fill: order_id=%s exec_size=%s price=%s symbol=%s",
+                                order_id, executed_size, exec_price, symbol
+                            )
                             mark_order_executed_with_fill(
                                 order_id=str(order_id),
-                                executed_size=float(executed_size_return),
+                                executed_size=float(executed_size),
                                 price=float(exec_price),
                                 fee=None,
                                 executed_at=utcnow(),
-                                fill_raw={"source": "execute_order_with_confirmation"}
+                                fill_raw={"source": "execute_order_with_confirmation", "symbol": symbol}
                             )
                         except Exception as e:
-                            insert_error("execute_order_with_confirmation/fill", str(e),
-                                        raw={"order_id": order_id, "symbol": symbol})
+                            insert_error(
+                                "execute_order_with_confirmation/fill",
+                                str(e),
+                                raw={"order_id": order_id, "symbol": symbol, "executed_size": executed_size}
+                            )
 
                         return {
-                            'success': True, 
-                            'order_id': order_id, 
-                            'executed_size': executed_size,
-                            'balance': executed_size
+                            'success': True,
+                            'order_id': order_id,
+                            'executed_size': executed_size
                         }
-                    
+
                     self.logger.info(f"約定待機中... 試行 {check+1}/5")
-                
-                # 約定が確認できない場合でも、成行注文は通常即座に約定するので注意が必要
+
+                # 3) 約定が取れない場合のフォールバック：建玉から確認
                 self.logger.warning(f"注文は送信されましたが、約定確認に時間がかかっています: {symbol} {order_type}")
-                
-                # 念のため、ポジション情報を確認してみる
                 time.sleep(2)
                 position_details = self.get_position_details(symbol.split('_')[0])
-                
+
                 if position_details and position_details.get('positions'):
-                    # ポジションが存在する場合は成功とみなす
-                    net_size = position_details.get('net_size', 0)
+                    net_size = float(position_details.get('net_size', 0) or 0)
                     if abs(net_size) > 0:
                         self.logger.info(f"ポジション情報から建玉を確認: サイズ {net_size}")
+
+                        # --- DB: フォールバックでも fills 登録 ---
                         try:
-                            exec_price = avg_entry or self.entry_prices.get(symbol) or self.get_current_price(symbol) or 0.0
+                            try:
+                                exec_price = float(self.entry_prices.get(symbol) or 0.0)
+                                if exec_price <= 0:
+                                    exec_price = float(self.get_current_price(symbol) or 0.0)
+                            except Exception:
+                                exec_price = 0.0
+
                             mark_order_executed_with_fill(
                                 order_id=str(order_id),
-                                executed_size=float(executed_size_return),
+                                executed_size=float(abs(net_size)),
                                 price=float(exec_price),
                                 fee=None,
                                 executed_at=utcnow(),
-                                fill_raw={"source": "execute_order_with_confirmation"}
+                                fill_raw={"source": "execute_order_with_confirmation/fallback", "symbol": symbol}
                             )
                         except Exception as e:
-                            insert_error("execute_order_with_confirmation/fill", str(e),
-                                        raw={"order_id": order_id, "symbol": symbol})
+                            insert_error(
+                                "execute_order_with_confirmation/fallback_fill",
+                                str(e),
+                                raw={"order_id": order_id, "symbol": symbol, "net_size": net_size}
+                            )
 
                         return {
-                            'success': True, 
-                            'order_id': order_id, 
-                            'executed_size': abs(net_size),
-                            'balance': abs(net_size)
+                            'success': True,
+                            'order_id': order_id,
+                            'executed_size': abs(net_size)
                         }
-                
-                # それでも確認できない場合
+
+                # 4) どちらでも確認できなかった
                 self.logger.error(f"約定も建玉も確認できませんでした: {symbol} {order_type}")
-                
+
             except Exception as e:
                 self.logger.error(f"注文処理中のエラー: {e}")
-            
-            # 再試行前にランダムな待機時間
+
+            # 次の試行まで少し待機
             wait_time = 3 + random.uniform(0, 2)
             self.logger.info(f"{wait_time:.1f}秒待機して再試行します")
             time.sleep(wait_time)
-        
-        # 全ての試行が失敗
+
+        # 全て失敗
         self.logger.error(f"すべての試行が失敗しました: {symbol} {order_type} {size}")
         return {'success': False, 'error': "最大試行回数を超えました", 'executed_size': 0}
 
@@ -4986,6 +5009,7 @@ class CryptoTradingBot:
                 trade_logs.append(trade_log_exit)
                 # --- DB: 決済トレードを記録 ---
                 try:
+                    self.logger.info("[DBHOOK] insert_trade: %s", trade_log_exit)
                     insert_trade(
                         trade_id=None,
                         symbol=trade_log_exit["symbol"],
@@ -5608,6 +5632,13 @@ class CryptoTradingBot:
 
 # メイン実行部分
 if __name__ == "__main__":
+    # DB起動確認（失敗しても落とさない）
+    try:
+        from db import ping_db_once
+        ping_db_once()
+    except Exception as e:
+        logging.getLogger(__name__).warning("DB ping skipped due to error: %s", e)
+
     # コマンドラインからのモード選択
     parser = argparse.ArgumentParser(description='仮想通貨トレーディングボット（ショート対応・改良版）')
     parser.add_argument('mode', choices=['backtest', 'live'], help='実行モード (backtest または live)')
@@ -5650,4 +5681,4 @@ if __name__ == "__main__":
         bot.backtest(days_to_test=args.days)
     elif args.mode == "live":
         print("リアルタイムトレードモードを開始します...")
-        bot.run_live()
+        bot.run_live()  
