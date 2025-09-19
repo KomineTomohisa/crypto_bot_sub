@@ -2,7 +2,8 @@ from __future__ import annotations
 import os
 import json
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, date, timezone
+from decimal import Decimal
 from typing import Optional, Dict, Any
 from uuid import uuid4
 from pathlib import Path  
@@ -148,22 +149,56 @@ errors = sa.table(
     sa.column("raw", sa.JSON),
 )
 
-def _jsonable(v):
-    if v is None:
-        return None
-    # ★ 追加：datetime/date は ISO8601 文字列へ
-    if isinstance(v, (datetime, date)):
-        try:
-            return v.isoformat()
-        except Exception:
-            return str(v)
+try:
+    import numpy as np
+except Exception:
+    np = None
 
-    if isinstance(v, (dict, list)):
-        if _PsycoJson:
-            return _PsycoJson(v, dumps=lambda x: json.dumps(x, ensure_ascii=False, default=_jsonable))
-        # default を噛ませるとネスト内の datetime も救えます
-        return json.dumps(v, ensure_ascii=False, default=_jsonable)
-    return v
+def _to_plain(obj):
+    """raw を JSON セーフな素の Python 型へ再帰変換"""
+    # None / プリミティブ
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+
+    # 日付・日時
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+
+    # Decimal
+    if isinstance(obj, Decimal):
+        # 精度を保ちたいなら str(obj) でもOK
+        return float(obj)
+
+    # numpy 系
+    if np is not None:
+        if isinstance(obj, (np.floating,)):
+            return float(obj)
+        if isinstance(obj, (np.integer,)):
+            return int(obj)
+        if isinstance(obj, (np.bool_,)):
+            return bool(obj)
+        if isinstance(obj, (np.ndarray,)):
+            return obj.tolist()
+
+    # 辞書
+    if isinstance(obj, dict):
+        return {str(k): _to_plain(v) for k, v in obj.items()}
+
+    # リスト/タプル/セット
+    if isinstance(obj, (list, tuple, set)):
+        return [_to_plain(v) for v in obj]
+
+    # それ以外はとりあえず文字列化（最後の保険）
+    return str(obj)
+
+def _jsonable(v):
+    from psycopg2.extras import Json as _PsycoJson  # 既にtry import済みなら不要
+    # コンテナは plain 化してそのまま返す（Jsonラッパ or プレーン）
+    if isinstance(v, (dict, list, tuple, set)):
+        plain = _to_plain(v)
+        return _PsycoJson(plain) if _PsycoJson else plain
+    # スカラはプレーンに
+    return _to_plain(v)
     
 # --- Upsert/Insert API（冪等） ----------------------------------------------
 
