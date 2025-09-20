@@ -40,6 +40,14 @@ except ImportError:
     EXCEL_REPORT_AVAILABLE = False
     print("⚠️ Excel自動評価レポート機能が利用できません（excel_report_generator.pyが見つかりません）")
 
+def _num(x):
+    """NUMERIC列に安全に入れられる値だけ返す: None/NaN/Inf は None に"""
+    try:
+        xf = float(x)
+        return xf if math.isfinite(xf) else None
+    except Exception:
+        return None
+
 def _make_session():
     s = requests.Session()
     retry = Retry(
@@ -1807,7 +1815,7 @@ class CryptoTradingBot:
 
                         # 決済の約定確認: executed_size > 0 が取れた直後に
                         try:
-                            exec_price = float(exit_price or self.get_current_price(symbol) or 0.0)  # 手元に exit_price があれば最優先
+                            exec_price = float(self.get_current_price(symbol) or 0.0)  # 取引所から即時取得できる最新価格で代替
                             self.logger.info("[DBHOOK] mark_order_executed_with_fill (CLOSE): order_id=%s exec_size=%s price=%s symbol=%s",
                                             order_id, executed_size, exec_price, symbol)
                             mark_order_executed_with_fill(
@@ -4988,14 +4996,14 @@ class CryptoTradingBot:
                         side=trade_log_exit.get("type", "long"),
                         entry_position_id=self.position_ids.get(trade_log_exit["symbol"]),
                         exit_order_id=str(order_id) if 'order_id' in locals() else None,
-                        entry_price=float(trade_log_exit["entry_price"]),
-                        exit_price=float(trade_log_exit["exit_price"]),
-                        size=float(trade_log_exit["size"]),
-                        pnl=float(trade_log_exit["profit"]),
-                        pnl_pct=float(trade_log_exit["profit_pct"]),
-                        holding_hours=float(trade_log_exit.get("holding_hours") or 0.0),
+                        entry_price=_num(trade_log_exit["entry_price"]),
+                        exit_price=_num(trade_log_exit["exit_price"]),
+                        size=_num(trade_log_exit["size"]),
+                        pnl=_num(trade_log_exit["profit"]),
+                        pnl_pct=_num(trade_log_exit["profit_pct"]),
+                        holding_hours=_num(trade_log_exit.get("holding_hours")),
                         closed_at=utcnow(),
-                        raw=raw_safe,    # ← セーフ化したものを渡す
+                        raw=trade_log_exit,  # rawはdb側で_jsonable/_to_plainを通る実装
                     )
                 except Exception as e:
                     # 何かあれば errors に残す（何が入らなかったか raw も一緒に）
