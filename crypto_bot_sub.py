@@ -1,7 +1,7 @@
 import requests
 import pandas as pd
 import numpy as np
-from datetime import datetime,date, timedelta
+from datetime import datetime,date, timedelta, timezone
 import time
 import json
 import os
@@ -30,9 +30,11 @@ from db import (
     upsert_position, insert_trade, insert_balance_snapshot, utcnow, insert_error
 )
 from db import get_line_user_id, get_line_user_ids_for_users  # 既に追加済みのDB関数
+from db import get_trades_between
 from notifiers.line_messaging import LineMessaging
 from notifications.message_templates import compose_signal_message, IndicatorSnapshot, SignalContext
-
+from reports.daily_report import build_daily_report_message
+JST = timezone(timedelta(hours=9))
 
 # 既存のimport文の後に追加
 try:
@@ -5301,98 +5303,52 @@ class CryptoTradingBot:
             self.logger.error(f"システム健全性チェック中にエラーが発生: {str(e)}")
             return False
 
-    def _send_daily_report(self, stats):
-        """日次レポートを送信する
-        
-        Parameters:
-        stats (dict): 統計情報の辞書
-        """
-        # 前回のレポート時刻
-        last_report_time = stats['last_report_time']
-        current_time = datetime.now()
-        
-        # 日付の書式
-        date_str = last_report_time.strftime('%Y-%m-%d')
-        
-        # 勝率の計算
-        daily_win_rate = 0
-        if stats['daily_trades'] > 0:
-            daily_win_rate = (stats['daily_wins'] / stats['daily_trades']) * 100
-        
-        # トータル勝率の計算
-        total_win_rate = 0
-        if stats['total_trades'] > 0:
-            total_win_rate = (stats['total_wins'] / stats['total_trades']) * 100
-        
-        # プロフィットファクター
-        profit_factor = 0
-        if stats['total_loss'] > 0:
-            profit_factor = stats['total_profit'] / stats['total_loss']
-        
-        # 日次収支
-        daily_net_profit = stats['daily_profit'] - stats['daily_loss']
-        
-        # 資金状況
-        current_balance = self.get_total_balance()
-        
-        # レポート本文
-        report_body = (
-            f"📊 {date_str} 日次取引レポート\n\n"
-            f"🔄 取引回数: {stats['daily_trades']}回\n"
-            f"✅ 勝ち: {stats['daily_wins']}回\n"
-            f"❌ 負け: {stats['daily_losses']}回\n"
-            f"📈 勝率: {daily_win_rate:.1f}%\n"
-            f"💰 利益: {stats['daily_profit']:,.0f}円\n"
-            f"💸 損失: {stats['daily_loss']:,.0f}円\n"
-            f"📊 日次収支: {daily_net_profit:+,.0f}円\n\n"
-            f"📋 累計成績\n"
-            f"🔄 総取引回数: {stats['total_trades']}回\n"
-            f"📈 総勝率: {total_win_rate:.1f}%\n"
-            f"💹 プロフィットファクター: {profit_factor:.2f}\n"
-            f"💵 現在資金: {current_balance:,.0f}円\n"
-            f"💰 累計利益: {self.total_profit:,.0f}円\n\n"
-            f"🏆 現在のポジション\n"
-        )
-        
-        # ポジション情報を追加
-        has_positions = False
-        for symbol in self.symbols:
-            position = self.positions.get(symbol)
-            if position:
-                has_positions = True
-                entry_price = self.entry_prices[symbol]
-                current_price = self.get_current_price(symbol)
-                if current_price > 0:
-                    if position == 'long':
-                        profit_pct = (current_price / entry_price - 1) * 100
-                    else:  # short
-                        profit_pct = (entry_price / current_price - 1) * 100
-                    
-                    # 保有時間
-                    if self.entry_times[symbol]:
-                        holding_time = current_time - self.entry_times[symbol]
-                        hours = holding_time.total_seconds() / 3600
-                        report_body += f"{symbol}: {position} ({profit_pct:+.2f}%), {hours:.1f}時間保有\n"
-                    else:
-                        report_body += f"{symbol}: {position} ({profit_pct:+.2f}%)\n"
-        
-        if not has_positions:
-            report_body += "現在ポジションはありません\n"
-        
-        # 市場センチメント情報を追加
-        if hasattr(self, 'sentiment'):
-            report_body += f"\n📉 市場センチメント\n"
-            report_body += f"強気: {self.sentiment.get('bullish', 0):.1f}%\n"
-            report_body += f"弱気: {self.sentiment.get('bearish', 0):.1f}%\n"
-            report_body += f"中立: {self.sentiment.get('neutral', 0):.1f}%\n"
-            report_body += f"ボラティリティ: {self.sentiment.get('volatility', 0):.1f}%\n"
-            report_body += f"トレンド強度: {self.sentiment.get('trend_strength', 0):.1f}%\n"
-        
-        # レポートを送信
-        self.logger.info("日次レポートを送信します")
-        self.send_notification("日次取引レポート", report_body, "daily_report")
-        self.logger.info("日次レポートを送信しました")
+    def send_daily_report(self, day: Optional[datetime] = None):
+        start, end = self._day_bounds_jst(day)
 
+        # DBから「クローズ済」トレードを取得
+        trades = []
+        try:
+            from db import get_trades_between
+            trades = (get_trades_between(start, end) or [])
+        except Exception as e:
+            self.logger.warning(f"DB取得に失敗（メモリfallback）: {e}")
+
+        # メモリ上の当日分 exit ログを併用（任意：軽量化で当日だけ抽出）
+        trades += getattr(self, "daily_exit_logs", [])
+
+        # 重複除外（任意）
+        seen = set()
+        deduped = []
+        for t in trades:
+            key = (
+                t.get("exit_order_id"),
+                t.get("closed_at") or t.get("exit_time"),
+                t.get("symbol"),
+                t.get("entry_price"), t.get("exit_price"),
+                t.get("size"),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(t)
+        trades = deduped
+
+        # ← ここを start に修正
+        subject, message = build_daily_report_message(trades, day=start)
+
+        try:
+            # 必要ならここで短縮処理（LINE対策）を入れる
+            self.send_notification(subject=subject, message=message)
+            self.logger.info("日次まとめ通知を送信しました")
+        except Exception as e:
+            self.logger.exception(f"日次まとめ通知 送信失敗: {e}")
+
+    def _day_bounds_jst(self, day=None):
+        day = (day or datetime.now(JST)).astimezone(JST)
+        start = day.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = start + timedelta(days=1)
+        return start, end
 
     def _generate_final_report(self, start_date, start_balance, stats, trade_logs):
         """最終レポートを生成する
