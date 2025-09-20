@@ -34,6 +34,7 @@ from db import get_trades_between
 from notifiers.line_messaging import LineMessaging
 from notifications.message_templates import compose_signal_message, IndicatorSnapshot, SignalContext
 from reports.daily_report import build_daily_report_message
+from typing import Optional, List, Dict, Tuple, Any
 JST = timezone(timedelta(hours=9))
 
 # 既存のimport文の後に追加

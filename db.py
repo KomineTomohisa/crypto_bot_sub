@@ -2,7 +2,7 @@ from __future__ import annotations
 import os
 import json
 from contextlib import contextmanager
-from datetime import datetime, date, timezone
+from datetime import datetime, date, timezone, timedelta
 from decimal import Decimal
 from typing import Optional, Dict, Any
 from uuid import uuid4
@@ -74,6 +74,23 @@ def _json_param(v):
     if isinstance(v, (dict, list)):
         return json.dumps(v, ensure_ascii=False)
     return v
+
+def get_trades_for_day_jst(day_dt):
+    """
+    JST の 00:00〜24:00 を作り、その範囲の trades を返す（辞書配列）。
+    day_dt: datetime（naive 可）— naive の場合は JST とみなす
+    """
+    day = day_dt
+    if day.tzinfo is None:
+        day = day.replace(tzinfo=JST)
+    else:
+        day = day.astimezone(JST)
+
+    start_jst = day.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_jst   = start_jst + timedelta(days=1)
+
+    # UTC に直してからクエリ
+    return get_trades_between(start_jst, end_jst)
 
 # === 起動時に接続先をログ出力（パスワード隠し） ===
 def _redact_url(u: str) -> str:
