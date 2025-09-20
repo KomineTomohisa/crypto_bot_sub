@@ -639,6 +639,31 @@ class CryptoTradingBot:
         except Exception as e:
             self.logger.error(f"通知送信エラー: {e}")
 
+    def _notify_signal(self, *args, **kwargs):
+        """
+        互換レイヤー（旧コードからの呼び出しを吸収）
+        受け付ける形:
+        1) _notify_signal(subject, message)
+        2) _notify_signal(kind, subject, message)  # kind='ENTRY'|'EXIT'|'ERROR' など
+        3) _notify_signal(subject, message, notification_type='info')
+        """
+        notification_type = kwargs.pop("notification_type", None)
+
+        if len(args) == 3:
+            # (kind, subject, message)
+            kind, subject, message = args
+            nt = (notification_type or (kind.lower() if isinstance(kind, str) else "info"))
+            return self.send_notification(subject, message, notification_type=nt)
+
+        if len(args) == 2:
+            # (subject, message)
+            subject, message = args
+            nt = (notification_type or "info")
+            return self.send_notification(subject, message, notification_type=nt)
+
+        # 形が合わない場合は分かりやすいエラーを出す
+        raise TypeError(f"_notify_signal unexpected signature: args={args}, kwargs={kwargs}")
+
     def _send_line(self, subject: str, body: str) -> None:
         """LINE Messaging API 送信（宛先は DB→ENV の順で解決。なければ黙ってスキップ）"""
         try:
