@@ -29,7 +29,8 @@ from db import (
     insert_order, mark_order_executed_with_fill,
     upsert_position, insert_trade, insert_balance_snapshot, utcnow, insert_error
 )
-
+from db import get_line_user_id, get_line_user_ids_for_users  # 既に追加済みのDB関数
+from notifiers.line_messaging import LineMessaging
 
 # 既存のimport文の後に追加
 try:
@@ -406,7 +407,7 @@ class CryptoTradingBot:
             self.logger.error(f"GMOコイン総資産額取得エラー: {e}", exc_info=True)
             return 0.0
 
-    def __init__(self, initial_capital=200000, test_mode=True):
+    def __init__(self, initial_capital=200000, test_mode=True, user_id=None):
         """
         トレーディングボットの初期化
         
@@ -414,6 +415,9 @@ class CryptoTradingBot:
         initial_capital (float): 初期資金 (円)
         test_mode (bool): テストモード（少額取引）の場合はTrue
         """
+
+        self.user_id = user_id  # ← DBから通知設定/トークンを引くための文脈
+
         # ディレクトリ設定（最初に設定する必要あり）
         self.base_dir = os.path.dirname(os.path.abspath(__file__))
         self.cache_dir = os.path.join(self.base_dir, 'data_cache')
@@ -622,12 +626,50 @@ class CryptoTradingBot:
             return
             
         try:
-            # メール通知
+            # 1) メール
             self._send_email(subject, message)
-            
+            # 2) LINE（Messaging API）
+            self._send_line(subject, message)
             self.logger.info(f"通知送信完了: {subject}")
         except Exception as e:
             self.logger.error(f"通知送信エラー: {e}")
+
+    def _send_line(self, subject: str, body: str) -> None:
+        """LINE Messaging API 送信（宛先は DB→ENV の順で解決。なければ黙ってスキップ）"""
+        try:
+            # 宛先解決：DB（user_id 紐づけ）→ 環境変数 LINE_DEFAULT_USER_ID
+            line_user_id = None
+            if getattr(self, "user_id", None) is not None:
+                line_user_id = get_line_user_id(self.user_id)  # U で始まる 32桁のhex
+            if not line_user_id:
+                line_user_id = os.getenv("LINE_DEFAULT_USER_ID")
+            if not line_user_id:
+                self.logger.info("LINE宛先が未設定のため送信スキップ")
+                return
+
+            client = LineMessaging()  # ENV の LINE_CHANNEL_ACCESS_TOKEN を利用
+            ok = client.send_text(line_user_id, f"{subject}\n{body}")
+            if ok:
+                self.logger.info("LINE送信成功")
+            else:
+                self.logger.warning("LINE送信失敗（詳細は直前のログ参照）")
+        except Exception as e:
+            # 失敗してもボットは止めない
+            self.logger.warning(f"LINE送信エラー: {e}")
+
+    # （将来用）複数ユーザー配信のヘルパ
+    def _send_line_multicast(self, app_user_ids: list[int], text: str) -> None:
+        try:
+            ids = get_line_user_ids_for_users(app_user_ids)
+            if not ids:
+                self.logger.info("LINE宛先が空（multicast）")
+                return
+            client = LineMessaging()
+            ok = client.send_text_bulk(ids, text)
+            if not ok:
+                self.logger.warning(f"LINEマルチキャスト失敗 count={len(ids)}")
+        except Exception as e:
+            self.logger.warning(f"LINEマルチキャスト エラー: {e}")
     
     def _send_email(self, subject, body):
         """メール送信
@@ -5632,11 +5674,12 @@ if __name__ == "__main__":
     parser.add_argument('--api-secret', type=str, help='bitbank API シークレット')
     parser.add_argument('--reset', action='store_true', help='起動時にポジション情報をリセットする')
     parser.add_argument('--clear-cache', action='store_true', help='キャッシュをクリアしてから実行する')
+    parser.add_argument('--user-id', type=int, help='通知/DB設定をひもづけるユーザーID')
     
     args = parser.parse_args()
     
     # ボットのインスタンス作成
-    bot = CryptoTradingBot(initial_capital=args.capital, test_mode=args.test)
+    bot = CryptoTradingBot(initial_capital=args.capital, test_mode=args.test, user_id=args.user_id)
     
     # デバッグモード設定
     if args.debug:
