@@ -148,6 +148,35 @@ errors = sa.table(
     sa.column("stack", sa.Text),
     sa.column("raw", sa.JSON),
 )
+user_integrations = sa.table(
+    "user_integrations",
+    sa.column("user_id", sa.BigInteger),
+    sa.column("provider", sa.String),
+    sa.column("access_token_enc", sa.LargeBinary),
+    sa.column("token_last4", sa.String),
+    sa.column("status", sa.String),
+    sa.column("created_at", sa.DateTime(timezone=True)),
+    sa.column("updated_at", sa.DateTime(timezone=True)),
+)
+user_line_endpoints = sa.table(
+    "user_line_endpoints",
+    sa.column("user_id", sa.BigInteger),
+    sa.column("line_user_id", sa.String),
+    sa.column("status", sa.String),
+    sa.column("display_name", sa.String),
+    sa.column("last_seen_at", sa.DateTime(timezone=True)),
+    sa.column("created_at", sa.DateTime(timezone=True)),
+    sa.column("updated_at", sa.DateTime(timezone=True)),
+)
+line_channels = sa.table(
+    "line_channels",
+    sa.column("id", sa.BigInteger),
+    sa.column("provider_key", sa.String),
+    sa.column("access_token_enc", sa.LargeBinary),
+    sa.column("status", sa.String),
+    sa.column("created_at", sa.DateTime(timezone=True)),
+    sa.column("updated_at", sa.DateTime(timezone=True)),
+)
 
 try:
     import numpy as np
@@ -359,3 +388,151 @@ def ping_db_once():
         insert_error("boot/ping", "ping ok", raw={"url": _redact_url(DATABASE_URL)})
     except Exception as e:
         insert_error("boot/ping", f"ping failed: {e}")
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential_jitter(0.2, 1.5))
+def upsert_user_integration_token(
+    user_id: int,
+    provider: str,
+    token_enc: bytes,       # ← 暗号化済（Fernet等）。平文はここに渡さない
+    token_last4: str,
+    status: str = "active",
+    conn: Optional[Connection] = None,
+) -> None:
+    """
+    暗号化済みトークンを保存（既存があれば更新）。1ユーザー×1プロバイダ=1行で維持。
+    """
+    stmt = sa.text("""
+        INSERT INTO user_integrations (user_id, provider, access_token_enc, token_last4, status)
+        VALUES (:user_id, :provider, :access_token_enc, :token_last4, :status)
+        ON CONFLICT (user_id, provider) DO UPDATE
+        SET access_token_enc = EXCLUDED.access_token_enc,
+            token_last4      = EXCLUDED.token_last4,
+            status           = EXCLUDED.status,
+            updated_at       = now()
+    """)
+    params = dict(
+        user_id=user_id, provider=provider,
+        access_token_enc=token_enc, token_last4=token_last4, status=status
+    )
+    _exec(stmt, params, conn)
+
+def get_active_user_integration_token(
+    user_id: int,
+    provider: str,
+    conn: Optional[Connection] = None,
+) -> Optional[tuple[bytes, str]]:
+    """
+    アクティブな暗号化済みトークンを取得（見つからなければ None）。
+    戻り値: (token_enc, token_last4)
+    """
+    stmt = sa.text("""
+        SELECT access_token_enc, token_last4
+          FROM user_integrations
+         WHERE user_id = :user_id
+           AND provider = :provider
+           AND status = 'active'
+         LIMIT 1
+    """)
+    if conn is not None:
+        row = conn.execute(stmt, {"user_id": user_id, "provider": provider}).fetchone()
+    else:
+        with engine.begin() as c:
+            row = c.execute(stmt, {"user_id": user_id, "provider": provider}).fetchone()
+    if not row:
+        return None
+    return row[0], row[1]
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential_jitter(0.2, 1.5))
+def set_user_integration_status(
+    user_id: int,
+    provider: str,
+    status: str,   # 'revoked' | 'error' | 'active'
+    conn: Optional[Connection] = None,
+) -> None:
+    """
+    ステータス更新（失効/エラー時などに使用）。
+    """
+    stmt = sa.text("""
+        UPDATE user_integrations
+           SET status = :status,
+               updated_at = now()
+         WHERE user_id = :user_id
+           AND provider = :provider
+    """)
+    params = dict(user_id=user_id, provider=provider, status=status)
+    _exec(stmt, params, conn)
+    
+# 1) ユーザーごとの送信先（LINE userId=U...）を登録/更新
+@retry(stop=stop_after_attempt(3), wait=wait_exponential_jitter(0.2, 1.5))
+def upsert_line_endpoint(user_id: int, line_user_id: str, display_name: Optional[str] = None) -> None:
+    stmt = sa.text("""
+        INSERT INTO user_line_endpoints (user_id, line_user_id, display_name, status)
+        VALUES (:user_id, :line_user_id, :display_name, 'active')
+        ON CONFLICT (user_id) DO UPDATE
+        SET line_user_id = EXCLUDED.line_user_id,
+            display_name = COALESCE(EXCLUDED.display_name, user_line_endpoints.display_name),
+            status       = 'active',
+            updated_at   = now()
+    """)
+    _exec(stmt, {"user_id": user_id, "line_user_id": line_user_id, "display_name": display_name}, None)
+
+# 2) 単一ユーザーのLINE userId を取得（なければ None）
+def get_line_user_id(user_id: int) -> Optional[str]:
+    stmt = sa.text("""
+        SELECT line_user_id
+          FROM user_line_endpoints
+         WHERE user_id = :user_id AND status = 'active'
+         LIMIT 1
+    """)
+    with engine.begin() as c:
+        row = c.execute(stmt, {"user_id": user_id}).fetchone()
+    return row[0] if row else None
+
+# 3) 複数ユーザー分のLINE userIdを配列で取得（multicast 用）
+def get_line_user_ids_for_users(user_ids: Sequence[int]) -> list[str]:
+    if not user_ids:
+        return []
+    stmt = sa.text("""
+        SELECT line_user_id
+          FROM user_line_endpoints
+         WHERE user_id = ANY(:ids) AND status = 'active'
+    """)
+    with engine.begin() as c:
+        rows = c.execute(stmt, {"ids": list(user_ids)}).fetchall()
+    return [r[0] for r in rows]
+
+# 4) エンドポイントの状態更新（例: ブロック検出時に 'blocked' へ）
+@retry(stop=stop_after_attempt(3), wait=wait_exponential_jitter(0.2, 1.5))
+def set_line_endpoint_status(user_id: int, status: str) -> None:
+    stmt = sa.text("""
+        UPDATE user_line_endpoints
+           SET status = :status, updated_at = now()
+         WHERE user_id = :user_id
+    """)
+    _exec(stmt, {"user_id": user_id, "status": status}, None)
+
+# --- （任意）チャネル・トークンをDBで運用する場合 --------------------------
+#  * 現状は .env の LINE_CHANNEL_ACCESS_TOKEN でOK。将来マルチテナント時に活用。
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential_jitter(0.2, 1.5))
+def upsert_line_channel_token(provider_key: str, access_token_enc: bytes, status: str = "active") -> None:
+    stmt = sa.text("""
+        INSERT INTO line_channels (provider_key, access_token_enc, status)
+        VALUES (:k, :t, :s)
+        ON CONFLICT (provider_key) DO UPDATE
+        SET access_token_enc = EXCLUDED.access_token_enc,
+            status = EXCLUDED.status,
+            updated_at = now()
+    """)
+    _exec(stmt, {"k": provider_key, "t": access_token_enc, "s": status}, None)
+
+def get_line_channel_token(provider_key: str) -> Optional[bytes]:
+    stmt = sa.text("""
+        SELECT access_token_enc
+          FROM line_channels
+         WHERE provider_key = :k AND status = 'active'
+         LIMIT 1
+    """)
+    with engine.begin() as c:
+        row = c.execute(stmt, {"k": provider_key}).fetchone()
+    return row[0] if row else None
