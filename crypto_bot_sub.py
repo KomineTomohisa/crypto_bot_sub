@@ -1,7 +1,7 @@
 import requests
 import pandas as pd
 import numpy as np
-from datetime import datetime,date, timedelta
+from datetime import datetime,date, timedelta, timezone
 import time
 import json
 import os
@@ -30,7 +30,12 @@ from db import (
     upsert_position, insert_trade, insert_balance_snapshot, utcnow, insert_error
 )
 from db import get_line_user_id, get_line_user_ids_for_users  # 既に追加済みのDB関数
+from db import get_trades_between
 from notifiers.line_messaging import LineMessaging
+from notifications.message_templates import compose_signal_message, IndicatorSnapshot, SignalContext
+from reports.daily_report import build_daily_report_message
+from typing import Optional, List, Dict, Tuple, Any
+JST = timezone(timedelta(hours=9))
 
 # 既存のimport文の後に追加
 try:
@@ -633,6 +638,31 @@ class CryptoTradingBot:
             self.logger.info(f"通知送信完了: {subject}")
         except Exception as e:
             self.logger.error(f"通知送信エラー: {e}")
+
+    def _notify_signal(self, *args, **kwargs):
+        """
+        互換レイヤー（旧コードからの呼び出しを吸収）
+        受け付ける形:
+        1) _notify_signal(subject, message)
+        2) _notify_signal(kind, subject, message)  # kind='ENTRY'|'EXIT'|'ERROR' など
+        3) _notify_signal(subject, message, notification_type='info')
+        """
+        notification_type = kwargs.pop("notification_type", None)
+
+        if len(args) == 3:
+            # (kind, subject, message)
+            kind, subject, message = args
+            nt = (notification_type or (kind.lower() if isinstance(kind, str) else "info"))
+            return self.send_notification(subject, message, notification_type=nt)
+
+        if len(args) == 2:
+            # (subject, message)
+            subject, message = args
+            nt = (notification_type or "info")
+            return self.send_notification(subject, message, notification_type=nt)
+
+        # 形が合わない場合は分かりやすいエラーを出す
+        raise TypeError(f"_notify_signal unexpected signature: args={args}, kwargs={kwargs}")
 
     def _send_line(self, subject: str, body: str) -> None:
         """LINE Messaging API 送信（宛先は DB→ENV の順で解決。なければ黙ってスキップ）"""
@@ -4614,28 +4644,131 @@ class CryptoTradingBot:
             self.log_entry(symbol, position_type, current_price, datetime.now(), entry_rsi, entry_cci, entry_atr, entry_adx, entry_sentiment)
             
             # 通知送信（修正箇所）
-            if self.notification_settings['send_on_entry']:
-                # RSI/CCIの値をフォーマット
-                rsi_str = f"{entry_rsi:.1f}" if entry_rsi is not None else "N/A"
-                cci_str = f"{entry_cci:.1f}" if entry_cci is not None else "N/A"
-                atr_str = f"{entry_atr:.2f}" if entry_atr is not None else "N/A"
-                adx_str = f"{entry_adx:.1f}" if entry_adx is not None else "N/A"
-                
-                notification_body = (
-                    f"価格: {current_price:.2f}円\n"
-                    f"数量: {executed_size:.6f}\n"
-                    f"金額: {final_order_amount:.0f}円\n"
-                    f"RSI: {rsi_str}\n"
-                    f"CCI: {cci_str}\n"
-                    f"ATR: {atr_str}\n"
-                    f"ADX: {adx_str}\n"  # この行を追加
+            if self.notification_settings.get('send_on_entry', True):
+                # --- df_5min を安全に取得（signal_dataに無ければキャッシュ等から） ---
+                df_5min = None
+                # 1) シグナル生成側で _df_5min を埋めているケース
+                if isinstance(signal_data, dict):
+                    df_5min = signal_data.get('_df_5min')
+                # 2) ボット内のキャッシュに持っているケース（環境に合わせて調整）
+                if df_5min is None and hasattr(self, 'df_5min_cache'):
+                    df_5min = self.df_5min_cache.get(symbol)
+                if df_5min is None and hasattr(self, 'latest_df_5min'):
+                    df_5min = getattr(self, 'latest_df_5min', {}).get(symbol)
+
+                # --- TP/SLを算出（df_5minが無ければNoneで送る） ---
+                tp_level = sl_level = None
+                try:
+                    if df_5min is not None and len(df_5min) > 0:
+                        exit_levels = self.calculate_dynamic_exit_levels(
+                            symbol=symbol,
+                            df_5min=df_5min,
+                            position_type=position_type,          # long/short
+                            entry_price=current_price              # いま入った価格
+                        ) if 'position_type' in self.calculate_dynamic_exit_levels.__code__.co_varnames else \
+                        self.calculate_dynamic_exit_levels(symbol, df_5min, position_type, current_price)
+                        tp_level = float(exit_levels.get('take_profit_price')) if exit_levels else None
+                        sl_level = float(exit_levels.get('stop_loss_price')) if exit_levels else None
+                except Exception as e:
+                    self.logger.warning(f"TP/SL算出に失敗（entry通知は継続）: {e}")
+
+                # --- 根拠タグ（最低限） ---
+                reason_tags = []
+                # トレンド・ボラ・オシレーターの簡易タグ化
+                try:
+                    last = None
+                    if df_5min is not None and len(df_5min) > 0:
+                        last = df_5min.iloc[-1]
+                    # 値源は signal_data を優先、無ければ df_5min の最新から
+                    rsi = float(entry_rsi) if entry_rsi is not None else (
+                        float(last["RSI"]) if (last is not None and "RSI" in df_5min.columns and not pd.isna(last["RSI"])) else None
+                    )
+                    adx = float(entry_adx) if entry_adx is not None else (
+                        float(last["ADX"]) if (last is not None and "ADX" in df_5min.columns and not pd.isna(last["ADX"])) else None
+                    )
+                    atr = float(entry_atr) if entry_atr is not None else (
+                        float(last["ATR"]) if (last is not None and "ATR" in df_5min.columns and not pd.isna(last["ATR"])) else None
+                    )
+
+                    # SMAは環境の列名に合わせて調整（SMA_FAST/SMA_SLOW or SMA20/SMA50 など）
+                    sma_fast = None
+                    sma_slow = None
+                    for fast_key in ("SMA_FAST","SMA20","SMA_20"):
+                        if fast_key in (signal_data.keys() if isinstance(signal_data, dict) else []):
+                            sma_fast = float(signal_data.get(fast_key)); break
+                    if sma_fast is None and last is not None:
+                        for fast_key in ("SMA_FAST","SMA20","SMA_20"):
+                            if fast_key in df_5min.columns and not pd.isna(last.get(fast_key)):
+                                sma_fast = float(last.get(fast_key)); break
+
+                    for slow_key in ("SMA_SLOW","SMA50","SMA_50"):
+                        if slow_key in (signal_data.keys() if isinstance(signal_data, dict) else []):
+                            sma_slow = float(signal_data.get(slow_key)); break
+                    if sma_slow is None and last is not None:
+                        for slow_key in ("SMA_SLOW","SMA50","SMA_50"):
+                            if slow_key in df_5min.columns and not pd.isna(last.get(slow_key)):
+                                sma_slow = float(last.get(slow_key)); break
+
+                    # タグ付け
+                    if adx is not None and adx >= 25:
+                        reason_tags.append("adx_trend")
+                    if atr is not None and current_price:
+                        atr_pct = 100.0 * atr / float(current_price)
+                        if atr_pct >= 1.6:
+                            reason_tags.append("atr_wide")
+                    if sma_fast is not None and sma_slow is not None:
+                        reason_tags.append("sma_bull" if sma_fast > sma_slow else "sma_bear")
+                    if rsi is not None:
+                        if rsi <= 30: reason_tags.append("rsi_oversold")
+                        elif rsi >= 70: reason_tags.append("rsi_overbought")
+                    # 方向タグ
+                    reason_tags.append("long_entry" if position_type == "long" else "short_entry")
+                    # 複数根拠なら confluence
+                    if len(reason_tags) >= 3:
+                        reason_tags.append("confluence")
+                except Exception as e:
+                    self.logger.warning(f"reason_tags生成に失敗: {e}")
+                    reason_tags = reason_tags or []
+
+                # --- 指標スナップショットを作成 ---
+                ind = IndicatorSnapshot(
+                    rsi = float(entry_rsi) if entry_rsi is not None else None,
+                    adx = float(entry_adx) if entry_adx is not None else None,
+                    atr = float(entry_atr) if entry_atr is not None else None,
+                    sma_fast = sma_fast,
+                    sma_slow = sma_slow,
+                    price = float(current_price) if current_price is not None else None,
+                    timeframe = "5m"
                 )
-                
-                self.send_notification(
-                    f"{symbol} {position_type}エントリー",
-                    notification_body,
-                    "entry"
+
+                # --- 通知サイド（BUY/SELL） ---
+                side_for_notice = "BUY" if position_type == "long" else "SELL"
+
+                # --- エントリー時の総合スコア（あれば使用） ---
+                entry_total_score = None
+                if isinstance(self.entry_scores.get(symbol, {}), dict):
+                    entry_total_score = self.entry_scores[symbol].get("entry_total_score")
+                if entry_total_score is None:
+                    # 無ければ buy_score/sell_score のどちらかを自然に採用
+                    entry_total_score = float(buy_score) if position_type == "long" else float(sell_score)
+
+                # --- コンテキストを組んで送信 ---
+                ctx = SignalContext(
+                    symbol=symbol,
+                    side=side_for_notice,
+                    reason_tags=reason_tags,
+                    tp=tp_level,
+                    sl=sl_level,
+                    score=entry_total_score
                 )
+                try:
+                    body = compose_signal_message(ctx, ind)
+                    self.send_notification(
+                        subject=f"{symbol.upper()} {side_for_notice}",
+                        message=body
+                    )
+                except Exception as e:
+                    self.logger.exception(f"ENTRY通知失敗: {e}")
 
             # スコア値を保存
             self.entry_scores[symbol] = {
@@ -4972,16 +5105,65 @@ class CryptoTradingBot:
                 self.log_exit(symbol, position, current_price, entry_price, datetime.now(), profit, profit_pct, exit_reason, hours, entry_sentiment)
                 
                 # 通知送信
-                if self.notification_settings['send_on_exit']:
-                    self.send_notification(
-                        f"{symbol} {position}決済",
-                        f"価格: {current_price:.2f}円\n"
-                        f"損益: {profit:.2f}円 ({profit_pct:+.2f}%)\n"
-                        f"保有時間: {hours:.1f}時間\n"
-                        f"理由: {exit_reason}\n"
-                        f"決済結果: 成功={success_count}, 失敗={failed_count}",
-                        "exit"
-                    )
+                if self.notification_settings.get('send_on_exit', True):
+                    # EXIT 用のside（見やすさ重視）
+                    exit_side = "EXIT-LONG" if position == "long" else "EXIT-SHORT"
+
+                    # reason_tags を簡易生成（必要に応じて拡張）
+                    reason_tags = []
+                    # TP/SLヒットのどちらか
+                    if exit_reason == "利益確定":
+                        reason_tags.append("tp_hit")
+                    elif exit_reason == "損切り":
+                        reason_tags.append("sl_hit")
+                    elif "長時間保有" in exit_reason:
+                        reason_tags.append("time_exit")
+
+                    # 指標系（ADX/ATR/SMA/RSI）のサマリをタグに反映（任意強化OK）
+                    last = df_5min.iloc[-1] if len(df_5min) > 0 else None
+                    if last is not None:
+                        adx = float(last["ADX"]) if "ADX" in df_5min.columns and not pd.isna(last["ADX"]) else None
+                        atr = float(last["ATR"]) if "ATR" in df_5min.columns and not pd.isna(last["ATR"]) else None
+                        rsi = float(last["RSI"]) if "RSI" in df_5min.columns and not pd.isna(last["RSI"]) else None
+                        sma_fast = float(last.get("SMA_FAST")) if "SMA_FAST" in df_5min.columns and not pd.isna(last.get("SMA_FAST")) else None
+                        sma_slow = float(last.get("SMA_SLOW")) if "SMA_SLOW" in df_5min.columns and not pd.isna(last.get("SMA_SLOW")) else None
+
+                        if adx is not None and adx >= 25:
+                            reason_tags.append("adx_trend")
+                        if atr is not None and current_price:
+                            atr_pct = 100.0 * atr / float(current_price)
+                            if atr_pct >= 1.6:
+                                reason_tags.append("atr_wide")
+                        if sma_fast is not None and sma_slow is not None:
+                            if sma_fast > sma_slow:
+                                reason_tags.append("sma_bull")
+                            elif sma_fast < sma_slow:
+                                reason_tags.append("sma_bear")
+                        if rsi is not None:
+                            if rsi <= 30:
+                                reason_tags.append("rsi_oversold")
+                            elif rsi >= 70:
+                                reason_tags.append("rsi_overbought")
+
+                    # エントリー時に保存していたスコア（存在すれば通知に混ぜる）
+                    saved_scores = self.entry_scores.get(symbol, {})
+                    score_for_notice = saved_scores.get("entry_total_score") \
+                        if "entry_total_score" in saved_scores else None
+
+                    # 価格・TP/SL は EXIT レベルと現在値を渡す
+                    try:
+                        self._notify_signal(
+                            symbol=symbol,
+                            side=exit_side,
+                            df_5min=df_5min,
+                            price=float(current_price) if current_price is not None else None,
+                            tp=float(take_profit_price) if take_profit_price is not None else None,
+                            sl=float(stop_loss_price) if stop_loss_price is not None else None,
+                            score=score_for_notice,
+                            reason_tags=reason_tags
+                        )
+                    except Exception as e:
+                        self.logger.exception(f"EXIT通知失敗: {e}")
                 
                 # 保存されていたスコア値を取得
                 saved_scores = self.entry_scores.get(symbol, {})
@@ -5147,98 +5329,52 @@ class CryptoTradingBot:
             self.logger.error(f"システム健全性チェック中にエラーが発生: {str(e)}")
             return False
 
-    def _send_daily_report(self, stats):
-        """日次レポートを送信する
-        
-        Parameters:
-        stats (dict): 統計情報の辞書
-        """
-        # 前回のレポート時刻
-        last_report_time = stats['last_report_time']
-        current_time = datetime.now()
-        
-        # 日付の書式
-        date_str = last_report_time.strftime('%Y-%m-%d')
-        
-        # 勝率の計算
-        daily_win_rate = 0
-        if stats['daily_trades'] > 0:
-            daily_win_rate = (stats['daily_wins'] / stats['daily_trades']) * 100
-        
-        # トータル勝率の計算
-        total_win_rate = 0
-        if stats['total_trades'] > 0:
-            total_win_rate = (stats['total_wins'] / stats['total_trades']) * 100
-        
-        # プロフィットファクター
-        profit_factor = 0
-        if stats['total_loss'] > 0:
-            profit_factor = stats['total_profit'] / stats['total_loss']
-        
-        # 日次収支
-        daily_net_profit = stats['daily_profit'] - stats['daily_loss']
-        
-        # 資金状況
-        current_balance = self.get_total_balance()
-        
-        # レポート本文
-        report_body = (
-            f"📊 {date_str} 日次取引レポート\n\n"
-            f"🔄 取引回数: {stats['daily_trades']}回\n"
-            f"✅ 勝ち: {stats['daily_wins']}回\n"
-            f"❌ 負け: {stats['daily_losses']}回\n"
-            f"📈 勝率: {daily_win_rate:.1f}%\n"
-            f"💰 利益: {stats['daily_profit']:,.0f}円\n"
-            f"💸 損失: {stats['daily_loss']:,.0f}円\n"
-            f"📊 日次収支: {daily_net_profit:+,.0f}円\n\n"
-            f"📋 累計成績\n"
-            f"🔄 総取引回数: {stats['total_trades']}回\n"
-            f"📈 総勝率: {total_win_rate:.1f}%\n"
-            f"💹 プロフィットファクター: {profit_factor:.2f}\n"
-            f"💵 現在資金: {current_balance:,.0f}円\n"
-            f"💰 累計利益: {self.total_profit:,.0f}円\n\n"
-            f"🏆 現在のポジション\n"
-        )
-        
-        # ポジション情報を追加
-        has_positions = False
-        for symbol in self.symbols:
-            position = self.positions.get(symbol)
-            if position:
-                has_positions = True
-                entry_price = self.entry_prices[symbol]
-                current_price = self.get_current_price(symbol)
-                if current_price > 0:
-                    if position == 'long':
-                        profit_pct = (current_price / entry_price - 1) * 100
-                    else:  # short
-                        profit_pct = (entry_price / current_price - 1) * 100
-                    
-                    # 保有時間
-                    if self.entry_times[symbol]:
-                        holding_time = current_time - self.entry_times[symbol]
-                        hours = holding_time.total_seconds() / 3600
-                        report_body += f"{symbol}: {position} ({profit_pct:+.2f}%), {hours:.1f}時間保有\n"
-                    else:
-                        report_body += f"{symbol}: {position} ({profit_pct:+.2f}%)\n"
-        
-        if not has_positions:
-            report_body += "現在ポジションはありません\n"
-        
-        # 市場センチメント情報を追加
-        if hasattr(self, 'sentiment'):
-            report_body += f"\n📉 市場センチメント\n"
-            report_body += f"強気: {self.sentiment.get('bullish', 0):.1f}%\n"
-            report_body += f"弱気: {self.sentiment.get('bearish', 0):.1f}%\n"
-            report_body += f"中立: {self.sentiment.get('neutral', 0):.1f}%\n"
-            report_body += f"ボラティリティ: {self.sentiment.get('volatility', 0):.1f}%\n"
-            report_body += f"トレンド強度: {self.sentiment.get('trend_strength', 0):.1f}%\n"
-        
-        # レポートを送信
-        self.logger.info("日次レポートを送信します")
-        self.send_notification("日次取引レポート", report_body, "daily_report")
-        self.logger.info("日次レポートを送信しました")
+    def send_daily_report(self, day: Optional[datetime] = None):
+        start, end = self._day_bounds_jst(day)
 
+        # DBから「クローズ済」トレードを取得
+        trades = []
+        try:
+            from db import get_trades_between
+            trades = (get_trades_between(start, end) or [])
+        except Exception as e:
+            self.logger.warning(f"DB取得に失敗（メモリfallback）: {e}")
+
+        # メモリ上の当日分 exit ログを併用（任意：軽量化で当日だけ抽出）
+        trades += getattr(self, "daily_exit_logs", [])
+
+        # 重複除外（任意）
+        seen = set()
+        deduped = []
+        for t in trades:
+            key = (
+                t.get("exit_order_id"),
+                t.get("closed_at") or t.get("exit_time"),
+                t.get("symbol"),
+                t.get("entry_price"), t.get("exit_price"),
+                t.get("size"),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(t)
+        trades = deduped
+
+        # ← ここを start に修正
+        subject, message = build_daily_report_message(trades, day=start)
+
+        try:
+            # 必要ならここで短縮処理（LINE対策）を入れる
+            self.send_notification(subject=subject, message=message)
+            self.logger.info("日次まとめ通知を送信しました")
+        except Exception as e:
+            self.logger.exception(f"日次まとめ通知 送信失敗: {e}")
+
+    def _day_bounds_jst(self, day=None):
+        day = (day or datetime.now(JST)).astimezone(JST)
+        start = day.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = start + timedelta(days=1)
+        return start, end
 
     def _generate_final_report(self, start_date, start_balance, stats, trade_logs):
         """最終レポートを生成する

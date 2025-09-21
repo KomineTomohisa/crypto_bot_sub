@@ -2,7 +2,7 @@ from __future__ import annotations
 import os
 import json
 from contextlib import contextmanager
-from datetime import datetime, date, timezone
+from datetime import datetime, date, timezone, timedelta
 from decimal import Decimal
 from typing import Optional, Dict, Any
 from uuid import uuid4
@@ -21,6 +21,49 @@ BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")  # ←絶対パスで .env を読む
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+JST = timezone(timedelta(hours=9))
+
+def _as_utc(dt):
+    """naive→UTC付与 / JST→UTC変換 / すでにtz付き→UTC変換"""
+    if dt.tzinfo is None:
+        # naive は UTC として扱う（必要ならここを JST 想定に変える）
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+def get_trades_between(start_dt, end_dt, symbols=None, min_abs_pnl=None):
+    """
+    [start_dt, end_dt) に closed_at が入る trades を返却（辞書の配列）。
+    - start_dt/end_dt: datetime（naive でも tz 付きでもOK）
+    - symbols: 例 ["ltc_jpy","eth_jpy"]（None なら全件）
+    - min_abs_pnl: 絶対値でこのPnLを下限にフィルタ（例: 0.0）
+    """
+    start_utc = _as_utc(start_dt)
+    end_utc   = _as_utc(end_dt)
+
+    where = ["closed_at >= :start_dt", "closed_at < :end_dt"]
+    params = {"start_dt": start_utc, "end_dt": end_utc}
+
+    if symbols:
+        where.append("symbol = ANY(:syms)")
+        params["syms"] = list(symbols)
+
+    if min_abs_pnl is not None:
+        where.append("ABS(pnl) >= :min_abs_pnl")
+        params["min_abs_pnl"] = float(min_abs_pnl)
+
+    sql = f"""
+        SELECT trade_id, symbol, side, entry_position_id, exit_order_id,
+               entry_price, exit_price, size, pnl, pnl_pct,
+               holding_hours, closed_at, raw
+          FROM trades
+         WHERE {' AND '.join(where)}
+         ORDER BY closed_at ASC
+    """
+    with engine.begin() as conn:
+        rows = conn.execute(sa.text(sql), params).mappings().all()
+    # dict のリストで返す
+    return [dict(r) for r in rows]
+
 def _json_param(v):
     if v is None:
         return None
@@ -31,6 +74,23 @@ def _json_param(v):
     if isinstance(v, (dict, list)):
         return json.dumps(v, ensure_ascii=False)
     return v
+
+def get_trades_for_day_jst(day_dt):
+    """
+    JST の 00:00〜24:00 を作り、その範囲の trades を返す（辞書配列）。
+    day_dt: datetime（naive 可）— naive の場合は JST とみなす
+    """
+    day = day_dt
+    if day.tzinfo is None:
+        day = day.replace(tzinfo=JST)
+    else:
+        day = day.astimezone(JST)
+
+    start_jst = day.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_jst   = start_jst + timedelta(days=1)
+
+    # UTC に直してからクエリ
+    return get_trades_between(start_jst, end_jst)
 
 # === 起動時に接続先をログ出力（パスワード隠し） ===
 def _redact_url(u: str) -> str:
@@ -461,7 +521,7 @@ def set_user_integration_status(
     """)
     params = dict(user_id=user_id, provider=provider, status=status)
     _exec(stmt, params, conn)
-    
+
 # 1) ユーザーごとの送信先（LINE userId=U...）を登録/更新
 @retry(stop=stop_after_attempt(3), wait=wait_exponential_jitter(0.2, 1.5))
 def upsert_line_endpoint(user_id: int, line_user_id: str, display_name: Optional[str] = None) -> None:
