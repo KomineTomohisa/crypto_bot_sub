@@ -1967,7 +1967,22 @@ class CryptoTradingBot:
             self.logger.error(f"GMOコイン注文確認エラー: {e}", exc_info=True)
             return 0
             
-    def execute_order_with_confirmation(self, symbol, order_type, size, max_retries=1):
+    def execute_order_with_confirmation(
+        self, symbol, order_type, size, max_retries=1,
+        *,  # ここからキーワード専用引数
+        timeframe: str | None = None,
+        strength_score: float | None = None,
+        rsi: float | None = None,
+        adx: float | None = None,
+        atr: float | None = None,
+        di_plus: float | None = None,
+        di_minus: float | None = None,
+        ema_fast: float | None = None,
+        ema_slow: float | None = None,
+        strategy_id: str | None = "v1_weighted_signals",
+        version: str | None = "2025-09-21",
+        signal_raw: dict | None = None,
+    ):
         """確実に注文を実行し、ポジションが実際に保有されていることを確認する"""
         # --- (追加) エントリー時のみシグナルを先に記録する --------------------
         # current_position が None = 新規エントリー、Noneでない = 決済フェーズの可能性
@@ -1976,30 +1991,30 @@ class CryptoTradingBot:
         try:
             current_position_preview = self.positions.get(symbol)
             if current_position_preview is None:
-                # エントリー方向を決定（buy→long / sell→short）
                 side_for_signal = "long" if str(order_type).lower() == "buy" else "short"
-                # 可能なら最新価格を取得（失敗時は 0.0）
                 try:
                     current_price_preview = float(self.get_current_price(symbol) or 0.0)
                 except Exception:
                     current_price_preview = 0.0
 
-                # timeframe/strategy_id/version はあなたの運用に合わせて調整可
-                # indicators はここでは取れないので省略（NoneでOK）
+                indicators = {
+                    "RSI": rsi, "ADX": adx, "ATR": atr,
+                    "DI+": di_plus, "DI-": di_minus,
+                    "EMA_fast": ema_fast, "EMA_slow": ema_slow,
+                } if any(v is not None for v in [rsi, adx, atr, di_plus, di_minus, ema_fast, ema_slow]) else None
+
                 signal_id = self._record_signal(
                     symbol=symbol,
-                    timeframe="15m",                 # ← 実運用の足に合わせて
+                    timeframe=timeframe or "5m",
                     side=side_for_signal,
                     price=current_price_preview,
-                    strength_score=None,
-                    indicators=None,                 # 直前で保持しているなら渡してOK
-                    strategy_id="v1_weighted_signals",
-                    version="2025-09-21",
+                    strength_score=strength_score,
+                    indicators=indicators,
+                    strategy_id=strategy_id,
+                    version=version,
                     status="new",
-                    raw={"source": "execute_order_with_confirmation/pre_order",
-                        "note": "order about to be placed"}
+                    raw=(signal_raw or {}) | {"source": "execute_order_with_confirmation/pre_order"}
                 )
-                # 後続で注文成功したら 'sent' へ更新します
         except Exception as e:
             self.logger.warning(f"シグナル事前記録スキップ: {e}")
 
@@ -4786,7 +4801,22 @@ class CryptoTradingBot:
         order_result = self.execute_order_with_confirmation(
             symbol,
             'buy' if position_type == 'long' else 'sell',
-            order_size
+            order_size,
+            timeframe="5m",                     # 運用している足
+            strength_score=buy_score,           # 合成スコア
+            rsi=rsi,
+            adx=adx,
+            atr=atr,
+            di_plus=di_plus,
+            di_minus=di_minus,
+            ema_fast=ema_fast,
+            ema_slow=ema_slow,
+            strategy_id="v1_weighted_signals",
+            version="2025-09-21",
+            signal_raw={
+                "thresholds": thresholds_dict,
+                "explanation": explanation_text
+            }
         )
         
         if order_result['success']:
