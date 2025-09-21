@@ -1957,7 +1957,7 @@ class CryptoTradingBot:
                 # indicators はここでは取れないので省略（NoneでOK）
                 signal_id = self._record_signal(
                     symbol=symbol,
-                    timeframe="5m",                 # ← 実運用の足に合わせて
+                    timeframe="15m",                 # ← 実運用の足に合わせて
                     side=side_for_signal,
                     price=current_price_preview,
                     strength_score=None,
@@ -4268,7 +4268,7 @@ class CryptoTradingBot:
             'daily_losses': 0,
             'daily_profit': 0,
             'daily_loss': 0,
-            'last_report_time': datetime.now()
+            'last_report_time': datetime.now(JST)
         }
         
         # 起動メッセージ送信
@@ -4324,7 +4324,7 @@ class CryptoTradingBot:
                 
                 try:
                     # 現在の日本時間を取得
-                    jst_now = datetime.now() + timedelta(hours=9)
+                    jst_now = datetime.now(JST)
                     
                     # システム健全性チェック
                     health_check_counter += 1
@@ -4342,8 +4342,15 @@ class CryptoTradingBot:
                         self.check_backup_needed()
                         self.check_monthly_increase()
                     
+                    last_rep = stats.get('last_report_time')
+                    try:
+                        last_rep_jst = last_rep.astimezone(JST)
+                    except Exception:
+                        # naive 対策：JST とみなす（必要に応じて UTC 扱いに変更）
+                        last_rep_jst = last_rep.replace(tzinfo=JST)
+
                     # 日次レポート送信（日本時間の深夜0時）
-                    if jst_now.hour == 0 and jst_now.minute < 5 and stats['last_report_time'].day != jst_now.day:
+                    if (jst_now.hour == 0 and jst_now.minute < 5 and last_rep_jst.date() != jst_now.date()):
                         self._send_daily_report(stats)
                         # レポート送信後に日次変数をリセット
                         stats['last_report_time'] = jst_now
