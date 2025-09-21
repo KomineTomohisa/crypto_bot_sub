@@ -35,7 +35,10 @@ from db import insert_signal
 from db import update_signal_status
 from notifiers.line_messaging import LineMessaging
 from notifications.message_templates import compose_signal_message, IndicatorSnapshot, SignalContext
-from reports.daily_report import build_daily_report_message
+try:
+    from reports.daily_report import build_daily_report_message
+except ImportError:
+    from daily_report import build_daily_report_message
 from typing import Optional, List, Dict, Tuple, Any
 JST = timezone(timedelta(hours=9))
 
@@ -678,6 +681,34 @@ class CryptoTradingBot:
             self.logger.info(f"通知送信完了: {subject}")
         except Exception as e:
             self.logger.error(f"通知送信エラー: {e}")
+
+    def _send_daily_report(self, stats: dict) -> None:
+        """
+        その日のトレードを集計して日次レポート（メール/LINE）を送る。
+        run_live 内の 0:00 トリガーで呼ばれる想定。
+        """
+        try:
+            jst_now = datetime.now(JST)
+            start = jst_now.replace(hour=0, minute=0, second=0, microsecond=0)
+            end   = start + timedelta(days=1)
+
+            # DBから当日分のクローズ済みトレードを取得（db.get_trades_between を利用）
+            try:
+                trades = get_trades_between(start, end)
+            except Exception as e:
+                self.logger.warning(f"DBからのトレード取得に失敗。メモリ上のログにフォールバック: {e}")
+                # フォールバック：stats または self に保っている当日ログがあれば使う
+                trades = stats.get("today_trade_logs", []) if isinstance(stats, dict) else []
+
+            # メッセージ生成（daily_report.py）
+            subject, message = build_daily_report_message(trades, day=start)
+
+            # 通知送信（メール＆LINE）
+            self.send_notification(subject=subject, message=message, notification_type="daily_report")
+            self.logger.info("✅ 日次レポート送信完了")
+
+        except Exception as e:
+            self.logger.error(f"日次レポート送信エラー: {e}", exc_info=True)
 
     def _notify_signal(self, *args, **kwargs):
         """
