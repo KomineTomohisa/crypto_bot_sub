@@ -31,6 +31,8 @@ from db import (
 )
 from db import get_line_user_id, get_line_user_ids_for_users  # 既に追加済みのDB関数
 from db import get_trades_between
+from db import insert_signal
+from db import update_signal_status
 from notifiers.line_messaging import LineMessaging
 from notifications.message_templates import compose_signal_message, IndicatorSnapshot, SignalContext
 from reports.daily_report import build_daily_report_message
@@ -314,6 +316,44 @@ class CryptoTradingBot:
         except Exception as e:
             self.logger.error(f"Excel評価レポート生成エラー: {str(e)}", exc_info=True)
             return None
+
+    def _record_signal(self, *, symbol: str, timeframe: str, side: str, price: float,
+                   strength_score: float | None,
+                   indicators: dict[str, float] | None,
+                   strategy_id: str | None = None,
+                   version: str | None = None,
+                   status: str = "new",
+                   raw: dict | None = None,
+                   signal_id: str | None = None) -> str:
+        try:
+            rsi = indicators.get("RSI") if indicators else None
+            adx = indicators.get("ADX") if indicators else None
+            atr = indicators.get("ATR") if indicators else None
+            di_p = indicators.get("DI+") if indicators else None
+            di_m = indicators.get("DI-") if indicators else None
+            ema_fast = indicators.get("EMA_fast") if indicators else None
+            ema_slow = indicators.get("EMA_slow") if indicators else None
+
+            sid = insert_signal(
+                user_id=getattr(self, "user_id", None),
+                symbol=symbol,
+                timeframe=timeframe,
+                side=side,
+                strength_score=strength_score,
+                rsi=rsi, adx=adx, atr=atr,
+                di_plus=di_p, di_minus=di_m,
+                ema_fast=ema_fast, ema_slow=ema_slow,
+                price=price,
+                strategy_id=strategy_id, version=version,
+                status=status,
+                raw=raw,
+                signal_id=signal_id
+            )
+            self.logger.info(f"✅ シグナル記録: signal_id={sid} {symbol} {timeframe} {side} price={price}")
+            return sid
+        except Exception as e:
+            self.logger.error(f"シグナル記録エラー: {e}", exc_info=True)
+            return ""
 
     def get_total_balance(self):
         """
@@ -641,28 +681,79 @@ class CryptoTradingBot:
 
     def _notify_signal(self, *args, **kwargs):
         """
-        互換レイヤー（旧コードからの呼び出しを吸収）
+        互換レイヤー（旧/新どちらの呼び方も吸収）
         受け付ける形:
         1) _notify_signal(subject, message)
-        2) _notify_signal(kind, subject, message)  # kind='ENTRY'|'EXIT'|'ERROR' など
-        3) _notify_signal(subject, message, notification_type='info')
+        2) _notify_signal(kind, subject, message)  # kind='ENTRY'|'EXIT'|'ERROR' 等
+        3) _notify_signal(**kwargs)  # 例: side, symbol, price, tp, sl, score, reason_tags, ...
+            ※ df_5min など巨大データは通知文から除外
         """
         notification_type = kwargs.pop("notification_type", None)
 
-        if len(args) == 3:
-            # (kind, subject, message)
-            kind, subject, message = args
-            nt = (notification_type or (kind.lower() if isinstance(kind, str) else "info"))
-            return self.send_notification(subject, message, notification_type=nt)
+        # --- 旧: 位置引数系 ---
+        if args:
+            if len(args) == 3:
+                kind, subject, message = args
+                nt = notification_type or (str(kind).lower() if isinstance(kind, str) else "info")
+                return self.send_notification(subject, message, notification_type=nt)
+            if len(args) == 2:
+                subject, message = args
+                nt = notification_type or "info"
+                return self.send_notification(subject, message, notification_type=nt)
+            raise TypeError(f"_notify_signal unexpected signature: args={args}, kwargs={kwargs}")
 
-        if len(args) == 2:
-            # (subject, message)
-            subject, message = args
-            nt = (notification_type or "info")
-            return self.send_notification(subject, message, notification_type=nt)
+        # --- 新: キーワード引数系（EXIT側はこちらで来る想定） ---
+        # 期待キー: side, symbol, price, tp, sl, score, reason_tags など
+        side    = kwargs.get("side") or kwargs.get("kind") or "SIGNAL"
+        symbol  = kwargs.get("symbol", "-")
+        price   = kwargs.get("price")
+        tp      = kwargs.get("tp")
+        sl      = kwargs.get("sl")
+        score   = kwargs.get("score")
+        reasons = kwargs.get("reason_tags") or kwargs.get("reasons") or []
 
-        # 形が合わない場合は分かりやすいエラーを出す
-        raise TypeError(f"_notify_signal unexpected signature: args={args}, kwargs={kwargs}")
+        # 件名
+        subject = f"{side} {symbol}".upper()
+
+        # 本文（巨大オブジェクトは含めない: df_5min 等は無視）
+        lines = []
+        if price is not None:
+            try:
+                lines.append(f"Price: {price:,.0f}")
+            except Exception:
+                lines.append(f"Price: {price}")
+        if tp is not None:
+            try:
+                lines.append(f"TP: {tp:,.0f}")
+            except Exception:
+                lines.append(f"TP: {tp}")
+        if sl is not None:
+            try:
+                lines.append(f"SL: {sl:,.0f}")
+            except Exception:
+                lines.append(f"SL: {sl}")
+        if score is not None:
+            lines.append(f"Score: {score}")
+        if reasons:
+            lines.append("Reasons: " + ", ".join(map(str, reasons)))
+
+        message = "\n".join(lines) if lines else "(no details)"
+
+        # 通知タイプ（未指定なら side から推測）
+        if notification_type:
+            nt = notification_type
+        else:
+            s = str(side).upper()
+            if "EXIT" in s:
+                nt = "exit"
+            elif "ENTRY" in s:
+                nt = "entry"
+            elif "ERROR" in s or "FAIL" in s:
+                nt = "error"
+            else:
+                nt = "info"
+
+        return self.send_notification(subject, message, notification_type=nt)
 
     def _send_line(self, subject: str, body: str) -> None:
         """LINE Messaging API 送信（宛先は DB→ENV の順で解決。なければ黙ってスキップ）"""
@@ -1847,6 +1938,41 @@ class CryptoTradingBot:
             
     def execute_order_with_confirmation(self, symbol, order_type, size, max_retries=1):
         """確実に注文を実行し、ポジションが実際に保有されていることを確認する"""
+        # --- (追加) エントリー時のみシグナルを先に記録する --------------------
+        # current_position が None = 新規エントリー、Noneでない = 決済フェーズの可能性
+        # 決済は signals には記録しない方針（必要なら別途 exit_signals を用意）
+        signal_id = ""
+        try:
+            current_position_preview = self.positions.get(symbol)
+            if current_position_preview is None:
+                # エントリー方向を決定（buy→long / sell→short）
+                side_for_signal = "long" if str(order_type).lower() == "buy" else "short"
+                # 可能なら最新価格を取得（失敗時は 0.0）
+                try:
+                    current_price_preview = float(self.get_current_price(symbol) or 0.0)
+                except Exception:
+                    current_price_preview = 0.0
+
+                # timeframe/strategy_id/version はあなたの運用に合わせて調整可
+                # indicators はここでは取れないので省略（NoneでOK）
+                signal_id = self._record_signal(
+                    symbol=symbol,
+                    timeframe="5m",                 # ← 実運用の足に合わせて
+                    side=side_for_signal,
+                    price=current_price_preview,
+                    strength_score=None,
+                    indicators=None,                 # 直前で保持しているなら渡してOK
+                    strategy_id="v1_weighted_signals",
+                    version="2025-09-21",
+                    status="new",
+                    raw={"source": "execute_order_with_confirmation/pre_order",
+                        "note": "order about to be placed"}
+                )
+                # 後続で注文成功したら 'sent' へ更新します
+        except Exception as e:
+            self.logger.warning(f"シグナル事前記録スキップ: {e}")
+
+        # ----------------------------------------------------------------------
         for attempt in range(max_retries):
             try:
                 self.logger.info(f"注文試行 {attempt+1}/{max_retries}: {symbol} {order_type} {size}")
@@ -1866,6 +1992,13 @@ class CryptoTradingBot:
                     self.logger.error("注文成功したが注文IDがありません")
                     time.sleep(2)
                     continue
+
+                # （追加）エントリー signals を 'sent' に更新（注文が通った時点）
+                try:
+                    if signal_id:
+                        update_signal_status(signal_id, "sent")
+                except Exception as e:
+                    self.logger.warning(f"シグナルstatus更新失敗: {e}")
 
                 # 2) 約定確認（数回試行）
                 for check in range(5):
@@ -1896,10 +2029,15 @@ class CryptoTradingBot:
                                 price=exec_price,
                                 fee=None,
                                 executed_at=utcnow(),
-                                fill_raw={"source": "exit", "symbol": symbol}
+                                fill_raw={
+                                    "source": "exit",
+                                    "symbol": symbol,
+                                    # （追加）signal_id を橋渡し：後続分析でトレース可能
+                                    "signal_id": signal_id or None
+                                }
                             )
                         except Exception as e:
-                            insert_error("exit/fill", str(e), raw={"order_id": order_id, "symbol": symbol})
+                            insert_error("exit/fill", str(e), raw={"order_id": order_id, "symbol": symbol, "signal_id": signal_id or None})
 
                         return {
                             'success': True,
@@ -1934,13 +2072,18 @@ class CryptoTradingBot:
                                 price=float(exec_price),
                                 fee=None,
                                 executed_at=utcnow(),
-                                fill_raw={"source": "execute_order_with_confirmation/fallback", "symbol": symbol}
+                                fill_raw={
+                                    "source": "execute_order_with_confirmation/fallback",
+                                    "symbol": symbol,
+                                    # （追加）signal_id を橋渡し
+                                    "signal_id": signal_id or None
+                                }
                             )
                         except Exception as e:
                             insert_error(
                                 "execute_order_with_confirmation/fallback_fill",
                                 str(e),
-                                raw={"order_id": order_id, "symbol": symbol, "net_size": net_size}
+                                raw={"order_id": order_id, "symbol": symbol, "net_size": net_size, "signal_id": signal_id or None}
                             )
 
                         return {
