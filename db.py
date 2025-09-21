@@ -237,6 +237,28 @@ line_channels = sa.table(
     sa.column("created_at", sa.DateTime(timezone=True)),
     sa.column("updated_at", sa.DateTime(timezone=True)),
 )
+signals = sa.table(
+    "signals",
+    sa.column("signal_id", sa.String),
+    sa.column("user_id", sa.BigInteger),
+    sa.column("symbol", sa.String),
+    sa.column("timeframe", sa.String),
+    sa.column("side", sa.String),
+    sa.column("strength_score", sa.Numeric),
+    sa.column("rsi", sa.Numeric),
+    sa.column("adx", sa.Numeric),
+    sa.column("atr", sa.Numeric),
+    sa.column("di_plus", sa.Numeric),
+    sa.column("di_minus", sa.Numeric),
+    sa.column("ema_fast", sa.Numeric),
+    sa.column("ema_slow", sa.Numeric),
+    sa.column("price", sa.Numeric),
+    sa.column("generated_at", sa.DateTime(timezone=True)),
+    sa.column("strategy_id", sa.String),
+    sa.column("version", sa.String),
+    sa.column("status", sa.String),
+    sa.column("raw", sa.JSON),
+)
 
 try:
     import numpy as np
@@ -419,6 +441,61 @@ def insert_error(where: str, message: str, stack: Optional[str] = None, raw: Any
     except Exception:
         pass
 
+def insert_signal(
+    *,
+    signal_id: Optional[str] = None,
+    user_id: Optional[int],
+    symbol: str,
+    timeframe: str,
+    side: str,
+    strength_score: Optional[float] = None,
+    rsi: Optional[float] = None,
+    adx: Optional[float] = None,
+    atr: Optional[float] = None,
+    di_plus: Optional[float] = None,
+    di_minus: Optional[float] = None,
+    ema_fast: Optional[float] = None,
+    ema_slow: Optional[float] = None,
+    price: Optional[float] = None,
+    generated_at: Optional[datetime] = None,
+    strategy_id: Optional[str] = None,
+    version: Optional[str] = None,
+    status: Optional[str] = "new",
+    raw: Optional[Dict[str, Any]] = None,
+) -> str:
+    sid = signal_id or str(uuid4())
+    stmt = sa.text("""
+        INSERT INTO signals (
+            signal_id, user_id, symbol, timeframe, side, strength_score,
+            rsi, adx, atr, di_plus, di_minus, ema_fast, ema_slow, price,
+            generated_at, strategy_id, version, status, raw
+        ) VALUES (
+            :signal_id, :user_id, :symbol, :timeframe, :side, :strength_score,
+            :rsi, :adx, :atr, :di_plus, :di_minus, :ema_fast, :ema_slow, :price,
+            :generated_at, :strategy_id, :version, :status, :raw
+        )
+        ON CONFLICT (signal_id) DO NOTHING
+    """)
+    params = dict(
+        signal_id=sid,
+        user_id=user_id,
+        symbol=symbol,
+        timeframe=timeframe,
+        side=side,
+        strength_score=strength_score,
+        rsi=rsi, adx=adx, atr=atr,
+        di_plus=di_plus, di_minus=di_minus,
+        ema_fast=ema_fast, ema_slow=ema_slow,
+        price=price,
+        generated_at=generated_at or datetime.now(timezone.utc),
+        strategy_id=strategy_id, version=version,
+        status=status,
+        raw=_jsonable(raw),   # ← 既存ヘルパを活用
+    )
+    with engine.begin() as conn:
+        conn.execute(stmt, params)
+    return sid
+
 # --- 便利: 注文→約定 の一括トランザクション例 -------------------------------
 
 def mark_order_executed_with_fill(
@@ -596,3 +673,28 @@ def get_line_channel_token(provider_key: str) -> Optional[bytes]:
     with engine.begin() as c:
         row = c.execute(stmt, {"k": provider_key}).fetchone()
     return row[0] if row else None
+
+def update_signal_status(signal_id: str, new_status: str) -> None:
+    stmt = sa.text("""
+        UPDATE signals SET status = :new_status
+         WHERE signal_id = :signal_id
+    """)
+    with engine.begin() as conn:
+        conn.execute(stmt, {"new_status": new_status, "signal_id": signal_id})
+
+def get_signals_between(start_dt, end_dt, *, symbol: str | None = None, timeframe: str | None = None):
+    where = ["generated_at >= :start_dt", "generated_at < :end_dt"]
+    params = {"start_dt": start_dt, "end_dt": end_dt}
+    if symbol:
+        where.append("symbol = :symbol"); params["symbol"] = symbol
+    if timeframe:
+        where.append("timeframe = :timeframe"); params["timeframe"] = timeframe
+    sql = f"""
+        SELECT *
+          FROM signals
+         WHERE {' AND '.join(where)}
+         ORDER BY generated_at DESC
+    """
+    with engine.begin() as conn:
+        rows = conn.execute(sa.text(sql), params).mappings().all()
+    return [dict(r) for r in rows]
