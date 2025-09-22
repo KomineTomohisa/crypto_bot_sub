@@ -3,10 +3,12 @@ from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Dict, Any, Optional
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 import sqlalchemy as sa
 from db import engine
+
+JST = timezone(timedelta(hours=9))
 
 app = FastAPI(
     title="Signal Service API",
@@ -100,6 +102,19 @@ FILTERED_SIGNALS_SQL = sa.text("""
     LIMIT :limit OFFSET :offset
 """)
 
+DAILY_SERIES_SQL = sa.text("""
+SELECT d AS metric_date,
+       COALESCE(m.total_trades, 0) AS total_trades,
+       m.win_rate,
+       m.avg_pnl_pct
+FROM generate_series(:start_date, :end_date, INTERVAL '1 day') AS d
+LEFT JOIN public_metrics_daily m ON m.metric_date = d
+ORDER BY d ASC
+""").bindparams(
+    sa.bindparam("start_date", type_=sa.Date),
+    sa.bindparam("end_date", type_=sa.Date),
+)
+
 @app.get("/public/metrics", response_model=PublicMetricsOut)
 def get_public_metrics():
     try:
@@ -174,4 +189,26 @@ def get_public_signals(
         "price": float(r["price"]) if r["price"] is not None else None,
         "generated_at": r["generated_at"].isoformat() if r["generated_at"] else None,
         "strength_score": float(r["strength_score"]) if r["strength_score"] is not None else None,
+    } for r in rows]
+
+@app.get("/public/performance/daily")
+def get_performance_daily(days: int = Query(30, ge=1, le=365)):
+    today_jst = datetime.now(JST).date()
+    start_date = today_jst - timedelta(days=days - 1)
+    end_date = today_jst
+
+    try:
+        with engine.begin() as conn:
+            rows = conn.execute(DAILY_SERIES_SQL, {
+                "start_date": start_date,  # ← Pythonのdateをそのまま渡す
+                "end_date": end_date,
+            }).mappings().all()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"DB error: {e}")
+
+    return [{
+        "date": r["metric_date"].isoformat(),
+        "total_trades": int(r["total_trades"]) if r["total_trades"] is not None else 0,
+        "win_rate": float(r["win_rate"]) if r["win_rate"] is not None else None,
+        "avg_pnl_pct": float(r["avg_pnl_pct"]) if r["avg_pnl_pct"] is not None else None,
     } for r in rows]
