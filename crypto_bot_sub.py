@@ -5236,6 +5236,21 @@ class CryptoTradingBot:
                     if response.get("status") == 0:
                         order_id = str(response.get("data"))
                         self.logger.info(f"決済注文成功: 注文ID={order_id}")
+                        try:
+                            insert_order(
+                                order_id=str(order_id),
+                                symbol=symbol,        # DBは "ada_jpy" のような自分のシンボルを保存
+                                side=side,            # long決済→SELL / short決済→BUY（直前で決めている変数）
+                                type_="MARKET",       # 成行決済なら MARKET
+                                size=float(pos_size), # そのポジションの決済サイズ
+                                status="ORDERED",
+                                requested_at=utcnow(),
+                                placed_at=utcnow(),
+                                raw=response          # 取引所レスポンスをそのまま残す
+                            )
+                        except Exception as e:
+                            insert_error("close_position/insert_order", str(e),
+                                        raw={"order_id": order_id, "symbol": symbol})
                         success_count += 1
                         total_order_ids.append(order_id)
                         
