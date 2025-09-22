@@ -1697,7 +1697,7 @@ class CryptoTradingBot:
                             avg_entry_price=float(avg_entry) if avg_entry else 0.0,
                             opened_at=utcnow(),
                             updated_at=utcnow(),
-                            raw={"source": "place_order_sync"}
+                            raw=response
                         )
                     except Exception as e:
                         insert_error("place_order/upsert_position", str(e),
