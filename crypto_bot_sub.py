@@ -40,6 +40,7 @@ try:
 except ImportError:
     from daily_report import build_daily_report_message
 from typing import Optional, List, Dict, Tuple, Any
+import datetime as dt
 JST = timezone(timedelta(hours=9))
 
 # 既存のimport文の後に追加
@@ -280,6 +281,14 @@ class CryptoTradingBot:
         except Exception as e:
             self.logger.error(f"Excel用データ準備エラー: {str(e)}")
             return pd.DataFrame()
+
+    def _current_strategy_version(self):
+        base = {
+            "date": dt.datetime.now().strftime("%Y-%m-%d"),
+            "thresholds": self.entry_thresholds,
+        }
+        h = hashlib.sha1(json.dumps(base, sort_keys=True).encode()).hexdigest()[:7]
+        return f"{base['date']}+{h}"
 
     def _generate_excel_report_from_trade_logs(self, trade_logs, days_to_test):
         """取引ログからExcelレポートを生成"""
@@ -577,6 +586,16 @@ class CryptoTradingBot:
             'bcc_jpy': 0.1,     # BCH
             'ada_jpy': 10      # ADA
         }
+        self.entry_thresholds = {
+            "adx_trend_min": 25.0,
+            "rsi_long_min": 58.0,
+            "rsi_short_max": 42.0,
+            "score_long_min": 0.55,
+            "score_short_min": 0.55,
+            "ema_cross_required": True,
+        }
+
+        self.strategy_id = getattr(self, "strategy_id", "v1_weighted_signals")
 
         self.reentry_block_until = {symbol: None for symbol in self.symbols}
         
@@ -1678,7 +1697,7 @@ class CryptoTradingBot:
                             avg_entry_price=float(avg_entry) if avg_entry else 0.0,
                             opened_at=utcnow(),
                             updated_at=utcnow(),
-                            raw={"source": "place_order_sync"}
+                            raw=response
                         )
                     except Exception as e:
                         insert_error("place_order/upsert_position", str(e),
@@ -2076,7 +2095,7 @@ class CryptoTradingBot:
                                 fee=None,
                                 executed_at=utcnow(),
                                 fill_raw={
-                                    "source": "exit",
+                                    "source": order_type,
                                     "symbol": symbol,
                                     # （追加）signal_id を橋渡し：後続分析でトレース可能
                                     "signal_id": signal_id or None
@@ -2119,7 +2138,7 @@ class CryptoTradingBot:
                                 fee=None,
                                 executed_at=utcnow(),
                                 fill_raw={
-                                    "source": "execute_order_with_confirmation/fallback",
+                                    "source": order_type,
                                     "symbol": symbol,
                                     # （追加）signal_id を橋渡し
                                     "signal_id": signal_id or None
@@ -4750,6 +4769,89 @@ class CryptoTradingBot:
             self.logger.error(f"{symbol}のデータ取得中にエラーが発生: {str(e)}", exc_info=True)
             return None, None
 
+    def _build_entry_explanation(self, symbol, position_type, signal_data, price):
+        def _f(x, nd=None):
+            try:
+                return float(x) if x is not None else nd
+            except Exception:
+                return nd
+
+        th = getattr(self, "entry_thresholds", None) or {
+            "adx_trend_min": 25.0,
+            "rsi_long_min": 58.0,
+            "rsi_short_max": 42.0,
+            "score_long_min": 0.55,
+            "score_short_min": 0.55,
+            "ema_cross_required": True,
+        }
+        # 入力スナップショット（None安全化）
+        rsi  = _f(signal_data.get('RSI'))
+        adx  = _f(signal_data.get('ADX'))
+        atr  = _f(signal_data.get('ATR'))
+        di_p = _f(signal_data.get('plus_di14'))
+        di_m = _f(signal_data.get('minus_di14'))
+        ema_fast = _f(signal_data.get('EMA_short'))
+        ema_slow = _f(signal_data.get('EMA_long'))
+        buy_score  = _f(signal_data.get('buy_score'))
+        sell_score = _f(signal_data.get('sell_score'))
+
+        # 使ったしきい値（実際に方向で使うキーだけを詰めると良い）
+        thresholds_dict = {
+            "adx_trend_min": th["adx_trend_min"],
+            "ema_cross_required": th["ema_cross_required"],
+        }
+        if position_type == "long":
+            thresholds_dict.update({
+                "rsi_min": th["rsi_long_min"],
+                "score_min": th["score_long_min"],
+            })
+        else:
+            thresholds_dict.update({
+                "rsi_max": th["rsi_short_max"],
+                "score_min": th["score_short_min"],
+            })
+
+        # 判定根拠（シンプルかつ再現可能に）
+        checks = []
+        if adx is not None:
+            checks.append(f"ADX={adx:.1f}≥{th['adx_trend_min']}" if adx >= th["adx_trend_min"] else f"ADX={adx:.1f}<{th['adx_trend_min']}")
+        if rsi is not None:
+            if position_type == "long":
+                checks.append(f"RSI={rsi:.1f}≥{th['rsi_long_min']}")
+            else:
+                checks.append(f"RSI={rsi:.1f}≤{th['rsi_short_max']}")
+        if ema_fast is not None and ema_slow is not None and th["ema_cross_required"]:
+            cross_ok = (ema_fast > ema_slow) if position_type == "long" else (ema_fast < ema_slow)
+            checks.append(f"EMA{'>' if cross_ok else '×'} (fast={ema_fast:.1f}, slow={ema_slow:.1f})")
+
+        score_used = buy_score if position_type == "long" else sell_score
+        if score_used is not None:
+            th_key = "score_long_min" if position_type == "long" else "score_short_min"
+            checks.append(f"score={score_used:.3f}≥{th[th_key]}")
+
+        # 一文説明（通知・DBで読みやすく）
+        dir_ja = "ロング" if position_type == "long" else "ショート"
+        explanation_text = (
+            f"{symbol.upper()} {dir_ja}エントリー: "
+            + "; ".join(c for c in checks if c) +
+            (f"; price={price:.2f}" if price else "")
+        )
+
+        # signal_raw：生情報＋使った設定・特徴量
+        signal_raw = {
+            "features": {
+                "rsi": rsi, "adx": adx, "atr": atr,
+                "di_plus": di_p, "di_minus": di_m,
+                "ema_fast": ema_fast, "ema_slow": ema_slow,
+                "buy_score": buy_score, "sell_score": sell_score,
+            },
+            "thresholds": thresholds_dict,
+            "notes": {
+                "position_type": position_type,
+                "ema_cross_required": th["ema_cross_required"],
+            }
+        }
+        return thresholds_dict, explanation_text, signal_raw
 
     def _handle_entry(self, symbol, position_type, signal_data, stats, trade_logs):
         """エントリー処理を実行する（backtest関数と整合性あり）
@@ -4762,11 +4864,22 @@ class CryptoTradingBot:
         stats (dict): 統計情報の辞書
         trade_logs (list): 取引ログのリスト
         """
+
+        def _f(x, nd=None):
+            try:
+                return float(x) if x is not None else nd
+            except Exception:
+                return nd
+
         # テクニカル指標値の取得
         entry_rsi = signal_data.get('RSI', None)
         entry_cci = signal_data.get('CCI', None)
         entry_atr = signal_data.get('ATR', None)
         entry_adx = signal_data.get('ADX', None)
+        entry_di_plus = signal_data.get('plus_di14', None)
+        entry_di_minus = signal_data.get('minus_di14', None)
+        ema_fast = signal_data.get('EMA_short', None)
+        ema_slow = signal_data.get('EMA_long', None)
 
         # スコア情報の取得（新規追加）
         buy_score = signal_data.get('buy_score', 0)
@@ -4798,27 +4911,53 @@ class CryptoTradingBot:
         # 注文実行
         self.logger.info(f"{symbol}の{position_type}エントリー注文を実行します: 価格 {current_price:.2f}, サイズ {order_size:.3f}, 金額 {order_amount:.0f}円")
         
+        current_price = self.get_current_price(symbol)
+
+        # None安全化
+        entry_rsi = _f(signal_data.get('RSI'))
+        entry_adx = _f(signal_data.get('ADX'))
+        entry_atr = _f(signal_data.get('ATR'))
+        entry_di_plus  = _f(signal_data.get('plus_di14'))
+        entry_di_minus = _f(signal_data.get('minus_di14'))
+        ema_fast = _f(signal_data.get('EMA_short'))
+        ema_slow = _f(signal_data.get('EMA_long'))
+        buy_score  = _f(signal_data.get('buy_score'))
+        sell_score = _f(signal_data.get('sell_score'))
+        ema_deviation = _f(signal_data.get('ema_deviation'))
+
+        # 説明・しきい値・生情報
+        thresholds_dict, explanation_text, signal_raw = self._build_entry_explanation(
+            symbol=symbol,
+            position_type=position_type,
+            signal_data=signal_data,
+            price=current_price
+        )
+
+        # バージョン
+        version = self._current_strategy_version()  # 上で例示
+
+        thresholds_dict, explanation_text, signal_raw = self._build_entry_explanation(
+            symbol, position_type, signal_data, price=current_price
+        )
+
         order_result = self.execute_order_with_confirmation(
             symbol,
             'buy' if position_type == 'long' else 'sell',
             order_size,
-            timeframe="5m",                     # 運用している足
-            strength_score=buy_score,           # 合成スコア
-            rsi=rsi,
-            adx=adx,
-            atr=atr,
-            di_plus=di_plus,
-            di_minus=di_minus,
-            ema_fast=ema_fast,
-            ema_slow=ema_slow,
-            strategy_id="v1_weighted_signals",
-            version="2025-09-21",
-            signal_raw={
-                "thresholds": thresholds_dict,
-                "explanation": explanation_text
-            }
+            timeframe="15m",
+            strength_score=float(signal_data.get('buy_score', 0) if position_type=='long' else signal_data.get('sell_score', 0)),
+            rsi=float(signal_data.get('RSI'))           if signal_data.get('RSI') is not None else None,
+            adx=float(signal_data.get('ADX'))           if signal_data.get('ADX') is not None else None,
+            atr=float(signal_data.get('ATR'))           if signal_data.get('ATR') is not None else None,
+            di_plus=float(signal_data.get('plus_di14')) if signal_data.get('plus_di14') is not None else None,
+            di_minus=float(signal_data.get('minus_di14')) if signal_data.get('minus_di14') is not None else None,
+            ema_fast=float(signal_data.get('EMA_short')) if signal_data.get('EMA_short') is not None else None,
+            ema_slow=float(signal_data.get('EMA_long'))  if signal_data.get('EMA_long')  is not None else None,
+            strategy_id=getattr(self, "strategy_id", "v1_weighted_signals"),
+            version=self._current_strategy_version(),   # ← ハッシュ付きで日付+短縮hashを自動付与
+            signal_raw=signal_raw,                      # ← 使った値と閾値のスナップショット
         )
-        
+
         if order_result['success']:
             executed_size = order_result.get('executed_size', 0)
             # 実際に約定したサイズで金額を再計算
