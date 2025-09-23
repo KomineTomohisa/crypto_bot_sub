@@ -8,14 +8,23 @@ type Daily = {
   avg_pnl_pct?: number | null;
 };
 
+type SignalRecord = {
+  signal_id?: number | string;
+  symbol: string;
+  side: string;        // BUY / SELL / EXIT-LONG 等
+  reason?: string;     // ある場合のみ
+  price?: number;      // ある場合のみ
+  created_at: string;  // ISO8601
+};
+
 function apiBase() {
   const isServer = typeof window === "undefined";
   return isServer ? process.env.API_BASE_INTERNAL! : process.env.NEXT_PUBLIC_API_BASE!;
 }
 
-// ダウンロードリンクは同一オリジン固定で安全に
 const publicBase = "/api";
 
+/** 日次系列の取得（全体 or シンボル別） */
 async function fetchDaily(days = 30, symbol?: string): Promise<Daily[]> {
   const base = apiBase();
   const url = new URL(
@@ -31,10 +40,25 @@ async function fetchDaily(days = 30, symbol?: string): Promise<Daily[]> {
   return res.json();
 }
 
+/** シンボル候補一覧の取得 */
 async function fetchSymbols(daysForList = 90): Promise<string[]> {
   const base = apiBase();
   const url = new URL(`${base}/public/symbols`);
   url.searchParams.set("days", String(daysForList));
+  const res = await fetch(url.toString(), { cache: "no-store" });
+  if (!res.ok) return [];
+  return res.json();
+}
+
+/** 最新シグナル（直近days日から10件） */
+async function fetchLatestSignals(days = 30, symbol?: string): Promise<SignalRecord[]> {
+  const base = apiBase();
+  const url = new URL(`${base}/public/signals`);
+  url.searchParams.set("limit", "10");
+  const sinceIso = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+  url.searchParams.set("since", sinceIso);
+  if (symbol) url.searchParams.set("symbol", symbol);
+
   const res = await fetch(url.toString(), { cache: "no-store" });
   if (!res.ok) return [];
   return res.json();
@@ -46,70 +70,16 @@ function pct(v?: number | null, digits = 1) {
   return v != null ? `${(v * 100).toFixed(digits)}%` : "—";
 }
 
-/** クライアント側で候補をstate管理し、起動時(マウント時)に /api/public/symbols をフェッチ */
-function SymbolSelectClient({
-  name,
-  defaultValue,
-  initialSymbols,
-}: {
-  name: string;
-  defaultValue?: string;
-  initialSymbols: string[];
-}) {
-  "use client";
-  import React, { useEffect, useState } from "react";
-
-  const [symbols, setSymbols] = useState<string[]>(initialSymbols);
-  const [loading, setLoading] = useState(false);
-
-  useEffect(() => {
-    let aborted = false;
-    (async () => {
-      try {
-        setLoading(true);
-        // 同一オリジンの公開APIを直接叩く（CSR）
-        const res = await fetch(`/api/public/symbols?days=90`, { cache: "no-store" });
-        if (!res.ok) throw new Error(String(res.status));
-        const data: string[] = await res.json();
-        if (!aborted && Array.isArray(data) && data.length) {
-          setSymbols(data);
-        }
-      } catch {
-        // 失敗時は initialSymbols をそのまま利用
-      } finally {
-        if (!aborted) setLoading(false);
-      }
-    })();
-    return () => { aborted = true; };
-  }, []);
-
-  return (
-    <select
-      name={name}
-      defaultValue={defaultValue ?? ""}
-      className="w-full border rounded-xl px-3 py-2"
-      aria-busy={loading}
-    >
-      <option value="">（全体）</option>
-      {symbols.map((s) => (
-        <option key={s} value={s}>
-          {s}
-        </option>
-      ))}
-    </select>
-  );
-}
-
 export default async function Page({
   searchParams,
 }: {
-  // Next.js 15 対応：Promise を許容
+  // Next.js 15 の型ずれ吸収：Promise 許容
   searchParams?: Promise<Record<string, string | string[] | undefined>>;
 }) {
   const sp = searchParams ? await searchParams : undefined;
   const days = Number(
     typeof sp?.days === "string" ? sp.days :
-    Array.isArray(sp?.days) ? sp.days[0] : 30
+    Array.isArray(sp?.days) ? sp?.days[0] : 30
   );
   const symbol =
     typeof sp?.symbol === "string"
@@ -119,13 +89,14 @@ export default async function Page({
       : undefined;
 
   try {
-    // 初期描画用にSSRでデータも候補も取得（CSR側で再フェッチしstateに格納）
-    const [data, initialSymbols] = await Promise.all([
+    // 初期描画に必要なものをSSRでまとめて取得
+    const [data, initialSymbols, latestSignals] = await Promise.all([
       fetchDaily(days, symbol),
       fetchSymbols(90),
+      fetchLatestSignals(days, symbol),
     ]);
 
-    // 直近days日の since を計算（signals CSV用）
+    // CSVリンク（sinceはdays起点）
     const sinceIso = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
     const csvDailyUrl = symbol
       ? `${publicBase}/public/export/performance/daily_by_symbol.csv?symbol=${encodeURIComponent(
@@ -162,11 +133,18 @@ export default async function Page({
           </div>
           <div className="sm:col-span-3">
             <label className="block text-sm text-gray-600">Symbol（任意）</label>
-            <SymbolSelectClient
+            <select
               name="symbol"
-              defaultValue={symbol}
-              initialSymbols={initialSymbols}
-            />
+              defaultValue={symbol ?? ""}
+              className="w-full border rounded-xl px-3 py-2"
+            >
+              <option value="">（全体）</option>
+              {initialSymbols.map((s) => (
+                <option key={s} value={s}>
+                  {s}
+                </option>
+              ))}
+            </select>
           </div>
           <div className="flex gap-2">
             <button className="w-full rounded-2xl shadow px-4 py-2">Apply</button>
@@ -180,7 +158,7 @@ export default async function Page({
           </div>
         </form>
 
-        {/* ダウンロード */}
+        {/* CSV エクスポート */}
         <section className="rounded-2xl border p-4 shadow space-y-3">
           <h2 className="font-semibold">CSV エクスポート</h2>
           <div className="flex flex-wrap gap-3">
@@ -212,7 +190,7 @@ export default async function Page({
           <ChartClient data={data} />
         </section>
 
-        {/* テーブル */}
+        {/* 日次テーブル */}
         <section className="rounded-2xl border p-4 shadow">
           <h2 className="font-semibold mb-2">日次テーブル</h2>
           <div className="overflow-x-auto">
@@ -246,7 +224,41 @@ export default async function Page({
           </div>
         </section>
 
-        {/* 算出ロジック */}
+        {/* 最新シグナル10件（SSR） */}
+        <section className="rounded-2xl border p-4 shadow space-y-2">
+          <h2 className="font-semibold">最新シグナル（10件）{symbol ? ` / ${symbol}` : ""}</h2>
+          <p className="text-xs text-gray-500">※ 直近 {days} 日のデータから抽出しています。</p>
+
+          {latestSignals.length === 0 ? (
+            <div className="text-sm text-gray-500">該当するシグナルが見つかりませんでした。</div>
+          ) : (
+            <div className="grid gap-3">
+              {latestSignals.map((s, i) => (
+                <article
+                  key={String(s.signal_id ?? `${s.symbol}-${s.created_at}-${i}`)}
+                  className="rounded-xl border p-3"
+                >
+                  <div className="flex items-baseline justify-between">
+                    <div className="font-medium">
+                      {s.symbol} <span className="text-xs text-gray-500">{s.side}</span>
+                    </div>
+                    <time className="text-xs text-gray-500">
+                      {new Date(s.created_at).toLocaleString()}
+                    </time>
+                  </div>
+                  <div className="text-sm text-gray-700 mt-1">
+                    {s.reason ? s.reason : "—"}
+                  </div>
+                  {s.price != null && (
+                    <div className="text-xs text-gray-500 mt-1">price: {s.price}</div>
+                  )}
+                </article>
+              ))}
+            </div>
+          )}
+        </section>
+
+        {/* 算出ロジック（概要） */}
         <section className="rounded-2xl border p-4 shadow space-y-2">
           <h2 className="font-semibold">算出ロジック（概要）</h2>
           <ul className="list-disc pl-5 space-y-1 text-sm">
