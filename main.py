@@ -7,6 +7,8 @@ from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 import sqlalchemy as sa
 from db import engine
+from fastapi.responses import StreamingResponse
+import io, csv
 
 JST = timezone(timedelta(hours=9))
 
@@ -115,6 +117,16 @@ ORDER BY d ASC
     sa.bindparam("end_date", type_=sa.Date),
 )
 
+# === signals のCSV ===
+EXPORT_SIGNALS_SQL = sa.text("""
+    SELECT symbol, side, price, generated_at, strength_score
+    FROM signals
+    WHERE (:symbol IS NULL OR lower(symbol) = lower(:symbol))
+      AND (:since  IS NULL OR generated_at >= :since)
+    ORDER BY generated_at DESC
+    LIMIT :limit
+""")
+
 @app.get("/public/metrics", response_model=PublicMetricsOut)
 def get_public_metrics():
     try:
@@ -212,3 +224,71 @@ def get_performance_daily(days: int = Query(30, ge=1, le=365)):
         "win_rate": float(r["win_rate"]) if r["win_rate"] is not None else None,
         "avg_pnl_pct": float(r["avg_pnl_pct"]) if r["avg_pnl_pct"] is not None else None,
     } for r in rows]
+
+# === 30日系列のCSV ===
+@app.get("/public/export/performance/daily.csv")
+def export_performance_daily_csv(days: int = Query(30, ge=1, le=365)):
+    today_jst = datetime.now(JST).date()
+    start_date = today_jst - timedelta(days=days - 1)
+    end_date = today_jst
+
+    with engine.begin() as conn:
+        rows = conn.execute(DAILY_SERIES_SQL, {
+            "start_date": start_date,
+            "end_date": end_date
+        }).mappings().all()
+
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["date", "total_trades", "win_rate", "avg_pnl_pct"])
+    for r in rows:
+        w.writerow([
+            r["metric_date"].isoformat(),
+            int(r["total_trades"]) if r["total_trades"] is not None else 0,
+            float(r["win_rate"]) if r["win_rate"] is not None else "",
+            float(r["avg_pnl_pct"]) if r["avg_pnl_pct"] is not None else "",
+        ])
+
+    csv_bytes = buf.getvalue().encode("utf-8")
+    filename = f"performance_daily_{days}d.csv"
+    return StreamingResponse(
+        iter([csv_bytes]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
+
+@app.get("/public/export/signals.csv")
+def export_signals_csv(
+    symbol: Optional[str] = Query(None, min_length=1, max_length=50),
+    since: Optional[str]  = Query(None, description="ISO8601（例: 2025-09-01T00:00:00Z）"),
+    limit: int            = Query(1000, ge=1, le=10000),
+):
+    since_dt = _parse_iso8601_or_422(since) if since else None
+
+    with engine.begin() as conn:
+        rows = conn.execute(EXPORT_SIGNALS_SQL, {
+            "symbol": symbol,
+            "since": since_dt,
+            "limit": limit
+        }).mappings().all()
+
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["symbol", "side", "price", "generated_at", "strength_score"])
+    for r in rows:
+        gen = r["generated_at"].isoformat() if r["generated_at"] else ""
+        w.writerow([
+            r["symbol"],
+            r["side"],
+            float(r["price"]) if r["price"] is not None else "",
+            gen,
+            float(r["strength_score"]) if r["strength_score"] is not None else "",
+        ])
+
+    csv_bytes = buf.getvalue().encode("utf-8")
+    filename = "signals_last.csv"
+    return StreamingResponse(
+        iter([csv_bytes]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
