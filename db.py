@@ -4,7 +4,7 @@ import json
 from contextlib import contextmanager
 from datetime import datetime, date, timezone, timedelta
 from decimal import Decimal
-from typing import Optional, Dict, Any
+from typing import List, Optional, Dict, Any
 from uuid import uuid4
 from pathlib import Path  
 from dotenv import load_dotenv
@@ -16,6 +16,7 @@ try:
     from psycopg2.extras import Json as _PsycoJson
 except Exception:
     _PsycoJson = None
+from sqlalchemy import text
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")  # ←絶対パスで .env を読む
@@ -697,4 +698,20 @@ def get_signals_between(start_dt, end_dt, *, symbol: str | None = None, timefram
     """
     with engine.begin() as conn:
         rows = conn.execute(sa.text(sql), params).mappings().all()
+    return [dict(r) for r in rows]
+
+def get_public_metrics_daily(start, end) -> List[Dict[str, Any]]:
+    """
+    public_metrics_daily から日次行を取得
+    返り値: [{'metric_date': date, 'symbols': {...}}, ...]
+    """
+    sql = text("""
+        SELECT metric_date, symbols
+        FROM public_metrics_daily
+        WHERE metric_date >= :start AND metric_date <= :end
+        ORDER BY metric_date ASC
+    """)
+    # engine は既存の db.py で定義されている想定
+    with engine.connect() as conn:
+        rows = conn.execute(sql, {"start": start, "end": end}).mappings().all()
     return [dict(r) for r in rows]
