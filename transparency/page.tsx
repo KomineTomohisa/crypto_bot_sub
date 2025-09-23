@@ -46,6 +46,60 @@ function pct(v?: number | null, digits = 1) {
   return v != null ? `${(v * 100).toFixed(digits)}%` : "—";
 }
 
+/** クライアント側で候補をstate管理し、起動時(マウント時)に /api/public/symbols をフェッチ */
+function SymbolSelectClient({
+  name,
+  defaultValue,
+  initialSymbols,
+}: {
+  name: string;
+  defaultValue?: string;
+  initialSymbols: string[];
+}) {
+  "use client";
+  import React, { useEffect, useState } from "react";
+
+  const [symbols, setSymbols] = useState<string[]>(initialSymbols);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    let aborted = false;
+    (async () => {
+      try {
+        setLoading(true);
+        // 同一オリジンの公開APIを直接叩く（CSR）
+        const res = await fetch(`/api/public/symbols?days=90`, { cache: "no-store" });
+        if (!res.ok) throw new Error(String(res.status));
+        const data: string[] = await res.json();
+        if (!aborted && Array.isArray(data) && data.length) {
+          setSymbols(data);
+        }
+      } catch {
+        // 失敗時は initialSymbols をそのまま利用
+      } finally {
+        if (!aborted) setLoading(false);
+      }
+    })();
+    return () => { aborted = true; };
+  }, []);
+
+  return (
+    <select
+      name={name}
+      defaultValue={defaultValue ?? ""}
+      className="w-full border rounded-xl px-3 py-2"
+      aria-busy={loading}
+    >
+      <option value="">（全体）</option>
+      {symbols.map((s) => (
+        <option key={s} value={s}>
+          {s}
+        </option>
+      ))}
+    </select>
+  );
+}
+
 export default async function Page({
   searchParams,
 }: {
@@ -65,7 +119,8 @@ export default async function Page({
       : undefined;
 
   try {
-    const [data, symbols] = await Promise.all([
+    // 初期描画用にSSRでデータも候補も取得（CSR側で再フェッチしstateに格納）
+    const [data, initialSymbols] = await Promise.all([
       fetchDaily(days, symbol),
       fetchSymbols(90),
     ]);
@@ -107,18 +162,11 @@ export default async function Page({
           </div>
           <div className="sm:col-span-3">
             <label className="block text-sm text-gray-600">Symbol（任意）</label>
-            <select
+            <SymbolSelectClient
               name="symbol"
-              defaultValue={symbol ?? ""}
-              className="w-full border rounded-xl px-3 py-2"
-            >
-              <option value="">（全体）</option>
-              {symbols.map((s) => (
-                <option key={s} value={s}>
-                  {s}
-                </option>
-              ))}
-            </select>
+              defaultValue={symbol}
+              initialSymbols={initialSymbols}
+            />
           </div>
           <div className="flex gap-2">
             <button className="w-full rounded-2xl shadow px-4 py-2">Apply</button>
