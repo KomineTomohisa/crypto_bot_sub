@@ -26,10 +26,10 @@ app.include_router(public_performance.router)
 # --- CORS（必要に応じて調整） ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],         # 公開するなら "*" でもOK。必要に応じてドメインを限定
-    allow_credentials=False,
-    allow_methods=["GET"],
-    allow_headers=["*"],
+    allow_origins=["https://198-13-61-186.sslip.io"],  # ← 自サイトのみ許可
+    allow_credentials=False,  # Cookie/SameSite 等を使わないなら False でOK
+    allow_methods=["GET", "OPTIONS"],  # OPTIONS も必須（プリフライト用）
+    allow_headers=["Content-Type", "Authorization"],  # 必要なヘッダだけ許可
 )
 
 # --- 型: JSONに安全な形へ整形 ---
