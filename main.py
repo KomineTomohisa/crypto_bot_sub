@@ -9,6 +9,7 @@ import sqlalchemy as sa
 from db import engine
 from fastapi.responses import StreamingResponse
 import io, csv
+import json
 
 JST = timezone(timedelta(hours=9))
 
@@ -126,6 +127,27 @@ EXPORT_SIGNALS_SQL = sa.text("""
     ORDER BY generated_at DESC
     LIMIT :limit
 """)
+
+# 期間のdate列を作るSQL（既存の bindparam 版）
+DAILY_SERIES_DATE_SQL = sa.text("""
+SELECT d AS metric_date
+FROM generate_series(:start_date, :end_date, INTERVAL '1 day') AS d
+ORDER BY d ASC
+""").bindparams(
+    sa.bindparam("start_date", type_=sa.Date),
+    sa.bindparam("end_date", type_=sa.Date),
+)
+
+# public_metrics_daily から日付範囲で rows を取る
+FETCH_DAILY_ROWS_SQL = sa.text("""
+SELECT metric_date, total_trades, symbols
+FROM public_metrics_daily
+WHERE metric_date BETWEEN :start_date AND :end_date
+ORDER BY metric_date ASC
+""").bindparams(
+    sa.bindparam("start_date", type_=sa.Date),
+    sa.bindparam("end_date", type_=sa.Date),
+)
 
 @app.get("/public/metrics", response_model=PublicMetricsOut)
 def get_public_metrics():
@@ -287,6 +309,95 @@ def export_signals_csv(
 
     csv_bytes = buf.getvalue().encode("utf-8")
     filename = "signals_last.csv"
+    return StreamingResponse(
+        iter([csv_bytes]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
+
+def _pick_symbol_case_insensitive(symbols_obj: Dict[str, Any], symbol: str) -> Optional[Dict[str, Any]]:
+    if symbols_obj is None:
+        return None
+    # 1) 完全一致
+    if symbol in symbols_obj:
+        return symbols_obj[symbol]
+    # 2) 大文字小文字無視
+    sym_l = symbol.lower()
+    for k, v in symbols_obj.items():
+        if isinstance(k, str) and k.lower() == sym_l:
+            return v
+    return None
+
+@app.get("/public/performance/daily/by-symbol")
+def get_performance_daily_by_symbol(
+    symbol: str = Query(..., min_length=1, max_length=50),
+    days: int = Query(30, ge=1, le=365),
+):
+    today_jst = datetime.now(JST).date()
+    start_date = today_jst - timedelta(days=days - 1)
+    end_date = today_jst
+
+    try:
+        with engine.begin() as conn:
+            # 期間の全日付（欠損日ゼロ埋め用）
+            days_rows = conn.execute(DAILY_SERIES_DATE_SQL, {
+                "start_date": start_date, "end_date": end_date
+            }).mappings().all()
+            # 実データ
+            data_rows = conn.execute(FETCH_DAILY_ROWS_SQL, {
+                "start_date": start_date, "end_date": end_date
+            }).mappings().all()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"DB error: {e}")
+
+    # metric_date -> row の辞書
+    by_date = { r["metric_date"]: r for r in data_rows }
+
+    out = []
+    for dr in days_rows:
+        d = dr["metric_date"]
+        row = by_date.get(d)
+        if row:
+            symbols_obj = row["symbols"] if isinstance(row["symbols"], dict) else (
+                json.loads(row["symbols"]) if row["symbols"] else {}
+            )
+            s = _pick_symbol_case_insensitive(symbols_obj or {}, symbol)
+            if s:
+                # s = {"trades": int, "win_rate": float?, "avg_pnl_pct": float?}
+                out.append({
+                    "date": d.isoformat(),
+                    "total_trades": int(s.get("trades") or 0),
+                    "win_rate": float(s.get("win_rate")) if s.get("win_rate") is not None else None,
+                    "avg_pnl_pct": float(s.get("avg_pnl_pct")) if s.get("avg_pnl_pct") is not None else None,
+                })
+            else:
+                out.append({"date": d.isoformat(), "total_trades": 0, "win_rate": None, "avg_pnl_pct": None})
+        else:
+            out.append({"date": d.isoformat(), "total_trades": 0, "win_rate": None, "avg_pnl_pct": None})
+
+    return out
+
+@app.get("/public/export/performance/daily_by_symbol.csv")
+def export_performance_daily_by_symbol_csv(
+    symbol: str = Query(..., min_length=1, max_length=50),
+    days: int = Query(30, ge=1, le=365),
+):
+    # 既存の関数ロジックを再利用
+    data = get_performance_daily_by_symbol(symbol=symbol, days=days)
+
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["date", "trades", "win_rate", "avg_pnl_pct"])
+    for r in data:
+        w.writerow([
+            r["date"],
+            r["total_trades"],
+            r["win_rate"] if r["win_rate"] is not None else "",
+            r["avg_pnl_pct"] if r["avg_pnl_pct"] is not None else "",
+        ])
+    csv_bytes = buf.getvalue().encode("utf-8")
+    filename = f"performance_daily_{symbol}_{days}d.csv"
+
     return StreamingResponse(
         iter([csv_bytes]),
         media_type="text/csv",

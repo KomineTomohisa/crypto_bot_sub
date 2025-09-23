@@ -1,3 +1,4 @@
+// ← ここで1回だけ宣言（または丸ごと削除でも可）
 export const revalidate = 0;
 
 type Daily = { date: string; total_trades: number; win_rate?: number | null; avg_pnl_pct?: number | null };
@@ -6,6 +7,8 @@ function apiBase() {
   const isServer = typeof window === "undefined";
   return isServer ? process.env.API_BASE_INTERNAL! : process.env.NEXT_PUBLIC_API_BASE!;
 }
+
+// ダウンロードリンクは同一オリジン固定で安全に
 const publicBase = "/api";
 
 async function fetchDaily(days = 30): Promise<Daily[]> {
@@ -24,6 +27,7 @@ function pct(v?: number | null, digits = 1) {
 export default async function Page({
   searchParams,
 }: {
+  // Next.js 15対策：Promiseを許容
   searchParams?: Promise<Record<string, string | string[] | undefined>>;
 }) {
   const sp = searchParams ? await searchParams : undefined;
@@ -53,12 +57,12 @@ export default async function Page({
         <section className="rounded-2xl border p-4 shadow space-y-3">
           <h2 className="font-semibold">CSV エクスポート</h2>
           <div className="flex flex-wrap gap-3">
-             <a className="px-4 py-2 border rounded-xl" href={csvDailyUrl} download target="_blank" rel="noopener">
-               日次指標CSV（{days}日）
-             </a>
-             <a className="px-4 py-2 border rounded-xl" href={csvSignalsUrl} download target="_blank" rel="noopener">
-               シグナルCSV（{days}日）
-             </a>
+            <a className="px-4 py-2 border rounded-xl" href={csvDailyUrl} download target="_blank" rel="noopener">
+              日次指標CSV（{days}日）
+            </a>
+            <a className="px-4 py-2 border rounded-xl" href={csvSignalsUrl} download target="_blank" rel="noopener">
+              シグナルCSV（{days}日）
+            </a>
           </div>
           <p className="text-xs text-gray-500">※ ブラウザがダウンロードを開始します。</p>
         </section>
