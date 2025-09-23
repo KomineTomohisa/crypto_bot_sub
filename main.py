@@ -10,6 +10,7 @@ from db import engine
 from fastapi.responses import StreamingResponse
 import io, csv
 import json
+from fastapi.responses import JSONResponse
 
 JST = timezone(timedelta(hours=9))
 
@@ -147,6 +148,15 @@ ORDER BY metric_date ASC
 """).bindparams(
     sa.bindparam("start_date", type_=sa.Date),
     sa.bindparam("end_date", type_=sa.Date),
+)
+
+SYMBOLS_SQL = sa.text("""
+SELECT DISTINCT LOWER(symbol) AS symbol
+FROM signals
+WHERE (:days IS NULL) OR generated_at >= (NOW() AT TIME ZONE 'UTC') - (:days || ' days')::interval
+ORDER BY 1 ASC
+""").bindparams(
+    sa.bindparam("days", type_=sa.Integer)
 )
 
 @app.get("/public/metrics", response_model=PublicMetricsOut)
@@ -403,3 +413,9 @@ def export_performance_daily_by_symbol_csv(
         media_type="text/csv",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'}
     )
+
+@app.get("/public/symbols")
+def get_symbols(days: int = Query(90, ge=1, le=365)):
+    with engine.begin() as conn:
+        rows = conn.execute(SYMBOLS_SQL, {"days": days}).mappings().all()
+    return JSONResponse([r["symbol"] for r in rows])

@@ -1,7 +1,12 @@
-// ← ここで1回だけ宣言（または丸ごと削除でも可）
+// app/transparency/page.tsx
 export const revalidate = 0;
 
-type Daily = { date: string; total_trades: number; win_rate?: number | null; avg_pnl_pct?: number | null };
+type Daily = {
+  date: string;
+  total_trades: number;
+  win_rate?: number | null;
+  avg_pnl_pct?: number | null;
+};
 
 function apiBase() {
   const isServer = typeof window === "undefined";
@@ -11,10 +16,27 @@ function apiBase() {
 // ダウンロードリンクは同一オリジン固定で安全に
 const publicBase = "/api";
 
-async function fetchDaily(days = 30): Promise<Daily[]> {
+async function fetchDaily(days = 30, symbol?: string): Promise<Daily[]> {
   const base = apiBase();
-  const res = await fetch(`${base}/public/performance/daily?days=${days}`, { cache: "no-store" });
+  const url = new URL(
+    symbol
+      ? `${base}/public/performance/daily/by-symbol`
+      : `${base}/public/performance/daily`
+  );
+  url.searchParams.set("days", String(days));
+  if (symbol) url.searchParams.set("symbol", symbol);
+
+  const res = await fetch(url.toString(), { cache: "no-store" });
   if (!res.ok) throw new Error(`Failed: ${res.status}`);
+  return res.json();
+}
+
+async function fetchSymbols(daysForList = 90): Promise<string[]> {
+  const base = apiBase();
+  const url = new URL(`${base}/public/symbols`);
+  url.searchParams.set("days", String(daysForList));
+  const res = await fetch(url.toString(), { cache: "no-store" });
+  if (!res.ok) return [];
   return res.json();
 }
 
@@ -27,7 +49,7 @@ function pct(v?: number | null, digits = 1) {
 export default async function Page({
   searchParams,
 }: {
-  // Next.js 15対策：Promiseを許容
+  // Next.js 15 対応：Promise を許容
   searchParams?: Promise<Record<string, string | string[] | undefined>>;
 }) {
   const sp = searchParams ? await searchParams : undefined;
@@ -35,33 +57,102 @@ export default async function Page({
     typeof sp?.days === "string" ? sp.days :
     Array.isArray(sp?.days) ? sp.days[0] : 30
   );
+  const symbol =
+    typeof sp?.symbol === "string"
+      ? sp.symbol
+      : Array.isArray(sp?.symbol)
+      ? sp.symbol[0]
+      : undefined;
 
   try {
-    const data = await fetchDaily(days);
+    const [data, symbols] = await Promise.all([
+      fetchDaily(days, symbol),
+      fetchSymbols(90),
+    ]);
 
     // 直近days日の since を計算（signals CSV用）
     const sinceIso = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
-    const csvDailyUrl   = `${publicBase}/public/export/performance/daily.csv?days=${days}`;
-    const csvSignalsUrl = `${publicBase}/public/export/signals.csv?since=${encodeURIComponent(sinceIso)}&limit=1000`;
+    const csvDailyUrl = symbol
+      ? `${publicBase}/public/export/performance/daily_by_symbol.csv?symbol=${encodeURIComponent(
+          symbol
+        )}&days=${days}`
+      : `${publicBase}/public/export/performance/daily.csv?days=${days}`;
+    const csvSignalsUrl = `${publicBase}/public/export/signals.csv?since=${encodeURIComponent(
+      sinceIso
+    )}&limit=1000${symbol ? `&symbol=${encodeURIComponent(symbol)}` : ""}`;
 
     return (
       <main className="p-6 max-w-6xl mx-auto space-y-8">
         <header className="space-y-2">
-          <h1 className="text-2xl font-bold">Transparency（直近{days}日）</h1>
+          <h1 className="text-2xl font-bold">
+            Transparency（直近{days}日{symbol ? ` / ${symbol}` : ""}）
+          </h1>
           <p className="text-sm text-gray-600">
-            本ページでは、直近期間の結果と算出ロジックを公開します。
+            直近期間の結果と算出ロジックを公開します。
           </p>
         </header>
+
+        {/* フィルタ（GET提出） */}
+        <form method="get" className="grid grid-cols-1 sm:grid-cols-6 gap-3 items-end">
+          <div>
+            <label className="block text-sm text-gray-600">Days</label>
+            <input
+              name="days"
+              type="number"
+              min={7}
+              max={365}
+              defaultValue={days}
+              className="w-full border rounded-xl px-3 py-2"
+            />
+          </div>
+          <div className="sm:col-span-3">
+            <label className="block text-sm text-gray-600">Symbol（任意）</label>
+            <select
+              name="symbol"
+              defaultValue={symbol ?? ""}
+              className="w-full border rounded-xl px-3 py-2"
+            >
+              <option value="">（全体）</option>
+              {symbols.map((s) => (
+                <option key={s} value={s}>
+                  {s}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="flex gap-2">
+            <button className="w-full rounded-2xl shadow px-4 py-2">Apply</button>
+            <a
+              className="w-full text-center rounded-2xl border px-4 py-2"
+              href="/transparency?days=30"
+              title="フィルタをクリア"
+            >
+              Reset
+            </a>
+          </div>
+        </form>
 
         {/* ダウンロード */}
         <section className="rounded-2xl border p-4 shadow space-y-3">
           <h2 className="font-semibold">CSV エクスポート</h2>
           <div className="flex flex-wrap gap-3">
-            <a className="px-4 py-2 border rounded-xl" href={csvDailyUrl} download target="_blank" rel="noopener">
-              日次指標CSV（{days}日）
+            <a
+              className="px-4 py-2 border rounded-xl"
+              href={csvDailyUrl}
+              download
+              target="_blank"
+              rel="noopener"
+            >
+              {symbol ? `日次指標CSV（${symbol} / ${days}日）` : `日次指標CSV（${days}日）`}
             </a>
-            <a className="px-4 py-2 border rounded-xl" href={csvSignalsUrl} download target="_blank" rel="noopener">
-              シグナルCSV（{days}日）
+            <a
+              className="px-4 py-2 border rounded-xl"
+              href={csvSignalsUrl}
+              download
+              target="_blank"
+              rel="noopener"
+            >
+              シグナルCSV（{days}日{symbol ? ` / ${symbol}` : ""}）
             </a>
           </div>
           <p className="text-xs text-gray-500">※ ブラウザがダウンロードを開始します。</p>
@@ -96,7 +187,11 @@ export default async function Page({
                   </tr>
                 ))}
                 {data.length === 0 && (
-                  <tr><td className="px-3 py-6 text-center text-gray-500" colSpan={4}>データがありません</td></tr>
+                  <tr>
+                    <td className="px-3 py-6 text-center text-gray-500" colSpan={4}>
+                      データがありません
+                    </td>
+                  </tr>
                 )}
               </tbody>
             </table>
