@@ -1,12 +1,20 @@
 // /app/signals/page.tsx
 export const revalidate = 0;
 
+import Link from "next/link";
+import {
+  PageHeader,
+  Section,
+  FilterBar,
+  CsvButtons,
+} from "@/components/ui";
+
 type Sig = {
   signal_id?: number | string;
   symbol: string;
-  side: string;                 // BUY / SELL / EXIT-LONG 等
+  side: string;
   price?: number;
-  generated_at?: string;        // ISO8601
+  generated_at?: string;
   strength_score?: number;
   reason?: string;
 };
@@ -57,7 +65,7 @@ const num = (v?: number, d = 2) => (v == null ? "—" : v.toFixed(d));
 
 /** クイック期間（since ISO） */
 function QuickSince({ basePath, symbol, since }: { basePath: string; symbol?: string; since?: string }) {
-  const mk = (days: number) => {
+  const mkHref = (days: number) => {
     const s = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
     const p = new URLSearchParams({ since: s });
     if (symbol) p.set("symbol", symbol);
@@ -66,14 +74,14 @@ function QuickSince({ basePath, symbol, since }: { basePath: string; symbol?: st
   const baseBtn =
     "px-3 py-1.5 rounded-xl border text-sm hover:bg-gray-50 dark:hover:bg-gray-800";
   return (
-    <div className="flex flex-wrap gap-2" role="group" aria-label="期間のクイック切替">
+    <div className="flex flex-nowrap gap-2">
       {[7, 30, 90].map((d) => (
-        <a key={d} href={mk(d)} className={`${baseBtn} border-gray-300 dark:border-gray-700`}>
+        <Link key={d} href={mkHref(d)} className={`${baseBtn} border-gray-300 dark:border-gray-700`}>
           過去{d}日
-        </a>
+        </Link>
       ))}
       {since && (
-        <span className="text-xs text-gray-500 ml-1">
+        <span className="text-xs text-gray-500 ml-1 whitespace-nowrap">
           since: {new Date(since).toLocaleString()}
         </span>
       )}
@@ -81,7 +89,7 @@ function QuickSince({ basePath, symbol, since }: { basePath: string; symbol?: st
   );
 }
 
-// ★ Next.js 15想定：searchParams を Promise で受けられるように
+// Next.js 15想定：searchParams を Promise で受けられるように
 export default async function Page({
   searchParams,
 }: {
@@ -123,109 +131,101 @@ export default async function Page({
     return (
       <main className="p-6 md:p-8 max-w-6xl mx-auto space-y-8">
         {/* ヘッダ */}
-        <header className="space-y-2">
-          <h1 className="text-2xl md:text-3xl font-bold">Signals（シグナル一覧）</h1>
-          <p className="text-sm text-gray-600 dark:text-gray-300">
-            期間・シンボルで絞り込み、ページング可能。CSVダウンロードにも対応。
-          </p>
-        </header>
+        <PageHeader
+          title="Signals（シグナル一覧）"
+          description={<>期間・シンボルで絞り込み、ページング可能。CSVダウンロードにも対応。</>}
+        />
 
-        {/* フィルタ行：クイック期間 + フォーム */}
-        <section
-          aria-labelledby="filters-heading"
-          className="rounded-2xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 p-4 shadow-sm space-y-3"
-        >
-          <h2 id="filters-heading" className="sr-only">フィルタ</h2>
+        {/* フィルタ行：すべて1列（横スクロール対応） */}
+        <FilterBar
+          left={
+            <div className="space-y-3">
+              {/* --- 1段目: クイックレンジ --- */}
+              <div className="flex gap-2">
+                <QuickSince basePath="/signals" symbol={symbol} since={since} />
+              </div>
 
-          <div className="flex items-center justify-between flex-wrap gap-3">
-            <QuickSince basePath="/signals" symbol={symbol} since={since} />
-            <div className="text-xs text-gray-500">
-              時刻は <b>ローカル表示</b>（保存はUTC）。大小文字非区別（<code>lower(symbol)</code>）。
+              {/* --- 2段目: Symbol / Since / Limit / Apply / Reset --- */}
+              <form method="get" className="grid grid-cols-1 md:grid-cols-5 gap-3">
+                {/* Symbol */}
+                <div>
+                  <label className="block text-sm text-gray-600 dark:text-gray-300">Symbol（任意）</label>
+                  <select
+                    name="symbol"
+                    defaultValue={symbol ?? ""}
+                    className="w-full border rounded-xl px-3 py-2 bg-white dark:bg-gray-900 border-gray-300 dark:border-gray-700"
+                  >
+                    <option value="">（全体）</option>
+                    {symbols.map((s) => (
+                      <option key={s} value={s}>
+                        {s}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                {/* Since */}
+                <div>
+                  <label className="block text-sm text-gray-600 dark:text-gray-300">
+                    Since（ISO / datetime-local 可）
+                  </label>
+                  <input
+                    name="since"
+                    defaultValue={since}
+                    placeholder="2025-09-01T00:00:00Z"
+                    className="w-full border rounded-xl px-3 py-2 bg-white dark:bg-gray-900 border-gray-300 dark:border-gray-700"
+                  />
+                </div>
+
+                {/* Limit */}
+                <div>
+                  <label className="block text-sm text-gray-600 dark:text-gray-300">Limit</label>
+                  <input
+                    type="number"
+                    name="limit"
+                    min={1}
+                    max={200}
+                    defaultValue={limit || 50}
+                    className="w-full border rounded-xl px-3 py-2 bg-white dark:bg-gray-900 border-gray-300 dark:border-gray-700"
+                  />
+                </div>
+
+                {/* Apply */}
+                <div className="flex flex-col justify-end">
+                  <button className="w-full rounded-2xl shadow px-4 py-2 bg-gray-900 text-white dark:bg-white dark:text-gray-900">
+                    Apply
+                  </button>
+                </div>
+
+                {/* Reset */}
+                <div className="flex flex-col justify-end">
+                  <Link
+                    className="w-full text-center rounded-2xl border px-4 py-2 border-gray-300 dark:border-gray-700"
+                    href={`/signals?${buildQS({ since: defaultSince })}`}
+                    title="フィルタをクリア（過去30日）"
+                  >
+                    Reset
+                  </Link>
+                </div>
+              </form>
             </div>
-          </div>
-
-          <form method="get" className="grid grid-cols-1 sm:grid-cols-6 gap-3 items-end">
-            <div className="sm:col-span-2">
-              <label className="block text-sm text-gray-600 dark:text-gray-300">Symbol（任意）</label>
-              <select
-                name="symbol"
-                defaultValue={symbol ?? ""}
-                className="w-full border rounded-xl px-3 py-2 bg-white dark:bg-gray-900 border-gray-300 dark:border-gray-700"
-              >
-                <option value="">（全体）</option>
-                {symbols.map((s) => (
-                  <option key={s} value={s}>
-                    {s}
-                  </option>
-                ))}
-              </select>
-            </div>
-
-            <div className="sm:col-span-3">
-              <label className="block text-sm text-gray-600 dark:text-gray-300">
-                Since（ISO / datetime-local 可）
-              </label>
-              <input
-                name="since"
-                defaultValue={since}
-                placeholder="2025-09-01T00:00:00Z または 2025-09-01T00:00"
-                className="w-full border rounded-xl px-3 py-2 bg-white dark:bg-gray-900 border-gray-300 dark:border-gray-700"
-              />
-            </div>
-
-            <div>
-              <label className="block text-sm text-gray-600 dark:text-gray-300">Limit</label>
-              <input
-                type="number"
-                name="limit"
-                min={1}
-                max={200}
-                defaultValue={limit || 50}
-                className="w-full border rounded-xl px-3 py-2 bg-white dark:bg-gray-900 border-gray-300 dark:border-gray-700"
-              />
-            </div>
-
-            <div className="flex gap-2 sm:col-span-6 sm:justify-end">
-              <button className="rounded-2xl shadow px-4 py-2 bg-gray-900 text-white dark:bg-white dark:text-gray-900">
-                Apply
-              </button>
-              <a
-                className="rounded-2xl border px-4 py-2 border-gray-300 dark:border-gray-700 text-center"
-                href={`/signals?${buildQS({ since: defaultSince })}`}
-                title="フィルタをクリア（過去30日）"
-              >
-                Reset
-              </a>
-            </div>
-          </form>
-        </section>
-
-        {/* CSV エクスポート */}
-        <section
-          aria-labelledby="csv-heading"
-          className="rounded-2xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 p-4 shadow-sm space-y-3"
-        >
-          <h2 id="csv-heading" className="font-semibold">CSV エクスポート</h2>
-          <div className="flex flex-wrap gap-3">
-            <a
-              className="px-4 py-2 border rounded-xl border-gray-300 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-800"
-              href={csvUrl}
-              download
-              target="_blank"
-              rel="noopener"
-            >
-              シグナルCSV（最大1000件）
-            </a>
-          </div>
-          <p className="text-xs text-gray-500">※ ブラウザが自動でダウンロードを開始します。</p>
-        </section>
+          }
+          right={
+            <>時刻は <b>ローカル表示</b>（保存はUTC）。大小文字非区別（<code>lower(symbol)</code>）。</>
+          }
+        />
 
         {/* テーブル */}
-        <section
-          aria-labelledby="table-heading"
-          className="rounded-2xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 p-4 shadow-sm"
+        <Section
+          title="一覧"
+          headerRight={
+            <CsvButtons
+              links={[
+                { href: csvUrl, label: "CSV（最大1000件）", download: true, target: "_blank", rel: "noopener" },
+              ]}
+            />
+          }
         >
-          <h2 id="table-heading" className="font-semibold mb-2">一覧</h2>
           <div className="overflow-x-auto rounded-2xl">
             <table className="min-w-full text-sm">
               <thead className="bg-gray-50 dark:bg-gray-800 text-gray-600 dark:text-gray-300">
@@ -240,7 +240,10 @@ export default async function Page({
               </thead>
               <tbody>
                 {items.map((r, i) => (
-                  <tr key={String(r.signal_id ?? `${r.symbol}-${r.generated_at}-${i}`)} className="border-t border-gray-100 dark:border-gray-800">
+                  <tr
+                    key={String(r.signal_id ?? `${r.symbol}-${r.generated_at}-${i}`)}
+                    className="border-t border-gray-100 dark:border-gray-800"
+                  >
                     <td className="px-4 py-2">{dt(r.generated_at!)}</td>
                     <td className="px-4 py-2">{fmt(r.symbol)}</td>
                     <td className="px-4 py-2">{fmt(r.side)}</td>
@@ -268,28 +271,36 @@ export default async function Page({
               Total: {meta.total} / Page: {meta.page} / Limit: {meta.limit}
             </div>
             <div className="space-x-2">
-              <a
+              <Link
                 href={`?${prevQS}`}
-                className={`rounded-xl px-3 py-2 border ${meta.page > 1 ? "border-gray-300 dark:border-gray-700" : "pointer-events-none opacity-40 border-gray-200 dark:border-gray-800"}`}
+                className={`rounded-xl px-3 py-2 border ${
+                  meta.page > 1
+                    ? "border-gray-300 dark:border-gray-700"
+                    : "pointer-events-none opacity-40 border-gray-200 dark:border-gray-800"
+                }`}
               >
                 ← Prev
-              </a>
-              <a
+              </Link>
+              <Link
                 href={`?${nextQS}`}
-                className={`rounded-xl px-3 py-2 border ${meta.hasNext ? "border-gray-300 dark:border-gray-700" : "pointer-events-none opacity-40 border-gray-200 dark:border-gray-800"}`}
+                className={`rounded-xl px-3 py-2 border ${
+                  meta.hasNext
+                    ? "border-gray-300 dark:border-gray-700"
+                    : "pointer-events-none opacity-40 border-gray-200 dark:border-gray-800"
+                }`}
               >
                 Next →
-              </a>
+              </Link>
             </div>
           </div>
-        </section>
+        </Section>
       </main>
     );
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
     return (
       <main className="p-6 max-w-6xl mx-auto">
-        <h1 className="text-2xl font-bold mb-4">Signals</h1>
+        <PageHeader title="Signals" />
         <div className="text-red-600">読み込みに失敗しました。{msg}</div>
         <p className="text-sm text-gray-600 mt-2">
           ネットワークまたはAPIの一時的な不調の可能性があります。時間をおいて再度お試しください。

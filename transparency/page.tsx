@@ -1,6 +1,14 @@
 // /app/transparency/page.tsx
 export const revalidate = 0;
 
+import Link from "next/link";
+import {
+  PageHeader,
+  Section,
+  FilterBar,
+  CsvButtons,
+} from "@/components/ui";
+
 type Daily = {
   date: string;
   total_trades: number;
@@ -84,14 +92,14 @@ function QuickRanges({ days, symbol }: { days: number; symbol?: string }) {
   return (
     <div className="flex flex-wrap gap-2" role="group" aria-label="期間のクイック切替">
       {[7, 30, 90].map((d) => (
-        <a
+        <Link
           key={d}
           href={makeHref(d)}
           className={`${baseBtn} ${days === d ? active : "border-gray-300 dark:border-gray-700"}`}
           aria-current={days === d ? "page" : undefined}
         >
           {d}日
-        </a>
+        </Link>
       ))}
     </div>
   );
@@ -112,7 +120,7 @@ export default async function Page({
     typeof sp?.symbol === "string"
       ? sp.symbol
       : Array.isArray(sp?.symbol)
-      ? sp.symbol[0]
+      ? sp?.symbol[0]
       : undefined;
 
   try {
@@ -124,117 +132,86 @@ export default async function Page({
     ]);
 
     // CSVリンク（sinceはdays起点）
-    const sinceIso = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
     const csvDailyUrl = symbol
       ? `${publicBase}/public/export/performance/daily_by_symbol.csv?symbol=${encodeURIComponent(
           symbol
         )}&days=${days}`
       : `${publicBase}/public/export/performance/daily.csv?days=${days}`;
-    const csvSignalsUrl = `${publicBase}/public/export/signals.csv?since=${encodeURIComponent(
-      sinceIso
-    )}&limit=1000${symbol ? `&symbol=${encodeURIComponent(symbol)}` : ""}`;
 
     return (
       <main className="p-6 md:p-8 max-w-6xl mx-auto space-y-8">
         {/* ヘッダ */}
-        <header className="space-y-2">
-          <h1 className="text-2xl md:text-3xl font-bold">透明性（パフォーマンス＆シグナル）</h1>
-          <p className="text-sm text-gray-600 dark:text-gray-300">
-            直近{days}日の結果と主要指標、最新シグナルを公開します。シンボル切替・CSVダウンロードに対応。
-          </p>
-        </header>
+        <PageHeader
+          title="透明性（パフォーマンス＆シグナル）"
+          description={<>直近{days}日の結果と主要指標、最新シグナルを公開します。シンボル切替・CSVダウンロードに対応。</>}
+        />
 
         {/* フィルタ行：クイックレンジ＋フォーム */}
-        <section
-          aria-labelledby="filters-heading"
-          className="rounded-2xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 p-4 shadow-sm space-y-3"
-        >
-          <h2 id="filters-heading" className="sr-only">フィルタ</h2>
+        <FilterBar
+          left={
+            <div className="space-y-3">
+              {/* --- 1段目：クイックレンジ --- */}
+              <div className="flex gap-2">
+                <QuickRanges days={days} symbol={symbol} />
+              </div>
 
-          <div className="flex items-center justify-between flex-wrap gap-3">
-            <QuickRanges days={days} symbol={symbol} />
-            <div className="text-xs text-gray-500">
-              JST日次集計・大小文字非区別（<code>lower(symbol)</code>）
-            </div>
-          </div>
+              {/* --- 2段目：Days / Symbol / Apply / Reset --- */}
+              <form method="get" className="grid grid-cols-1 md:grid-cols-12 gap-3 items-end">
+                {/* Days（2カラム） */}
+                <div className="md:col-span-2">
+                  <label className="block text-sm text-gray-600 dark:text-gray-300">Days</label>
+                  <input
+                    name="days"
+                    type="number"
+                    min={7}
+                    max={365}
+                    defaultValue={days}
+                    className="w-full border rounded-xl px-3 py-2 bg-white dark:bg-gray-900 border-gray-300 dark:border-gray-700"
+                  />
+                </div>
 
-          <form method="get" className="grid grid-cols-1 sm:grid-cols-6 gap-3 items-end">
-            <div>
-              <label className="block text-sm text-gray-600 dark:text-gray-300">Days</label>
-              <input
-                name="days"
-                type="number"
-                min={7}
-                max={365}
-                defaultValue={days}
-                className="w-full border rounded-xl px-3 py-2 bg-white dark:bg-gray-900 border-gray-300 dark:border-gray-700"
-              />
-            </div>
-            <div className="sm:col-span-3">
-              <label className="block text-sm text-gray-600 dark:text-gray-300">Symbol（任意）</label>
-              <select
-                name="symbol"
-                defaultValue={symbol ?? ""}
-                className="w-full border rounded-xl px-3 py-2 bg-white dark:bg-gray-900 border-gray-300 dark:border-gray-700"
-              >
-                <option value="">（全体）</option>
-                {initialSymbols.map((s) => (
-                  <option key={s} value={s}>
-                    {s}
-                  </option>
-                ))}
-              </select>
-            </div>
-            <div className="flex gap-2 sm:col-span-2">
-              <button className="w-full rounded-2xl shadow px-4 py-2 bg-gray-900 text-white dark:bg-white dark:text-gray-900">
-                Apply
-              </button>
-              <a
-                className="w-full text-center rounded-2xl border px-4 py-2 border-gray-300 dark:border-gray-700"
-                href="/transparency?days=30"
-                title="フィルタをクリア"
-              >
-                Reset
-              </a>
-            </div>
-          </form>
-        </section>
+                {/* Symbol（6カラム） */}
+                <div className="md:col-span-6">
+                  <label className="block text-sm text-gray-600 dark:text-gray-300">Symbol（任意）</label>
+                  <select
+                    name="symbol"
+                    defaultValue={symbol ?? ""}
+                    className="w-full border rounded-xl px-3 py-2 bg-white dark:bg-gray-900 border-gray-300 dark:border-gray-700"
+                  >
+                    <option value="">（全体）</option>
+                    {initialSymbols.map((s) => (
+                      <option key={s} value={s}>
+                        {s}
+                      </option>
+                    ))}
+                  </select>
+                </div>
 
-        {/* CSV エクスポート */}
-        <section
-          aria-labelledby="csv-heading"
-          className="rounded-2xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 p-4 shadow-sm space-y-3"
-        >
-          <h2 id="csv-heading" className="font-semibold">CSV エクスポート</h2>
-          <div className="flex flex-wrap gap-3">
-            <a
-              className="px-4 py-2 border rounded-xl border-gray-300 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-800"
-              href={csvDailyUrl}
-              download
-              target="_blank"
-              rel="noopener"
-            >
-              {symbol ? `日次指標CSV（${symbol} / ${days}日）` : `日次指標CSV（${days}日）`}
-            </a>
-            <a
-              className="px-4 py-2 border rounded-xl border-gray-300 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-800"
-              href={csvSignalsUrl}
-              download
-              target="_blank"
-              rel="noopener"
-            >
-              シグナルCSV（{days}日{symbol ? ` / ${symbol}` : ""}）
-            </a>
-          </div>
-          <p className="text-xs text-gray-500">※ ブラウザが自動でダウンロードを開始します。</p>
-        </section>
+                {/* Apply（2カラム） */}
+                <div className="md:col-span-2 flex">
+                  <button className="w-full rounded-2xl shadow px-4 py-2 bg-gray-900 text-white dark:bg-white dark:text-gray-900">
+                    Apply
+                  </button>
+                </div>
+
+                {/* Reset（2カラム） */}
+                <div className="md:col-span-2 flex">
+                  <Link
+                    className="w-full text-center rounded-2xl border px-4 py-2 border-gray-300 dark:border-gray-700"
+                    href="/transparency?days=30"
+                    title="フィルタをクリア"
+                  >
+                    Reset
+                  </Link>
+                </div>
+              </form>
+            </div>
+          }
+          right={<>JST日次集計・大小文字非区別（<code>lower(symbol)</code>）</>}
+        />
 
         {/* グラフ */}
-        <section
-          aria-labelledby="chart-heading"
-          className="rounded-2xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 p-4 shadow-sm space-y-2"
-        >
-          <h2 id="chart-heading" className="font-semibold">日次推移（Win Rate / Avg PnL%）</h2>
+        <Section title="日次推移（Win Rate / Avg PnL%）">
           {Array.isArray(data) && data.length > 0 ? (
             <ChartClient data={data} />
           ) : (
@@ -242,14 +219,25 @@ export default async function Page({
               表示できるデータがありません（期間・シンボルを変更してお試しください）
             </div>
           )}
-        </section>
+        </Section>
 
         {/* 日次テーブル */}
-        <section
-          aria-labelledby="table-heading"
-          className="rounded-2xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 p-4 shadow-sm"
+        <Section
+          title="日次テーブル"
+          headerRight={
+            <CsvButtons
+              links={[
+                {
+                  href: csvDailyUrl,
+                  label: symbol ? `CSV（${symbol} / ${days}日）` : `CSV（${days}日）`,
+                  download: true,
+                  target: "_blank",
+                  rel: "noopener",
+                },
+              ]}
+            />
+          }
         >
-          <h2 id="table-heading" className="font-semibold mb-2">日次テーブル</h2>
           <div className="overflow-x-auto">
             <table className="min-w-full text-sm">
               <thead className="bg-gray-50 dark:bg-gray-800 text-gray-600 dark:text-gray-300">
@@ -280,18 +268,13 @@ export default async function Page({
             </table>
           </div>
           <p className="text-xs text-gray-500 mt-2">※ Win/Avg PnL% は当日トレードに基づく単純集計です。</p>
-        </section>
+        </Section>
 
         {/* 最新シグナル10件（SSR） */}
-        <section
-          aria-labelledby="signals-heading"
-          className="rounded-2xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 p-4 shadow-sm space-y-2"
+        <Section
+          title={<>最新シグナル（10件）{symbol ? ` / ${symbol}` : ""}</>}
+          subtitle={<>※ 直近 {days} 日のデータから抽出しています。</>}
         >
-          <h2 id="signals-heading" className="font-semibold">
-            最新シグナル（10件）{symbol ? ` / ${symbol}` : ""}
-          </h2>
-          <p className="text-xs text-gray-500">※ 直近 {days} 日のデータから抽出しています。</p>
-
           {latestSignals.length === 0 ? (
             <div className="text-sm text-gray-500">該当するシグナルが見つかりませんでした。</div>
           ) : (
@@ -321,14 +304,10 @@ export default async function Page({
               ))}
             </div>
           )}
-        </section>
+        </Section>
 
         {/* 算出ロジック（概要） */}
-        <section
-          aria-labelledby="logic-heading"
-          className="rounded-2xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 p-4 shadow-sm space-y-2"
-        >
-          <h2 id="logic-heading" className="font-semibold">算出ロジック（概要）</h2>
+        <Section title="算出ロジック（概要）">
           <ul className="list-disc pl-5 space-y-1 text-sm text-gray-700 dark:text-gray-200">
             <li>タイムゾーンは <b>JST（UTC+9）</b> を基準に日次を区切ります。</li>
             <li>日次指標は、該当日のトレード（<code>trades</code>）を対象に算出します。</li>
@@ -341,14 +320,14 @@ export default async function Page({
           <p className="text-xs text-gray-500">
             ※ 具体実装はサーバ側の <code>compute_metrics()</code> に準拠しています。
           </p>
-        </section>
+        </Section>
       </main>
     );
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
     return (
       <main className="p-6 max-w-6xl mx-auto">
-        <h1 className="text-2xl font-bold mb-4">Transparency</h1>
+        <PageHeader title="Transparency" />
         <div className="text-red-600">読み込みに失敗しました。{msg}</div>
         <p className="text-sm text-gray-600 mt-2">
           ネットワークまたはAPIの一時的な不調の可能性があります。時間をおいて再度お試しください。
