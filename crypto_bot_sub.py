@@ -34,6 +34,7 @@ from db import get_trades_between
 from db import insert_signal
 from db import update_signal_status
 from notifiers.line_messaging import LineMessaging
+from notifications.message_templates import compose_exit_message, ExitPerf
 from notifications.message_templates import compose_signal_message, IndicatorSnapshot, SignalContext
 try:
     from reports.daily_report import build_daily_report_message
@@ -881,6 +882,80 @@ class CryptoTradingBot:
             
         except Exception as e:
             self.logger.error(f"メール送信エラー: {e}")
+
+    def _send_exit_detail(self, symbol: str, exit_price: float, *, timeframe: str = "5m", reason: str | None = None) -> None:
+        """
+        イグジット時の“利益中心の詳細通知”を作成して送るヘルパー。
+        - 件名: EXIT-LONG / EXIT-SHORT を自動判定
+        - 本文: 先頭に損益（円・％）、次に Entry/Exit/Size、保有時間、理由、JSTタイムスタンプ
+
+        引数:
+            symbol      : "eth_jpy" など
+            exit_price  : 決済価格（約定平均が取れればそれを渡す。無ければ current_price を渡す）
+            timeframe   : 表示用の時間足ラベル（既定 "5m"）
+            reason      : "利益確定" / "損切り" / "長時間保有" などの理由文字列
+        """
+        try:
+            position    = self.positions.get(symbol)        # "long" | "short" | None
+            entry_price = float(self.entry_prices.get(symbol, 0) or 0)
+            size        = float(self.entry_sizes.get(symbol, 0) or 0)
+            entry_time  = self.entry_times.get(symbol)
+
+            # side（件名用）
+            if position in ("long", "short"):
+                side = "EXIT-LONG" if position == "long" else "EXIT-SHORT"
+            else:
+                side = "EXIT"
+
+            # データ不整合時はシンプル通知にフォールバック（無通知を避ける）
+            if entry_price <= 0 or size <= 0 or not entry_time or exit_price is None:
+                self._notify_signal(
+                    side=side,
+                    symbol=symbol,
+                    price=float(exit_price) if exit_price is not None else None,
+                    reason_tags=[reason] if reason else None,
+                    notification_type="exit",
+                )
+                return
+
+            # PnL 計算
+            if position == "long":
+                profit_jpy = (exit_price - entry_price) * size
+                profit_pct = (exit_price / entry_price - 1.0) * 100.0
+            else:  # short
+                profit_jpy = (entry_price - exit_price) * size
+                profit_pct = (entry_price / exit_price - 1.0) * 100.0
+
+            # 保有時間（時間）
+            holding_hours = (datetime.now() - entry_time).total_seconds() / 3600.0
+
+            # 本文生成（利益最上段）
+            perf = ExitPerf(
+                position=position,
+                entry_price=entry_price,
+                exit_price=float(exit_price),
+                size=size,
+                profit_jpy=profit_jpy,
+                profit_pct=profit_pct,
+                holding_hours=holding_hours,
+                reason=reason,
+            )
+            body = compose_exit_message(symbol, timeframe, perf)  # 先頭に「損益: ○円（±x.xx%）」を出す
+
+            # 送信（件名＋本文）: _notify_signal の 2引数版 → send_notification 経由でメール/LINEに配送
+            subject = f"{side} {symbol}".upper()
+            self._notify_signal(subject, body, notification_type="exit")  # 2引数版OK:contentReference[oaicite:3]{index=3}
+
+        except Exception as e:
+            # 想定外エラー時も最低限の通知は出す
+            self.logger.exception(f"_send_exit_detail エラー: {e}")
+            self._notify_signal(
+                side="EXIT",
+                symbol=symbol,
+                price=float(exit_price) if exit_price is not None else None,
+                reason_tags=[str(e)],
+                notification_type="exit",
+            )
 
     def _load_total_profit(self):
         """累積利益の読み込み"""
@@ -5471,64 +5546,27 @@ class CryptoTradingBot:
                 
                 # 通知送信
                 if self.notification_settings.get('send_on_exit', True):
-                    # EXIT 用のside（見やすさ重視）
                     exit_side = "EXIT-LONG" if position == "long" else "EXIT-SHORT"
-
-                    # reason_tags を簡易生成（必要に応じて拡張）
-                    reason_tags = []
-                    # TP/SLヒットのどちらか
-                    if exit_reason == "利益確定":
-                        reason_tags.append("tp_hit")
-                    elif exit_reason == "損切り":
-                        reason_tags.append("sl_hit")
-                    elif "長時間保有" in exit_reason:
-                        reason_tags.append("time_exit")
-
-                    # 指標系（ADX/ATR/SMA/RSI）のサマリをタグに反映（任意強化OK）
-                    last = df_5min.iloc[-1] if len(df_5min) > 0 else None
-                    if last is not None:
-                        adx = float(last["ADX"]) if "ADX" in df_5min.columns and not pd.isna(last["ADX"]) else None
-                        atr = float(last["ATR"]) if "ATR" in df_5min.columns and not pd.isna(last["ATR"]) else None
-                        rsi = float(last["RSI"]) if "RSI" in df_5min.columns and not pd.isna(last["RSI"]) else None
-                        sma_fast = float(last.get("SMA_FAST")) if "SMA_FAST" in df_5min.columns and not pd.isna(last.get("SMA_FAST")) else None
-                        sma_slow = float(last.get("SMA_SLOW")) if "SMA_SLOW" in df_5min.columns and not pd.isna(last.get("SMA_SLOW")) else None
-
-                        if adx is not None and adx >= 25:
-                            reason_tags.append("adx_trend")
-                        if atr is not None and current_price:
-                            atr_pct = 100.0 * atr / float(current_price)
-                            if atr_pct >= 1.6:
-                                reason_tags.append("atr_wide")
-                        if sma_fast is not None and sma_slow is not None:
-                            if sma_fast > sma_slow:
-                                reason_tags.append("sma_bull")
-                            elif sma_fast < sma_slow:
-                                reason_tags.append("sma_bear")
-                        if rsi is not None:
-                            if rsi <= 30:
-                                reason_tags.append("rsi_oversold")
-                            elif rsi >= 70:
-                                reason_tags.append("rsi_overbought")
-
-                    # エントリー時に保存していたスコア（存在すれば通知に混ぜる）
-                    saved_scores = self.entry_scores.get(symbol, {})
-                    score_for_notice = saved_scores.get("entry_total_score") \
-                        if "entry_total_score" in saved_scores else None
-
-                    # 価格・TP/SL は EXIT レベルと現在値を渡す
                     try:
+                        # こちらに差し替え
+                        self._send_exit_detail(
+                            symbol,
+                            exit_price=current_price,      # 約定平均が取れればそちらを渡す
+                            timeframe="5m",                # 主に使う時間足を指定
+                            reason=exit_reason
+                        )
+                    except Exception as e:
+                        self.logger.exception(f"EXIT詳細通知失敗: {e}")
+                        # フォールバック（従来のシンプル通知）
                         self._notify_signal(
-                            symbol=symbol,
                             side=exit_side,
-                            df_5min=df_5min,
+                            symbol=symbol,
                             price=float(current_price) if current_price is not None else None,
                             tp=float(take_profit_price) if take_profit_price is not None else None,
                             sl=float(stop_loss_price) if stop_loss_price is not None else None,
-                            score=score_for_notice,
-                            reason_tags=reason_tags
+                            score=None,
+                            reason_tags=[exit_reason] if exit_reason else None
                         )
-                    except Exception as e:
-                        self.logger.exception(f"EXIT通知失敗: {e}")
                 
                 # 保存されていたスコア値を取得
                 saved_scores = self.entry_scores.get(symbol, {})

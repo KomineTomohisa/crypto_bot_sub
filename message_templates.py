@@ -107,3 +107,43 @@ def compose_signal_message(ctx: SignalContext, ind: IndicatorSnapshot, *, locale
         f"\n{now} JST",
     ]
     return "\n".join([l for l in lines if l is not None and l != ""])
+
+@dataclass
+class ExitPerf:
+    position: str              # "long" | "short"
+    entry_price: float
+    exit_price: float
+    size: float
+    profit_jpy: float
+    profit_pct: float          # 例: +2.34 は +2.34%
+    holding_hours: float
+    reason: Optional[str] = None  # "TP", "SL", "時間経過", など任意
+
+def compose_exit_message(symbol: str, timeframe: str, perf: ExitPerf, *, locale: str="ja") -> str:
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    pos_ja = "ロング" if perf.position == "long" else "ショート"
+    title = f"【{symbol.upper()} / {timeframe}】{pos_ja}決済"
+
+    # 1行目: PnL をドン！
+    pnl_line = f"損益: {perf.profit_jpy:,.0f} 円（{perf.profit_pct:+.2f}%）"
+
+    # 2行目: 価格とサイズの内訳
+    detail_line = (
+        f"Entry: {perf.entry_price:,.0f} / Exit: {perf.exit_price:,.0f} / "
+        f"Size: {perf.size:g}"
+    )
+
+    # 3行目: 保有時間・理由
+    hold_reason = f"保有: {perf.holding_hours:.1f} 時間"
+    if perf.reason:
+        hold_reason += f" / 理由: {perf.reason}"
+
+    lines = [
+        title,
+        pnl_line,
+        detail_line,
+        hold_reason,
+        "",
+        f"{now} JST",
+    ]
+    return "\n".join(lines)
