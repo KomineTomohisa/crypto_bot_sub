@@ -38,9 +38,18 @@ def _extract_exit_time_jst(t: Dict) -> Optional[datetime]:
         if isinstance(v, datetime):
             return v.astimezone(JST) if v.tzinfo else v.replace(tzinfo=JST)
         if isinstance(v, str):
+            s = v.strip().replace("Z", "+00:00")
+            # ISO8601 with tz
             try:
-                # ISO8601 文字列想定
-                dt = datetime.fromisoformat(v.replace("Z", "+00:00"))
+                dt = datetime.fromisoformat(s)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=JST)
+                return dt.astimezone(JST)
+            except Exception:
+                pass
+            # "YYYY-mm-dd HH:MM:SS.sss +0900" 形式対応
+            try:
+                dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S.%f %z")
                 return dt.astimezone(JST)
             except Exception:
                 continue
