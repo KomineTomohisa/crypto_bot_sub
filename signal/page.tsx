@@ -8,6 +8,7 @@ import {
   FilterBar,
   CsvButtons,
 } from "@/components/ui";
+import { Notes } from "@/components/ui/Notes";
 
 type Sig = {
   signal_id?: number | string;
@@ -211,7 +212,12 @@ export default async function Page({
             </div>
           }
           right={
-            <>時刻は <b>ローカル表示</b>（保存はUTC）。大小文字非区別（<code>lower(symbol)</code>）。</>
+            <Notes
+              items={[
+                { label: <>時刻は<b>ローカル表示</b></>, tooltip: "保存はUTC、表示は端末のタイムゾーン" },
+                { label: <>大小文字非区別: <code>lower(symbol)</code></> },
+              ]}
+            />
           }
         />
 

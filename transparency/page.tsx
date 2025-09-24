@@ -8,6 +8,7 @@ import {
   FilterBar,
   CsvButtons,
 } from "@/components/ui";
+import { Notes } from "@/components/ui/Notes";
 
 type Daily = {
   date: string;
@@ -207,7 +208,14 @@ export default async function Page({
               </form>
             </div>
           }
-          right={<>JST日次集計・大小文字非区別（<code>lower(symbol)</code>）</>}
+          right={
+            <Notes
+              items={[
+                { label: <>JST基準の<b>日次</b>集計</>, tooltip: "日付の区切りは JST (UTC+9)" },
+                { label: <>大小文字非区別: <code>lower(symbol)</code></> },
+              ]}
+            />
+          }
         />
 
         {/* グラフ */}
