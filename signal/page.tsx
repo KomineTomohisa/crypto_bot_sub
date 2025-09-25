@@ -8,6 +8,9 @@ import {
   FilterBar,
   CsvButtons,
 } from "@/components/ui";
+import { Notes } from "@/components/ui/Notes";
+import { QuickFilters } from "@/components/ui/QuickFilters";
+import { TablePagination } from "@/components/ui/TablePagination";
 
 type Sig = {
   signal_id?: number | string;
@@ -63,32 +66,6 @@ const fmt = (v: string | number | null | undefined) => (v ?? "—");
 const dt = (s?: string) => (s ? new Date(s).toLocaleString() : "—");
 const num = (v?: number, d = 2) => (v == null ? "—" : v.toFixed(d));
 
-/** クイック期間（since ISO） */
-function QuickSince({ basePath, symbol, since }: { basePath: string; symbol?: string; since?: string }) {
-  const mkHref = (days: number) => {
-    const s = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
-    const p = new URLSearchParams({ since: s });
-    if (symbol) p.set("symbol", symbol);
-    return `${basePath}?${p.toString()}`;
-  };
-  const baseBtn =
-    "px-3 py-1.5 rounded-xl border text-sm hover:bg-gray-50 dark:hover:bg-gray-800";
-  return (
-    <div className="flex flex-nowrap gap-2">
-      {[7, 30, 90].map((d) => (
-        <Link key={d} href={mkHref(d)} className={`${baseBtn} border-gray-300 dark:border-gray-700`}>
-          過去{d}日
-        </Link>
-      ))}
-      {since && (
-        <span className="text-xs text-gray-500 ml-1 whitespace-nowrap">
-          since: {new Date(since).toLocaleString()}
-        </span>
-      )}
-    </div>
-  );
-}
-
 // Next.js 15想定：searchParams を Promise で受けられるように
 export default async function Page({
   searchParams,
@@ -142,7 +119,12 @@ export default async function Page({
             <div className="space-y-3">
               {/* --- 1段目: クイックレンジ --- */}
               <div className="flex gap-2">
-                <QuickSince basePath="/signals" symbol={symbol} since={since} />
+                <QuickFilters mode="since" basePath="/signals" symbol={symbol} />
+                {since && (
+                  <span className="text-xs text-gray-500 ml-1 whitespace-nowrap">
+                    since: {new Date(since).toLocaleString()}
+                  </span>
+                )}
               </div>
 
               {/* --- 2段目: Symbol / Since / Limit / Apply / Reset --- */}
@@ -211,7 +193,12 @@ export default async function Page({
             </div>
           }
           right={
-            <>時刻は <b>ローカル表示</b>（保存はUTC）。大小文字非区別（<code>lower(symbol)</code>）。</>
+            <Notes
+              items={[
+                { label: <>時刻は<b>ローカル表示</b></>, tooltip: "保存はUTC、表示は端末のタイムゾーン" },
+                { label: <>大小文字非区別: <code>lower(symbol)</code></> },
+              ]}
+            />
           }
         />
 
@@ -221,12 +208,27 @@ export default async function Page({
           headerRight={
             <CsvButtons
               links={[
-                { href: csvUrl, label: "CSV（最大1000件）", download: true, target: "_blank", rel: "noopener" },
+                {
+                  href: csvUrl,
+                  label: "CSV（最大1000件）",
+                  download: true,
+                  target: "_blank",
+                  rel: "noopener",
+                },
               ]}
             />
           }
         >
-          <div className="overflow-x-auto rounded-2xl">
+          {/* ページング（上） */}
+          <TablePagination
+            prevHref={`?${prevQS}`}
+            nextHref={`?${nextQS}`}
+            canPrev={meta.page > 1}
+            canNext={meta.hasNext}
+          />
+
+          {/* テーブル本体 */}
+          <div className="overflow-x-auto rounded-2xl mt-3">
             <table className="min-w-full text-sm">
               <thead className="bg-gray-50 dark:bg-gray-800 text-gray-600 dark:text-gray-300">
                 <tr>
@@ -250,7 +252,9 @@ export default async function Page({
                     <td className="px-4 py-2 text-right">{fmt(r.price)}</td>
                     <td className="px-4 py-2 text-right">{num(r.strength_score, 2)}</td>
                     <td className="px-4 py-2 max-w-[480px]">
-                      <div className="truncate" title={r.reason ?? ""}>{r.reason ?? "—"}</div>
+                      <div className="truncate" title={r.reason ?? ""}>
+                        {r.reason ?? "—"}
+                      </div>
                     </td>
                   </tr>
                 ))}
@@ -265,34 +269,13 @@ export default async function Page({
             </table>
           </div>
 
-          {/* ページング */}
-          <div className="flex items-center justify-between mt-3">
-            <div className="text-sm text-gray-600 dark:text-gray-300">
-              Total: {meta.total} / Page: {meta.page} / Limit: {meta.limit}
-            </div>
-            <div className="space-x-2">
-              <Link
-                href={`?${prevQS}`}
-                className={`rounded-xl px-3 py-2 border ${
-                  meta.page > 1
-                    ? "border-gray-300 dark:border-gray-700"
-                    : "pointer-events-none opacity-40 border-gray-200 dark:border-gray-800"
-                }`}
-              >
-                ← Prev
-              </Link>
-              <Link
-                href={`?${nextQS}`}
-                className={`rounded-xl px-3 py-2 border ${
-                  meta.hasNext
-                    ? "border-gray-300 dark:border-gray-700"
-                    : "pointer-events-none opacity-40 border-gray-200 dark:border-gray-800"
-                }`}
-              >
-                Next →
-              </Link>
-            </div>
-          </div>
+          {/* ページング（下） */}
+          <TablePagination
+            prevHref={`?${prevQS}`}
+            nextHref={`?${nextQS}`}
+            canPrev={meta.page > 1}
+            canNext={meta.hasNext}
+          />
         </Section>
       </main>
     );
