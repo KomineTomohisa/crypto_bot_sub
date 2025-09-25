@@ -9,6 +9,7 @@ import {
   CsvButtons,
 } from "@/components/ui";
 import { Notes } from "@/components/ui/Notes";
+import { QuickFilters } from "@/components/ui/QuickFilters";
 
 type Daily = {
   date: string;
@@ -52,33 +53,6 @@ import ChartClient from "./ChartClient";
 
 function pct(v?: number | null, digits = 1) {
   return v != null ? `${(v * 100).toFixed(digits)}%` : "—";
-}
-
-/** クイック期間切替（7/30/90日） */
-function QuickRanges({ days, symbol }: { days: number; symbol?: string }) {
-  const makeHref = (d: number) => {
-    const p = new URLSearchParams({ days: String(d) });
-    if (symbol) p.set("symbol", symbol);
-    return `/performance?${p.toString()}`;
-  };
-  const baseBtn =
-    "px-3 py-1.5 rounded-xl border text-sm hover:bg-gray-50 dark:hover:bg-gray-800";
-  const active =
-    "bg-gray-900 text-white border-gray-900 dark:bg-white dark:text-gray-900 dark:border-white";
-  return (
-    <div className="flex flex-wrap gap-2" role="group" aria-label="期間のクイック切替">
-      {[7, 30, 90].map((d) => (
-        <Link
-          key={d}
-          href={makeHref(d)}
-          className={`${baseBtn} ${days === d ? active : "border-gray-300 dark:border-gray-700"}`}
-          aria-current={days === d ? "page" : undefined}
-        >
-          {d}日
-        </Link>
-      ))}
-    </div>
-  );
 }
 
 export default async function Page({
@@ -127,7 +101,7 @@ export default async function Page({
             <div className="space-y-3">
               {/* --- 1段目：クイックレンジ（左寄せ） --- */}
               <div className="flex gap-2">
-                <QuickRanges days={days} symbol={symbol} />
+                <QuickFilters mode="range" basePath="/performance" symbol={symbol} activeDays={days} />
               </div>
 
               {/* --- 2段目：Days / Symbol / Apply / Reset を横一列で展開 --- */}
