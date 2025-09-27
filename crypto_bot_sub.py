@@ -91,6 +91,38 @@ def _is_dns_temp_failure(err: Exception) -> bool:
         e = getattr(e, "__cause__", None)
     return False
 
+def to_iso8601(v):
+    """文字列やdatetimeをISO8601(+TZ)に正規化"""
+    if isinstance(v, datetime):
+        if v.tzinfo is None:
+            v = v.replace(tzinfo=JST)  # naiveはJST前提
+        return v.isoformat()
+    if isinstance(v, str):
+        s = v.strip()
+        # "YYYY-mm-dd HH:MM:SS.sss +0900" を許可
+        try:
+            dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S.%f %z")
+            return dt.isoformat()
+        except Exception:
+            pass
+        # naiveなISO文字列 "2025-09-24T12:34:56.123456" → JST付与
+        if "T" in s and ("+" not in s and "Z" not in s):
+            return s + "+09:00"
+    return v
+
+def row_to_report_trade(row):
+    """DBから取った行を日次レポート用に整形"""
+    return {
+        "symbol": row.get("symbol") or row.get("pair"),
+        "side": row.get("type") or row.get("position_type"),
+        "exit_time": to_iso8601(row.get("closed_at") or row.get("exit_time")),
+        "exit_price": row.get("exit_price"),
+        "pnl": row.get("pnl") if row.get("pnl") is not None else row.get("profit"),
+        "profit": row.get("profit") if row.get("profit") is not None else row.get("pnl"),
+        "entry_price": row.get("entry_price"),
+        "holding_hours": row.get("holding_hours"),
+    }
+
 class GMOCoinAPI:
     """GMOコインの信用取引APIラッパー"""
     
@@ -708,27 +740,63 @@ class CryptoTradingBot:
         run_live 内の 0:00 トリガーで呼ばれる想定。
         """
         try:
-            jst_now = datetime.now(JST)
-            start = jst_now.replace(hour=0, minute=0, second=0, microsecond=0)
-            end   = start + timedelta(days=1)
+            # --- 対象日のJST範囲を決定（force_day_start を優先） ---
+            force_start = (stats or {}).get("force_day_start")
+            if force_start:
+                start = force_start
+            else:
+                jst_now = datetime.now(JST)
+                start = jst_now.replace(hour=0, minute=0, second=0, microsecond=0)
+            end = start + timedelta(days=1)
 
-            # DBから当日分のクローズ済みトレードを取得（db.get_trades_between を利用）
+            # --- DBから当日分のクローズ済みトレードを取得 ---
             try:
-                trades = get_trades_between(start, end)
+                from db import get_trades_between
+                trades = get_trades_between(start, end) or []
             except Exception as e:
                 self.logger.warning(f"DBからのトレード取得に失敗。メモリ上のログにフォールバック: {e}")
-                # フォールバック：stats または self に保っている当日ログがあれば使う
-                trades = stats.get("today_trade_logs", []) if isinstance(stats, dict) else []
+                trades = (stats.get("today_trade_logs", []) if isinstance(stats, dict) else []) or []
+                trades += getattr(self, "daily_exit_logs", [])
 
-            # メッセージ生成（daily_report.py）
-            subject, message = build_daily_report_message(trades, day=start)
+            # --- 重複除外 ---
+            seen, deduped = set(), []
+            for t in trades:
+                key = (
+                    t.get("exit_order_id"),
+                    t.get("closed_at") or t.get("exit_time") or t.get("time"),
+                    t.get("symbol") or t.get("pair"),
+                    t.get("entry_price"), t.get("exit_price"),
+                    t.get("size"),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                deduped.append(t)
+            trades = deduped
 
-            # 通知送信（メール＆LINE）
-            self.send_notification(subject=subject, message=message, notification_type="daily_report")
+            # --- 正規化（外出し済みユーティリティを使用） ---
+            normalized_trades = [row_to_report_trade(t) for t in trades]
+
+            # デバッグに役立つ簡易ログ（必要なら残す）
+            self.logger.info(f"[daily] raw={len(deduped)}, normalized={len(normalized_trades)}")
+            if normalized_trades:
+                s = normalized_trades[0]
+                self.logger.info(f"[daily] sample exit_time={s.get('exit_time')} pnl={s.get('pnl')} profit={s.get('profit')} symbol={s.get('symbol')}")
+
+            # --- メッセージ生成（JSTの start を day に渡す） ---
+            subject, message = build_daily_report_message(normalized_trades, day=start)
+
+            # --- 通知送信 ---
+            self.send_notification(
+                subject=subject,
+                message=message,
+                notification_type="daily_report",
+            )
             self.logger.info("✅ 日次レポート送信完了")
 
         except Exception as e:
             self.logger.error(f"日次レポート送信エラー: {e}", exc_info=True)
+
 
     def _notify_signal(self, *args, **kwargs):
         """
@@ -5733,45 +5801,17 @@ class CryptoTradingBot:
             return False
 
     def send_daily_report(self, day: Optional[datetime] = None):
-        start, end = self._day_bounds_jst(day)
+        """
+        手動/外部呼び出し用の公開メソッド。
+        実処理は _send_daily_report に委譲する（正規化経路を強制）。
+        """
+        stats = {}
+        if day is not None:
+            start, _ = self._day_bounds_jst(day)
+            # _send_daily_report 側でこのキーを見て開始日を上書き
+            stats["force_day_start"] = start
+        return self._send_daily_report(stats)
 
-        # DBから「クローズ済」トレードを取得
-        trades = []
-        try:
-            from db import get_trades_between
-            trades = (get_trades_between(start, end) or [])
-        except Exception as e:
-            self.logger.warning(f"DB取得に失敗（メモリfallback）: {e}")
-
-        # メモリ上の当日分 exit ログを併用（任意：軽量化で当日だけ抽出）
-        trades += getattr(self, "daily_exit_logs", [])
-
-        # 重複除外（任意）
-        seen = set()
-        deduped = []
-        for t in trades:
-            key = (
-                t.get("exit_order_id"),
-                t.get("closed_at") or t.get("exit_time"),
-                t.get("symbol"),
-                t.get("entry_price"), t.get("exit_price"),
-                t.get("size"),
-            )
-            if key in seen:
-                continue
-            seen.add(key)
-            deduped.append(t)
-        trades = deduped
-
-        # ← ここを start に修正
-        subject, message = build_daily_report_message(trades, day=start)
-
-        try:
-            # 必要ならここで短縮処理（LINE対策）を入れる
-            self.send_notification(subject=subject, message=message)
-            self.logger.info("日次まとめ通知を送信しました")
-        except Exception as e:
-            self.logger.exception(f"日次まとめ通知 送信失敗: {e}")
 
     def _day_bounds_jst(self, day=None):
         day = (day or datetime.now(JST)).astimezone(JST)
