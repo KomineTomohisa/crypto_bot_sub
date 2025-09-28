@@ -9,13 +9,6 @@ import ChartClient from "@/app/performance/ChartClient";
    ========================= */
 type TimeLike = string | number | Date | null | undefined;
 
-type Kpis = {
-  win_rate?: number | null;     // 0.0-1.0
-  avg_pnl_pct?: number | null;  // 0.0123 (=1.23%)
-  total_trades?: number | null;
-  recent_signal_count?: number | null; // 未使用だがKPI APIに残っている前提
-};
-
 type Daily = {
   date: string;                 // JST日（YYYY-MM-DD）
   win_rate?: number | null;
@@ -24,14 +17,26 @@ type Daily = {
 };
 
 type Position = {
-  position_id: number;
+  position_id: number | string;
   symbol: string;
   side: 'LONG' | 'SHORT' | string;
   size: number | null;
   entry_price: number | null;
   entry_time: string | null;
-  current_price?: number | null;           // 追加（APIと合わせる）
-  unrealized_pnl_pct?: number | null;      // 追加（APIと合わせる）
+
+  // ↓ API /public/positions/open_with_price の追加フィールド
+  current_price?: number | null;
+  unrealized_pnl_pct?: number | null;
+  price_ts?: string | null;
+};
+
+type KPI = {
+  trade_count: number;
+  win_count: number;
+  win_rate: number | null;
+  total_pnl: number | null;
+  avg_pnl_pct: number | null;
+  avg_holding_hours: number | null;
 };
 
 /* =========================
@@ -83,26 +88,27 @@ function fmtJST(v: TimeLike): string {
   return d ? d.toLocaleString("ja-JP", { timeZone: "Asia/Tokyo" }) : "Invalid Date";
 }
 
-function pct(v?: number | null, digits = 1) {
-  return v != null ? `${(v * 100).toFixed(digits)}%` : "—";
+// ▼ ここを置換
+function fmtPctSmart(v?: number | null, digits = 1) {
+  if (v == null) return "—";
+  const abs = Math.abs(v);
+  // 1以下なら比率(0.0123=1.23%)、1超なら既に%値(1.23=1.23%)
+  const val = abs <= 1 ? v * 100 : v;
+  return `${val.toFixed(digits)}%`;
+}
+
+// 価格鮮度（分）
+const STALE_TTL_MIN = 10;
+function isStale(ts?: string | null, ttlMin = STALE_TTL_MIN) {
+  if (!ts) return true;
+  const ageMin = (Date.now() - new Date(ts).getTime()) / 60000;
+  return ageMin > ttlMin;
 }
 
 /* =========================
    Data fetchers (SSR)
    ========================= */
 const DAYS = 7; // ★ 7日固定
-
-async function fetchKpis(symbol?: string): Promise<Kpis> {
-  const base = apiBase();
-  const url = new URL(`${base}/public/metrics`);
-  url.searchParams.set("days", String(DAYS));
-  if (symbol) url.searchParams.set("symbol", symbol);
-  const res = await fetch(url.toString(), { cache: "no-store" });
-  if (!res.ok) {
-    return { win_rate: null, avg_pnl_pct: null, total_trades: null, recent_signal_count: null };
-  }
-  return res.json();
-}
 
 async function fetchDaily(symbol?: string): Promise<Daily[]> {
   const base = apiBase();
@@ -128,6 +134,16 @@ async function fetchOpenPositions(symbol?: string): Promise<Position[]> {
   return res.json();
 }
 
+async function fetchKPI(symbol?: string): Promise<KPI | null> {
+  const base = apiBase();
+  const url = new URL(`${base}/public/kpi/7days`);
+  if (symbol) url.searchParams.set("symbol", symbol);
+  const res = await fetch(url.toString(), { cache: "no-store" });
+  if (!res.ok) return null;
+  return res.json();
+}
+
+
 /* =========================
    Page (SSR)
    ========================= */
@@ -146,8 +162,8 @@ export default async function Page({
       ? sp?.symbol[0]
       : undefined;
 
-  const [kpis, daily, positions] = await Promise.all([
-    fetchKpis(symbol),
+  const [kpi, daily, positions] = await Promise.all([
+    fetchKPI(symbol),
     fetchDaily(symbol),
     fetchOpenPositions(symbol),
   ]);
@@ -161,11 +177,12 @@ export default async function Page({
 
       {/* 1. KPI（7日固定） */}
       <Section title={`KPI（直近 ${DAYS} 日）`}>
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
-          <KpiCard label="Win Rate" value={pct(kpis.win_rate, 1)} hint="直近期間の勝率" />
-          <KpiCard label="Avg PnL%" value={kpis.avg_pnl_pct != null ? `${(kpis.avg_pnl_pct * 100).toFixed(2)}%` : "—"} hint="日次平均（単純）" />
-          <KpiCard label="Total Trades" value={kpis.total_trades ?? "—"} hint="直近期間の総トレード数" />
-          <KpiCard label="Positions (Open)" value={positions.length} hint="現在の保有数" />
+        <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
+          <KpiCard title="Trades (7d)" value={kpi?.trade_count ?? "—"} />
+          <KpiCard title="Win Rate (7d)" value={fmtPctSmart(kpi?.win_rate)} />
+          <KpiCard title="Total PnL (7d)" value={kpi?.total_pnl != null ? kpi.total_pnl.toFixed(2) : "—"} />
+          <KpiCard title="Avg PnL% (7d)" value={fmtPctSmart(kpi?.avg_pnl_pct)} />
+          <KpiCard title="Avg Holding Hours (7d)" value={kpi?.avg_holding_hours != null ? kpi.avg_holding_hours.toFixed(1) : "—"} />
         </div>
       </Section>
 
@@ -209,17 +226,39 @@ export default async function Page({
                 {/* 2段目：サイズ・建値 */}
                 <div className="mt-3 text-sm">
                   <div>size: <b>{p.size}</b></div>
-                  <div>entry: <b>{p.entry_price}</b></div>
+                  <div>entry: <b>{p.entry_price?.toLocaleString?.('ja-JP') ?? p.entry_price ?? '—'}</b></div>
                 </div>
 
-                {/* 3段目：エントリー時刻・含み損益 */}
-                <div className="mt-2 text-xs text-gray-500">Entry Time: {fmtJST(p.entry_time)}</div>
+                {/* 3段目：エントリー時刻 */}
+                <div className="mt-2 text-xs text-gray-500">
+                  Entry Time: {fmtJST(p.entry_time)}
+                </div>
+
+                {/* 価格 + 鮮度バッジ */}
+                <div className="mt-1 text-xs">
+                  Price: {p.current_price != null ? p.current_price.toLocaleString('ja-JP') : '—'}
+                  {isStale(p.price_ts) && (
+                    <span className="ml-2 rounded px-1.5 py-0.5 text-[10px] bg-yellow-100 text-yellow-800 dark:bg-yellow-900/40 dark:text-yellow-300">
+                      stale
+                    </span>
+                  )}
+                </div>
+
+                {/* 含み損益％（色分け） */}
                 <div className="mt-1 text-base font-semibold">
-                  <span className="text-sm">
-                    PnL%:{' '}
-                    {p.unrealized_pnl_pct == null
-                    ? '—'
-                    : `${p.unrealized_pnl_pct.toFixed(2)}%`}
+                  <span
+                    className={
+                      "text-sm " +
+                      (p.unrealized_pnl_pct == null
+                        ? "text-gray-500"
+                        : p.unrealized_pnl_pct > 0
+                          ? "text-emerald-600 dark:text-emerald-400"
+                          : p.unrealized_pnl_pct < 0
+                            ? "text-rose-600 dark:text-rose-400"
+                            : "text-gray-500")
+                    }
+                  >
+                    PnL%: {p.unrealized_pnl_pct == null ? '—' : `${p.unrealized_pnl_pct.toFixed(2)}%`}
                   </span>
                 </div>
               </article>
@@ -252,17 +291,17 @@ export default async function Page({
    Local UI mini components
    ========================= */
 function KpiCard({
-  label,
+  title,
   value,
   hint,
 }: {
-  label: string;
+  title: string;
   value: string | number | null;
   hint?: string;
 }) {
   return (
     <div className="rounded-2xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 p-4 shadow-sm">
-      <div className="text-xs text-gray-500">{label}</div>
+      <div className="text-xs text-gray-500">{title}</div>
       <div className="mt-1 text-2xl font-bold">{value ?? "—"}</div>
       {hint && <div className="mt-1 text-xs text-gray-500">{hint}</div>}
     </div>

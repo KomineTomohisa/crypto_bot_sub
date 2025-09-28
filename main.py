@@ -199,8 +199,12 @@ OPEN_WITH_PRICE_SQL = sa.text("""
       p.size,
       p.avg_entry_price AS entry_price,
       p.opened_at::timestamptz AS entry_time,
-      pc.last AS current_price,
       CASE
+        WHEN pc.ts >= NOW() - INTERVAL '10 minutes' THEN pc.last
+        ELSE NULL
+      END AS current_price,
+      CASE
+        WHEN pc.ts < NOW() - INTERVAL '10 minutes' THEN NULL
         WHEN pc.last IS NULL OR p.avg_entry_price IS NULL OR p.size = 0 THEN NULL
         WHEN lower(p.side) = 'long'  THEN (pc.last / NULLIF(p.avg_entry_price,0) - 1) * 100
         WHEN lower(p.side) = 'short' THEN (NULLIF(p.avg_entry_price,0) / pc.last - 1) * 100
@@ -209,13 +213,13 @@ OPEN_WITH_PRICE_SQL = sa.text("""
       pc.ts AS price_ts
     FROM positions p
     LEFT JOIN price_cache pc
-      ON lower(pc.symbol) = lower(p.symbol)
+      ON lower(btrim(pc.symbol)) = lower(btrim(p.symbol))
     WHERE
-      -- オープン判定：tradesにクローズ記録がない（またはサイズ≠0）
       COALESCE(p.size, 0) <> 0
       AND NOT EXISTS (
         SELECT 1 FROM trades t
         WHERE t.entry_position_id = p.position_id
+          AND (t.closed_at IS NOT NULL OR t.exit_price IS NOT NULL)
       )
       AND (:symbol IS NULL OR lower(p.symbol) = lower(:symbol))
       AND p.opened_at >= (NOW() AT TIME ZONE 'UTC') - INTERVAL '3 days'
@@ -223,6 +227,18 @@ OPEN_WITH_PRICE_SQL = sa.text("""
 """).bindparams(
     sa.bindparam("symbol", type_=sa.String)
 )
+
+OPEN_KPI_SQL = sa.text("""
+    SELECT
+      COUNT(*)::int AS trade_count,
+      SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END)::int AS win_count,
+      SUM(pnl)::numeric AS total_pnl,
+      AVG(pnl_pct)::numeric AS avg_pnl_pct,
+      AVG(holding_hours)::numeric AS avg_holding_hours
+    FROM trades
+    WHERE closed_at >= NOW() - INTERVAL '7 days'
+      AND (:symbol IS NULL OR lower(symbol) = lower(:symbol))
+""")
 
 @app.get("/public/metrics", response_model=PublicMetricsOut)
 def get_public_metrics():
@@ -558,3 +574,45 @@ def get_open_positions_with_price(symbol: str | None = Query(None)):
         }
         for r in rows
     ]
+
+@app.get("/public/kpi/7days")
+def get_kpi_7days(symbol: str | None = Query(None)):
+    try:
+        with engine.begin() as conn:
+            row = conn.execute(OPEN_KPI_SQL, {"symbol": symbol}).mappings().first()
+    except Exception as e:
+        logger.exception("GET /public/kpi/7days failed")
+        raise HTTPException(status_code=500, detail=f"kpi query failed: {e}")
+
+    if not row:
+        return {}
+
+    def _f(v): return float(v) if v is not None else None
+
+    return {
+        "trade_count": row["trade_count"],
+        "win_count": row["win_count"],
+        "win_rate": (row["win_count"] / row["trade_count"] * 100.0) if row["trade_count"] else None,
+        "total_pnl": _f(row["total_pnl"]),
+        "avg_pnl_pct": _f(row["avg_pnl_pct"]),
+        "avg_holding_hours": _f(row["avg_holding_hours"]),
+    }
+
+@app.get("/healthz")
+def healthz():
+    try:
+        with engine.begin() as conn:
+            # DB生存 & 価格キャッシュの鮮度を軽く確認
+            pong = conn.execute(sa.text("SELECT 1")).scalar_one()
+            fresh_cnt = conn.execute(sa.text("""
+                SELECT COUNT(*) FROM price_cache WHERE ts >= NOW() - INTERVAL '10 minutes'
+            """)).scalar_one()
+            return {
+                "ok": True,
+                "db": pong == 1,
+                "price_cache_fresh_count": int(fresh_cnt),
+                "ttl_minutes": 10
+            }
+    except Exception as e:
+        logger.exception("healthz failed")
+        raise HTTPException(status_code=500, detail=f"healthz error: {e}")
