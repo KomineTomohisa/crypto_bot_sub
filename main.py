@@ -12,6 +12,10 @@ import io, csv
 import json
 from fastapi.responses import JSONResponse
 from app.routers import public_performance
+from typing import Optional
+import logging
+
+logger = logging.getLogger("uvicorn.error")
 
 JST = timezone(timedelta(hours=9))
 
@@ -161,6 +165,31 @@ ORDER BY 1 ASC
 """).bindparams(
     sa.bindparam("days", type_=sa.Integer)
 )
+
+OPEN_POSITIONS_SQL = sa.text("""
+    SELECT
+      p.position_id,
+      p.symbol,
+      p.side,
+      p.size,
+      p.avg_entry_price AS entry_price,
+      p.opened_at::timestamptz AS entry_time
+    FROM positions p
+    WHERE
+      -- オープン判定：size が 0 でない & side が LONG/SHORT
+      COALESCE(p.size, 0) <> 0
+      AND lower(p.side) IN ('long', 'short')
+      -- trades にクローズ済みレコードが無いものだけ
+      AND NOT EXISTS (
+        SELECT 1 FROM trades t
+        WHERE t.entry_position_id = p.position_id
+          AND (t.closed_at IS NOT NULL OR t.exit_price IS NOT NULL)
+      )
+      -- ★ 直近3日以内にオープンしたものだけ
+      AND p.opened_at >= NOW() - INTERVAL '3 days'
+      AND (:symbol IS NULL OR lower(p.symbol) = lower(:symbol))
+    ORDER BY p.opened_at DESC
+""")
 
 @app.get("/public/metrics", response_model=PublicMetricsOut)
 def get_public_metrics():
@@ -453,3 +482,26 @@ def get_symbols(days: int = Query(90, ge=1, le=365)):
     with engine.begin() as conn:
         rows = conn.execute(SYMBOLS_SQL, {"days": days}).mappings().all()
     return JSONResponse([r["symbol"] for r in rows])
+
+@app.get("/public/positions/open")
+def get_open_positions(symbol: Optional[str] = Query(None, description="例: btc_jpy")):
+    try:
+        with engine.begin() as conn:  # ← あなたのプロジェクトの engine に合わせてください
+            rows = conn.execute(OPEN_POSITIONS_SQL, {"symbol": symbol}).mappings().all()
+    except Exception as e:
+        logger.exception("GET /public/positions/open failed")
+        raise HTTPException(status_code=500, detail=f"positions query failed: {e}")
+
+    # JSON 整形（Decimal/datetime対策）
+    result = []
+    for r in rows:
+        t = r.get("entry_time")
+        result.append({
+            "position_id": r.get("position_id"),
+            "symbol": r.get("symbol"),
+            "side": r.get("side"),
+            "size": float(r["size"]) if r.get("size") is not None else None,
+            "entry_price": float(r["entry_price"]) if r.get("entry_price") is not None else None,
+            "entry_time": t.isoformat() if hasattr(t, "isoformat") else t,  # 例: 2025-09-26T00:30:13.578+09:00
+        })
+    return result
