@@ -33,6 +33,7 @@ from db import get_line_user_id, get_line_user_ids_for_users  # 既に追加済�
 from db import get_trades_between
 from db import insert_signal
 from db import update_signal_status
+from db import upsert_price_cache
 from notifiers.line_messaging import LineMessaging
 from notifications.message_templates import compose_exit_message, ExitPerf
 from notifications.message_templates import compose_signal_message, IndicatorSnapshot, SignalContext
@@ -122,6 +123,30 @@ def row_to_report_trade(row):
         "entry_price": row.get("entry_price"),
         "holding_hours": row.get("holding_hours"),
     }
+
+class PriceCacheRefresher:
+    def __init__(self, symbols, get_price_fn, interval_sec=30, logger=None):
+        self.symbols = symbols
+        self.get_price = get_price_fn
+        self.interval = interval_sec
+        self.logger = logger
+
+    def run_forever(self):
+        import time
+        while True:
+            start = time.time()
+            for sym in self.symbols:
+                try:
+                    px = self.get_price(sym)
+                    if px and px > 0:
+                        upsert_price_cache(sym.lower(), px, datetime.now(timezone.utc))
+                        if self.logger:
+                            self.logger.debug(f"[price_cache] {sym} = {px}")
+                except Exception as e:
+                    if self.logger:
+                        self.logger.warning(f"[price_cache] {sym} failed: {e}")
+            elapsed = time.time() - start
+            time.sleep(max(0, self.interval - elapsed))
 
 class GMOCoinAPI:
     """GMOコインの信用取引APIラッパー"""
@@ -6284,4 +6309,22 @@ if __name__ == "__main__":
         bot.backtest(days_to_test=args.days)
     elif args.mode == "live":
         print("リアルタイムトレードモードを開始します...")
+
+        from threading import Thread
+        refresher = PriceCacheRefresher(
+            bot.symbols,
+            bot.get_current_price,
+            interval_sec=30,
+            logger=bot.logger
+        )
+        Thread(target=refresher.run_forever, daemon=True).start()
         bot.run_live()  
+
+    if args.mode == "live":
+        from threading import Thread
+        refresher = PriceCacheRefresher(bot.symbols, bot.get_current_price, interval_sec=30, logger=bot.logger)
+        Thread(target=refresher.run_forever, daemon=True).start()
+        bot.run_live()
+
+    elif args.mode == "backtest":
+        bot.run_backtest(days=args.days)

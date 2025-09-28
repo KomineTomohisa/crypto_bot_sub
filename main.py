@@ -191,6 +191,39 @@ OPEN_POSITIONS_SQL = sa.text("""
     ORDER BY p.opened_at DESC
 """)
 
+OPEN_WITH_PRICE_SQL = sa.text("""
+    SELECT
+      p.position_id,
+      p.symbol,
+      p.side,
+      p.size,
+      p.avg_entry_price AS entry_price,
+      p.opened_at::timestamptz AS entry_time,
+      pc.last AS current_price,
+      CASE
+        WHEN pc.last IS NULL OR p.avg_entry_price IS NULL OR p.size = 0 THEN NULL
+        WHEN lower(p.side) = 'long'  THEN (pc.last / NULLIF(p.avg_entry_price,0) - 1) * 100
+        WHEN lower(p.side) = 'short' THEN (NULLIF(p.avg_entry_price,0) / pc.last - 1) * 100
+        ELSE NULL
+      END AS unrealized_pnl_pct,
+      pc.ts AS price_ts
+    FROM positions p
+    LEFT JOIN price_cache pc
+      ON lower(pc.symbol) = lower(p.symbol)
+    WHERE
+      -- オープン判定：tradesにクローズ記録がない（またはサイズ≠0）
+      COALESCE(p.size, 0) <> 0
+      AND NOT EXISTS (
+        SELECT 1 FROM trades t
+        WHERE t.entry_position_id = p.position_id
+      )
+      AND (:symbol IS NULL OR lower(p.symbol) = lower(:symbol))
+      AND p.opened_at >= (NOW() AT TIME ZONE 'UTC') - INTERVAL '3 days'
+    ORDER BY p.opened_at DESC
+""").bindparams(
+    sa.bindparam("symbol", type_=sa.String)
+)
+
 @app.get("/public/metrics", response_model=PublicMetricsOut)
 def get_public_metrics():
     try:
@@ -505,3 +538,23 @@ def get_open_positions(symbol: Optional[str] = Query(None, description="例: btc
             "entry_time": t.isoformat() if hasattr(t, "isoformat") else t,  # 例: 2025-09-26T00:30:13.578+09:00
         })
     return result
+
+@app.get("/public/positions/open_with_price")
+def get_open_positions_with_price(symbol: str | None = Query(None)):
+    with engine.begin() as conn:
+        rows = conn.execute(OPEN_WITH_PRICE_SQL, {"symbol": symbol}).mappings().all()
+    # JSON化
+    return [
+        {
+            "position_id": r["position_id"],
+            "symbol": r["symbol"],
+            "side": r["side"],
+            "size": float(r["size"]) if r["size"] is not None else None,
+            "entry_price": float(r["entry_price"]) if r["entry_price"] is not None else None,
+            "entry_time": r["entry_time"].isoformat() if r["entry_time"] else None,
+            "current_price": float(r["current_price"]) if r["current_price"] is not None else None,
+            "unrealized_pnl_pct": float(r["unrealized_pnl_pct"]) if r["unrealized_pnl_pct"] is not None else None,
+            "price_ts": r["price_ts"].isoformat() if r["price_ts"] else None,
+        }
+        for r in rows
+    ]

@@ -24,13 +24,14 @@ type Daily = {
 };
 
 type Position = {
-  position_id?: string | number;
-  symbol: string;               // 例: btc_jpy
-  side: "LONG" | "SHORT";       // 保有方向
-  size: number;                 // ロット
-  entry_price: number;
-  entry_time?: TimeLike;        // 取得日時
-  unrealized_pnl_pct?: number | null; // 含み損益（%）0.0123形式を想定
+  position_id: number;
+  symbol: string;
+  side: 'LONG' | 'SHORT' | string;
+  size: number | null;
+  entry_price: number | null;
+  entry_time: string | null;
+  current_price?: number | null;           // 追加（APIと合わせる）
+  unrealized_pnl_pct?: number | null;      // 追加（APIと合わせる）
 };
 
 /* =========================
@@ -120,7 +121,7 @@ async function fetchDaily(symbol?: string): Promise<Daily[]> {
 /** 現在の保有ポジション一覧（未実装なら空配列でもOK） */
 async function fetchOpenPositions(symbol?: string): Promise<Position[]> {
   const base = apiBase();
-  const url = new URL(`${base}/public/positions/open`);
+  const url = new URL(`${base}/public/positions/open_with_price`);
   if (symbol) url.searchParams.set("symbol", symbol);
   const res = await fetch(url.toString(), { cache: "no-store" });
   if (!res.ok) return [];
@@ -214,7 +215,12 @@ export default async function Page({
                 {/* 3段目：エントリー時刻・含み損益 */}
                 <div className="mt-2 text-xs text-gray-500">Entry Time: {fmtJST(p.entry_time)}</div>
                 <div className="mt-1 text-base font-semibold">
-                  Unrealized PnL%: {p.unrealized_pnl_pct != null ? `${(p.unrealized_pnl_pct * 100).toFixed(2)}%` : "—"}
+                  <span className="text-sm">
+                    PnL%:{' '}
+                    {p.unrealized_pnl_pct == null
+                    ? '—'
+                    : `${p.unrealized_pnl_pct.toFixed(2)}%`}
+                  </span>
                 </div>
               </article>
             ))}
