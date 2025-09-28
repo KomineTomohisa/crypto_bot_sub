@@ -13,6 +13,7 @@ import { QuickFilters } from "@/components/ui/QuickFilters";
 import { TablePagination } from "@/components/ui/TablePagination";
 import SinceField from "./SinceField";
 import ExpandableText from "./ExpandableText";
+import { FilterCard } from "@/components/ui/FilterCard";
 
 type Sig = {
   signal_id?: number | string;
@@ -130,78 +131,80 @@ export default async function Page({
               </div>
 
               {/* --- 2段目: Symbol / Since / Limit / Apply / Reset --- */}
-              <form method="get" className="grid grid-cols-1 md:grid-cols-12 gap-3 md:items-end">
-                {/* 1列目：Symbol（3/12） */}
-                <div className="md:col-span-3">
-                  <label className="block text-sm text-gray-600 dark:text-gray-300">Symbol（任意）</label>
-                  <select
-                    name="symbol"
-                    defaultValue={symbol ?? ""}
-                    className="h-10 w-full border rounded-xl px-3 bg-white dark:bg-gray-900 border-gray-300 dark:border-gray-700"
-                  >
-                    <option value="">（全体）</option>
-                    {symbols.map((s) => (
-                      <option key={s} value={s}>{s}</option>
-                    ))}
-                  </select>
-                </div>
+              <FilterCard title="検索フィルタ" defaultOpen={false}>
+                <form method="get" className="grid grid-cols-1 md:grid-cols-12 gap-3 md:items-end">
+                  {/* Symbol（3/12） */}
+                  <div className="md:col-span-3">
+                    <label className="block text-sm text-gray-600 dark:text-gray-300">Symbol（任意）</label>
+                    <select
+                      name="symbol"
+                      defaultValue={symbol ?? ""}
+                      className="h-10 w-full border rounded-xl px-3 bg-white dark:bg-gray-900 border-gray-300 dark:border-gray-700"
+                    >
+                      <option value="">（全体）</option>
+                      {symbols.map((s) => (
+                        <option key={s} value={s}>{s}</option>
+                      ))}
+                    </select>
+                  </div>
 
-                {/* 2列目：Since（日付/時刻）（5/12） */}
-                <div className="md:col-span-5">
-                  <label className="block text-sm text-gray-600 dark:text-gray-300">
-                    Since（日付/時刻）
-                    <abbr title="入力はローカル時刻、送信時はISO(UTC)に変換されます" className="ml-1 cursor-help">ⓘ</abbr>
-                  </label>
-                  <SinceField
-                    defaultValueISO={since || defaultSince}
-                    withLabel={false}
-                    inputClassName="h-10"
-                  />
-                </div>
+                  {/* Since（5/12） */}
+                  <div className="md:col-span-5">
+                    <label className="block text-sm text-gray-600 dark:text-gray-300">
+                      Since（日付/時刻）
+                      <abbr title="入力はローカル時刻、送信時はISO(UTC)に変換されます" className="ml-1 cursor-help">ⓘ</abbr>
+                    </label>
+                    <SinceField
+                      defaultValueISO={since || defaultSince}
+                      withLabel={false}
+                      inputClassName="h-10"
+                    />
+                  </div>
 
-                {/* 3列目：Limit＆ボタン（4/12）→ 内側で 5 : 4 : 3 に再配分（ボタンを広げる） */}
-                <div className="md:col-span-4">
-                  <div className="grid grid-cols-12 gap-3 md:items-end">
-                    {/* Limit（4/12） */}
-                    <div className="col-span-6 sm:col-span-4">
-                      <label className="block text-sm text-gray-600 dark:text-gray-300">Limit</label>
-                      <input
-                        type="number"
-                        name="limit"
-                        min={1}
-                        max={200}
-                        defaultValue={limit || 50}
-                        className="h-10 w-full border rounded-xl px-3 bg-white dark:bg-gray-900 border-gray-300 dark:border-gray-700"
-                      />
-                    </div>
+                  {/* Limit＆ボタン（4/12） */}
+                  <div className="md:col-span-4">
+                    <div className="grid grid-cols-12 gap-3 md:items-end">
+                      {/* Limit（4/12） */}
+                      <div className="col-span-6 sm:col-span-4">
+                        <label className="block text-sm text-gray-600 dark:text-gray-300">Limit</label>
+                        <input
+                          type="number"
+                          name="limit"
+                          min={1}
+                          max={200}
+                          defaultValue={limit || 50}
+                          className="h-10 w-full border rounded-xl px-3 bg-white dark:bg-gray-900 border-gray-300 dark:border-gray-700"
+                        />
+                      </div>
 
-                    {/* Apply（4/12） ← 変更なし */}
-                    <div className="col-span-6 sm:col-span-4 flex">
-                      <button
-                        className="h-10 w-full rounded-2xl shadow px-3 whitespace-nowrap text-sm shrink-0
-                                  bg-gray-900 text-white dark:bg-white dark:text-gray-900"
-                        title="フィルタを適用"
-                      >
-                        <span className="md:inline hidden">Apply</span>
-                        <span className="md:hidden inline">OK</span>
-                      </button>
-                    </div>
+                      {/* Apply（4/12） */}
+                      <div className="col-span-6 sm:col-span-4 flex">
+                        <button
+                          className="h-10 w-full rounded-2xl shadow px-3 whitespace-nowrap text-sm shrink-0
+                                    bg-gray-900 text-white dark:bg-white dark:text-gray-900"
+                          title="フィルタを適用"
+                        >
+                          <span className="md:inline hidden">Apply</span>
+                          <span className="md:hidden inline">OK</span>
+                        </button>
+                      </div>
 
-                    {/* Reset（4/12） ← ここを 3 → 4 に */}
-                    <div className="col-span-12 sm:col-span-4 flex">
-                      <Link
-                        className="h-10 w-full text-center rounded-2xl border px-3 py-2 whitespace-nowrap text-sm shrink-0
-                                  border-gray-300 dark:border-gray-700 grid place-items-center"
-                        href={`/signals?${buildQS({ since: defaultSince })}`}
-                        title="フィルタをリセット（過去30日）"
-                      >
-                        <span className="md:inline hidden">Reset</span>
-                        <span className="md:hidden inline">CLR</span>
-                      </Link>
+                      {/* Reset（4/12） */}
+                      <div className="col-span-12 sm:col-span-4 flex">
+                        <Link
+                          className="h-10 w-full text-center rounded-2xl border px-3 py-2 whitespace-nowrap text-sm shrink-0
+                                    border-gray-300 dark:border-gray-700 grid place-items-center"
+                          href={`/signals?${buildQS({ since: defaultSince })}`}
+                          title="フィルタをリセット（過去30日）"
+                        >
+                          <span className="md:inline hidden">Reset</span>
+                          <span className="md:hidden inline">CLR</span>
+                        </Link>
+                      </div>
                     </div>
                   </div>
-                </div>
-              </form>
+                </form>
+              </FilterCard>
 
             </div>
           }

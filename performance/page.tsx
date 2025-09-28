@@ -10,6 +10,7 @@ import {
 } from "@/components/ui";
 import { Notes } from "@/components/ui/Notes";
 import { QuickFilters } from "@/components/ui/QuickFilters";
+import { FilterCard } from "@/components/ui/FilterCard";
 
 type Daily = {
   date: string;
@@ -108,55 +109,62 @@ export default async function Page({
               </div>
 
               {/* --- 2段目：Days / Symbol / Apply / Reset を横一列で展開 --- */}
-              <form method="get" className="grid grid-cols-1 md:grid-cols-12 gap-3 items-end">
-                {/* Days（2カラム） */}
-                <div className="md:col-span-2">
-                  <label className="block text-sm text-gray-600 dark:text-gray-300">Days</label>
-                  <input
-                    name="days"
-                    type="number"
-                    min={7}
-                    max={365}
-                    defaultValue={days}
-                    className="w-full border rounded-xl px-3 py-2 bg-white dark:bg-gray-900 border-gray-300 dark:border-gray-700"
-                  />
-                </div>
+              <FilterCard title="検索フィルタ" defaultOpen={false}>
+                <form method="get" className="grid grid-cols-1 md:grid-cols-12 gap-3 items-end">
+                  {/* Days（2カラム） */}
+                  <div className="md:col-span-2">
+                    <label className="block text-sm text-gray-600 dark:text-gray-300">Days</label>
+                    <input
+                      name="days"
+                      type="number"
+                      min={7}
+                      max={365}
+                      defaultValue={days}
+                      className="w-full border rounded-xl px-3 py-2 bg-white dark:bg-gray-900 border-gray-300 dark:border-gray-700"
+                    />
+                  </div>
 
-                {/* Symbol（6カラム） */}
-                <div className="md:col-span-6">
-                  <label className="block text-sm text-gray-600 dark:text-gray-300">Symbol（任意）</label>
-                  <select
-                    name="symbol"
-                    defaultValue={symbol ?? ""}
-                    className="w-full border rounded-xl px-3 py-2 bg-white dark:bg-gray-900 border-gray-300 dark:border-gray-700"
-                  >
-                    <option value="">（全体）</option>
-                    {symbols.map((s) => (
-                      <option key={s} value={s}>
-                        {s}
-                      </option>
-                    ))}
-                  </select>
-                </div>
+                  {/* Symbol（6カラム） */}
+                  <div className="md:col-span-6">
+                    <label className="block text-sm text-gray-600 dark:text-gray-300">Symbol（任意）</label>
+                    <select
+                      name="symbol"
+                      defaultValue={symbol ?? ""}
+                      className="w-full border rounded-xl px-3 py-2 bg-white dark:bg-gray-900 border-gray-300 dark:border-gray-700"
+                    >
+                      <option value="">（全体）</option>
+                      {symbols.map((s) => (
+                        <option key={s} value={s}>{s}</option>
+                      ))}
+                    </select>
+                  </div>
 
-                {/* Apply（2カラム） */}
-                <div className="md:col-span-2 flex">
-                  <button className="w-full rounded-2xl shadow px-4 py-2 bg-gray-900 text-white dark:bg-white dark:text-gray-900">
-                    Apply
-                  </button>
-                </div>
+                  {/* Apply */}
+                  <div className="md:col-span-2 flex">
+                    <button
+                      className="w-full h-10 rounded-2xl shadow px-4 whitespace-nowrap text-sm
+                                bg-gray-900 text-white dark:bg-white dark:text-gray-900"
+                      title="フィルタを適用"
+                    >
+                      <span className="md:inline hidden">Apply</span>
+                      <span className="md:hidden inline">OK</span>
+                    </button>
+                  </div>
 
-                {/* Reset（2カラム） */}
-                <div className="md:col-span-2 flex">
-                  <Link
-                    className="w-full text-center rounded-2xl border px-4 py-2 border-gray-300 dark:border-gray-700"
-                    href="/performance?days=30"
-                    title="フィルタをクリア"
-                  >
-                    Reset
-                  </Link>
-                </div>
-              </form>
+                  {/* Reset */}
+                  <div className="md:col-span-2 flex">
+                    <Link
+                      className="w-full h-10 text-center rounded-2xl border px-4 py-2 whitespace-nowrap text-sm
+                                border-gray-300 dark:border-gray-700 grid place-items-center"
+                      href="/performance?days=30"
+                      title="フィルタをクリア"
+                    >
+                      <span className="md:inline hidden">Reset</span>
+                      <span className="md:hidden inline">CLR</span>
+                    </Link>
+                  </div>
+                </form>
+              </FilterCard>
             </div>
           }
           right={
