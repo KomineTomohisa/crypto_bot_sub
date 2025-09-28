@@ -10,6 +10,7 @@ import {
 } from "@/components/ui";
 import { Notes } from "@/components/ui/Notes";
 import { QuickFilters } from "@/components/ui/QuickFilters";
+import ExpandableText from "../signals/ExpandableText";
 
 type Daily = {
   date: string;
@@ -87,10 +88,13 @@ export default async function Page({
   searchParams?: Promise<Record<string, string | string[] | undefined>>;
 }) {
   const sp = searchParams ? await searchParams : undefined;
-  const days = Number(
+  const daysRaw =
     typeof sp?.days === "string" ? sp.days :
-    Array.isArray(sp?.days) ? sp?.days[0] : 30
-  );
+    Array.isArray(sp?.days) ? sp?.days[0] : "30";
+  const daysNum = Number(daysRaw);
+  const days = Number.isFinite(daysNum)
+    ? Math.min(365, Math.max(7, daysNum))
+    : 30;
   const symbol =
     typeof sp?.symbol === "string"
       ? sp.symbol
@@ -114,7 +118,7 @@ export default async function Page({
       : `${publicBase}/public/export/performance/daily.csv?days=${days}`;
 
     return (
-      <main className="p-6 md:p-8 max-w-6xl mx-auto space-y-8">
+      <main className="p-6 md:p-8 max-w-3xl mx-auto space-y-8">
         {/* ヘッダ */}
         <PageHeader
           title="透明性（パフォーマンス＆シグナル）"
@@ -198,7 +202,25 @@ export default async function Page({
             <ChartClient data={data} />
           ) : (
             <div className="h-32 grid place-items-center text-sm text-gray-500">
-              表示できるデータがありません（期間・シンボルを変更してお試しください）
+              <div className="text-center space-y-2">
+                <div>表示できるデータがありません。</div>
+                <div className="flex gap-2 justify-center">
+                  <Link
+                    className="rounded-2xl border px-3 py-1.5 border-gray-300 dark:border-gray-700"
+                    href={`/transparency?days=${Math.max(30, Math.min(90, days))}${symbol ? `&symbol=${encodeURIComponent(symbol)}` : ""}`}
+                  >
+                    期間を90日に広げる
+                  </Link>
+                  {symbol && (
+                    <Link
+                      className="rounded-2xl border px-3 py-1.5 border-gray-300 dark:border-gray-700"
+                      href={`/transparency?days=${days}`}
+                    >
+                      シンボル解除
+                    </Link>
+                  )}
+                </div>
+              </div>
             </div>
           )}
         </Section>
@@ -224,10 +246,20 @@ export default async function Page({
             <table className="min-w-full text-sm">
               <thead className="bg-gray-50 dark:bg-gray-800 text-gray-600 dark:text-gray-300">
                 <tr>
-                  <th scope="col" className="px-3 py-2 text-left">Date（JST）</th>
-                  <th scope="col" className="px-3 py-2 text-right">Trades</th>
-                  <th scope="col" className="px-3 py-2 text-right">Win Rate</th>
-                  <th scope="col" className="px-3 py-2 text-right">Avg PnL</th>
+                  <th scope="col" className="px-3 py-2 text-left">
+                    Date（JST）
+                  </th>
+                  <th scope="col" className="px-3 py-2 text-right">
+                    <abbr title="当日の全トレード件数">Trades</abbr>
+                  </th>
+                  <th scope="col" className="px-3 py-2 text-right">
+                    <abbr title="Winの定義: pnl > 0。Win Rate = wins / total_trades">
+                      Win Rate
+                    </abbr>
+                  </th>
+                  <th scope="col" className="px-3 py-2 text-right">
+                    <abbr title="当日の pnl_pct の単純平均（JST日単位）">Avg PnL</abbr>
+                  </th>
                 </tr>
               </thead>
               <tbody>
@@ -242,7 +274,25 @@ export default async function Page({
                 {data.length === 0 && (
                   <tr>
                     <td className="px-3 py-6 text-center text-gray-500" colSpan={4}>
-                      データがありません
+                      <div className="space-y-2">
+                        <div>データがありません。</div>
+                        <div className="flex gap-2 justify-center">
+                          <Link
+                            className="rounded-2xl border px-3 py-1.5 border-gray-300 dark:border-gray-700"
+                            href={`/transparency?days=${Math.max(30, Math.min(90, days))}${symbol ? `&symbol=${encodeURIComponent(symbol)}` : ""}`}
+                          >
+                            期間を90日に広げる
+                          </Link>
+                          {symbol && (
+                            <Link
+                              className="rounded-2xl border px-3 py-1.5 border-gray-300 dark:border-gray-700"
+                              href={`/transparency?days=${days}`}
+                            >
+                              シンボル解除
+                            </Link>
+                          )}
+                        </div>
+                      </div>
                     </td>
                   </tr>
                 )}
@@ -277,7 +327,7 @@ export default async function Page({
                     </time>
                   </div>
                   <div className="text-sm text-gray-700 dark:text-gray-200 mt-1">
-                    {s.reason ? s.reason : "—"}
+                    <ExpandableText text={s.reason} maxChars={160} />
                   </div>
                   {s.price != null && (
                     <div className="text-xs text-gray-500 mt-1">price: {s.price}</div>

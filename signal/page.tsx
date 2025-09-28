@@ -11,6 +11,8 @@ import {
 import { Notes } from "@/components/ui/Notes";
 import { QuickFilters } from "@/components/ui/QuickFilters";
 import { TablePagination } from "@/components/ui/TablePagination";
+import SinceField from "./SinceField";
+import ExpandableText from "./ExpandableText";
 
 type Sig = {
   signal_id?: number | string;
@@ -106,7 +108,7 @@ export default async function Page({
     })}`;
 
     return (
-      <main className="p-6 md:p-8 max-w-6xl mx-auto space-y-8">
+      <main className="p-6 md:p-8 max-w-3xl mx-auto space-y-8">
         {/* ヘッダ */}
         <PageHeader
           title="Signals（シグナル一覧）"
@@ -128,68 +130,79 @@ export default async function Page({
               </div>
 
               {/* --- 2段目: Symbol / Since / Limit / Apply / Reset --- */}
-              <form method="get" className="grid grid-cols-1 md:grid-cols-5 gap-3">
-                {/* Symbol */}
-                <div>
+              <form method="get" className="grid grid-cols-1 md:grid-cols-12 gap-3 md:items-end">
+                {/* 1列目：Symbol（3/12） */}
+                <div className="md:col-span-3">
                   <label className="block text-sm text-gray-600 dark:text-gray-300">Symbol（任意）</label>
                   <select
                     name="symbol"
                     defaultValue={symbol ?? ""}
-                    className="w-full border rounded-xl px-3 py-2 bg-white dark:bg-gray-900 border-gray-300 dark:border-gray-700"
+                    className="h-10 w-full border rounded-xl px-3 bg-white dark:bg-gray-900 border-gray-300 dark:border-gray-700"
                   >
                     <option value="">（全体）</option>
                     {symbols.map((s) => (
-                      <option key={s} value={s}>
-                        {s}
-                      </option>
+                      <option key={s} value={s}>{s}</option>
                     ))}
                   </select>
                 </div>
 
-                {/* Since */}
-                <div>
+                {/* 2列目：Since（日付/時刻）（5/12） */}
+                <div className="md:col-span-5">
                   <label className="block text-sm text-gray-600 dark:text-gray-300">
-                    Since（ISO / datetime-local 可）
+                    Since（日付/時刻）
+                    <abbr title="入力はローカル時刻、送信時はISO(UTC)に変換されます" className="ml-1 cursor-help">ⓘ</abbr>
                   </label>
-                  <input
-                    name="since"
-                    defaultValue={since}
-                    placeholder="2025-09-01T00:00:00Z"
-                    className="w-full border rounded-xl px-3 py-2 bg-white dark:bg-gray-900 border-gray-300 dark:border-gray-700"
+                  <SinceField
+                    defaultValueISO={since || defaultSince}
+                    withLabel={false}
+                    inputClassName="h-10"
                   />
                 </div>
 
-                {/* Limit */}
-                <div>
-                  <label className="block text-sm text-gray-600 dark:text-gray-300">Limit</label>
-                  <input
-                    type="number"
-                    name="limit"
-                    min={1}
-                    max={200}
-                    defaultValue={limit || 50}
-                    className="w-full border rounded-xl px-3 py-2 bg-white dark:bg-gray-900 border-gray-300 dark:border-gray-700"
-                  />
-                </div>
+                {/* 3列目：Limit＆ボタン（4/12）→ 内側で 5 : 4 : 3 に再配分（ボタンを広げる） */}
+                <div className="md:col-span-4">
+                  <div className="grid grid-cols-12 gap-3 md:items-end">
+                    {/* Limit（4/12） */}
+                    <div className="col-span-6 sm:col-span-4">
+                      <label className="block text-sm text-gray-600 dark:text-gray-300">Limit</label>
+                      <input
+                        type="number"
+                        name="limit"
+                        min={1}
+                        max={200}
+                        defaultValue={limit || 50}
+                        className="h-10 w-full border rounded-xl px-3 bg-white dark:bg-gray-900 border-gray-300 dark:border-gray-700"
+                      />
+                    </div>
 
-                {/* Apply */}
-                <div className="flex flex-col justify-end">
-                  <button className="w-full rounded-2xl shadow px-4 py-2 bg-gray-900 text-white dark:bg-white dark:text-gray-900">
-                    Apply
-                  </button>
-                </div>
+                    {/* Apply（4/12） ← 変更なし */}
+                    <div className="col-span-6 sm:col-span-4 flex">
+                      <button
+                        className="h-10 w-full rounded-2xl shadow px-3 whitespace-nowrap text-sm shrink-0
+                                  bg-gray-900 text-white dark:bg-white dark:text-gray-900"
+                        title="フィルタを適用"
+                      >
+                        <span className="md:inline hidden">Apply</span>
+                        <span className="md:hidden inline">OK</span>
+                      </button>
+                    </div>
 
-                {/* Reset */}
-                <div className="flex flex-col justify-end">
-                  <Link
-                    className="w-full text-center rounded-2xl border px-4 py-2 border-gray-300 dark:border-gray-700"
-                    href={`/signals?${buildQS({ since: defaultSince })}`}
-                    title="フィルタをクリア（過去30日）"
-                  >
-                    Reset
-                  </Link>
+                    {/* Reset（4/12） ← ここを 3 → 4 に */}
+                    <div className="col-span-12 sm:col-span-4 flex">
+                      <Link
+                        className="h-10 w-full text-center rounded-2xl border px-3 py-2 whitespace-nowrap text-sm shrink-0
+                                  border-gray-300 dark:border-gray-700 grid place-items-center"
+                        href={`/signals?${buildQS({ since: defaultSince })}`}
+                        title="フィルタをリセット（過去30日）"
+                      >
+                        <span className="md:inline hidden">Reset</span>
+                        <span className="md:hidden inline">CLR</span>
+                      </Link>
+                    </div>
+                  </div>
                 </div>
               </form>
+
             </div>
           }
           right={
@@ -252,16 +265,32 @@ export default async function Page({
                     <td className="px-4 py-2 text-right">{fmt(r.price)}</td>
                     <td className="px-4 py-2 text-right">{num(r.strength_score, 2)}</td>
                     <td className="px-4 py-2 max-w-[480px]">
-                      <div className="truncate" title={r.reason ?? ""}>
-                        {r.reason ?? "—"}
-                      </div>
+                      <ExpandableText text={r.reason} maxChars={140} />
                     </td>
                   </tr>
                 ))}
                 {items.length === 0 && (
                   <tr>
                     <td className="px-4 py-6 text-center text-gray-500" colSpan={6}>
-                      データがありません（期間やシンボルを変更してお試しください）
+                      <div className="space-y-2">
+                        <div>データがありません。</div>
+                        <div className="flex gap-2 justify-center">
+                          <Link
+                            className="rounded-2xl border px-3 py-1.5 border-gray-300 dark:border-gray-700"
+                            href={`/signals?${buildQS({ symbol, since: new Date(Date.now() - 90*24*60*60*1000).toISOString(), page: 1, limit: meta.limit })}`}
+                          >
+                            期間を90日に広げる
+                          </Link>
+                          {symbol && (
+                            <Link
+                              className="rounded-2xl border px-3 py-1.5 border-gray-300 dark:border-gray-700"
+                              href={`/signals?${buildQS({ since: defaultSince, page: 1, limit: meta.limit })}`}
+                            >
+                              シンボル解除
+                            </Link>
+                          )}
+                        </div>
+                      </div>
                     </td>
                   </tr>
                 )}
