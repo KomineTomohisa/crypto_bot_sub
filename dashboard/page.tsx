@@ -174,17 +174,79 @@ export default async function Page({
         title="Dashboard"
         description={<>過去<b>{DAYS}日</b>のKPI、簡易チャート、現在の保有ポジションを表示します。</>}
       />
-
+      
       {/* 1. KPI（7日固定） */}
       <Section title={`KPI（直近 ${DAYS} 日）`}>
-        <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
-          <KpiCard title="Trades (7d)" value={kpi?.trade_count ?? "—"} />
-          <KpiCard title="Win Rate (7d)" value={fmtPctSmart(kpi?.win_rate)} />
-          <KpiCard title="Total PnL (7d)" value={kpi?.total_pnl != null ? kpi.total_pnl.toFixed(2) : "—"} />
-          <KpiCard title="Avg PnL% (7d)" value={fmtPctSmart(kpi?.avg_pnl_pct)} />
-          <KpiCard title="Avg Holding Hours (7d)" value={kpi?.avg_holding_hours != null ? kpi.avg_holding_hours.toFixed(1) : "—"} />
-        </div>
+        {(() => {
+          // スパークライン用の系列（欠損は0で埋め）
+          const seriesTrades = daily.map(d => d.total_trades ?? 0);
+          const seriesWinRate = daily.map(d => (d.win_rate ?? 0));       // 0.42 等（fmt側で%化）
+          const seriesAvgPnl = daily.map(d => (d.avg_pnl_pct ?? 0));      // 0.8 (=0.8%) または 0.8% の表現に対応
+
+          // Δ（初日→最終日）
+          const first = daily[0];
+          const last  = daily[daily.length - 1];
+
+          const deltaTrades   = (first && last) ? (last.total_trades - first.total_trades) : null;
+          const deltaWinRate  = (first && last && first.win_rate != null && last.win_rate != null)
+            ? (last.win_rate - first.win_rate) : null;
+          const deltaAvgPnl   = (first && last && first.avg_pnl_pct != null && last.avg_pnl_pct != null)
+            ? (last.avg_pnl_pct - first.avg_pnl_pct) : null;
+
+          return (
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+              <KpiCardPro
+                title="Trades (7d)"
+                value={kpi?.trade_count}
+                valueRender={(v) => (v ?? "—")}
+                series={seriesTrades}
+                delta={deltaTrades}
+                deltaUnit=""
+                hint="7日間の合計トレード数"
+              />
+              <KpiCardPro
+                title="Win Rate (7d)"
+                value={kpi?.win_rate}
+                valueRender={(v) => fmtPctSmart(v as number | null | undefined)}
+                series={seriesWinRate}
+                // win_rateは比率(0.42)を%に直すのでΔは「ポイント(pp)」
+                delta={deltaWinRate != null ? (Math.abs(deltaWinRate) <= 1 ? deltaWinRate * 100 : deltaWinRate) : null}
+                deltaUnit="pp"
+                hint="最終日と初日の差（ポイント）"
+              />
+              <KpiCardPro
+                title="Total PnL (7d)"
+                value={kpi?.total_pnl}
+                valueRender={(v) => (v != null ? (Number(v).toFixed(2)) : "—")}
+                series={seriesAvgPnl}
+                // 合計PnLのトレンドは日次Avg PnL%の傾向を補助的に表示
+                delta={deltaAvgPnl != null ? (Math.abs(deltaAvgPnl) <= 1 ? deltaAvgPnl * 100 : deltaAvgPnl) : null}
+                deltaUnit="pp"
+                hint="日次Avg PnL%の推移を補助的に表示"
+              />
+              <KpiCardPro
+                title="Avg PnL% (7d)"
+                value={kpi?.avg_pnl_pct}
+                valueRender={(v) => fmtPctSmart(v as number | null | undefined)}
+                series={seriesAvgPnl}
+                delta={deltaAvgPnl != null ? (Math.abs(deltaAvgPnl) <= 1 ? deltaAvgPnl * 100 : deltaAvgPnl) : null}
+                deltaUnit="pp"
+                hint="平均損益率（7日平均）と推移"
+              />
+              <KpiCardPro
+                title="Avg Holding Hours (7d)"
+                value={kpi?.avg_holding_hours}
+                valueRender={(v) => (v != null ? Number(v).toFixed(1) : "—")}
+                series={daily.map(() => 0)} // データがなければフラット
+                delta={null}
+                deltaUnit=""
+                hint="平均保有時間（時間）"
+              />
+            </div>
+          );
+        })()}
       </Section>
+
 
       {/* 2. パフォーマンス（簡易チャート、7日固定） */}
       <Section
@@ -290,23 +352,121 @@ export default async function Page({
 /* =========================
    Local UI mini components
    ========================= */
-function KpiCard({
+function Sparkline({
+  values,
+  className,
+  maxHeight = 36,
+}: {
+  values: number[];
+  className?: string;
+  maxHeight?: number;
+}) {
+  const w = 120;
+  const h = maxHeight;
+  const n = Math.max(values.length, 1);
+  const min = Math.min(...values, 0);
+  const max = Math.max(...values, 1);
+  const range = max - min || 1;
+
+  const points = values.map((v, i) => {
+    const x = (i / (n - 1 || 1)) * (w - 2) + 1;
+    const y = h - ((v - min) / range) * (h - 2) - 1;
+    return `${x},${y}`;
+  });
+
+  return (
+    <svg
+      className={className}
+      width={w}
+      height={h}
+      viewBox={`0 0 ${w} ${h}`}
+      aria-hidden="true"
+    >
+      <polyline
+        points={points.join(" ")}
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2"
+        className="text-gray-400 dark:text-gray-500"
+      />
+    </svg>
+  );
+}
+
+function DeltaBadge({
+  delta,
+  unit = "",
+}: {
+  delta: number | null;
+  unit?: string;
+}) {
+  if (delta == null || Number.isNaN(delta)) {
+    return <span className="text-xs text-gray-400">—</span>;
+  }
+  const sign = delta === 0 ? "" : delta > 0 ? "+" : "";
+  const positive = delta > 0;
+  const negative = delta < 0;
+  return (
+    <span
+      className={
+        "inline-flex items-center text-xs font-medium " +
+        (positive
+          ? "text-emerald-600 dark:text-emerald-400"
+          : negative
+            ? "text-rose-600 dark:text-rose-400"
+            : "text-gray-500")
+      }
+      aria-label={`delta ${delta}${unit}`}
+      title={`前後比較の差分：${delta}${unit}`}
+    >
+      {positive ? "▲" : negative ? "▼" : "■"} {sign}
+      {Math.abs(delta).toFixed(Math.abs(delta) < 1 ? 2 : 1)}
+      {unit}
+    </span>
+  );
+}
+
+function KpiCardPro<T>({
   title,
   value,
+  valueRender,
+  series,
+  delta,
+  deltaUnit,
   hint,
 }: {
   title: string;
-  value: string | number | null;
+  value: T | null | undefined;
+  valueRender: (v: T | null | undefined) => string | number;
+  series: number[];
+  delta: number | null;
+  deltaUnit: string;
   hint?: string;
 }) {
+  const rendered = valueRender(value);
   return (
     <div className="rounded-2xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 p-4 shadow-sm">
-      <div className="text-xs text-gray-500">{title}</div>
-      <div className="mt-1 text-2xl font-bold">{value ?? "—"}</div>
-      {hint && <div className="mt-1 text-xs text-gray-500">{hint}</div>}
+      <div className="flex items-start justify-between">
+        <div>
+          <div className="text-xs text-gray-500">{title}</div>
+          <div className="mt-1 text-2xl font-bold tabular-nums">{rendered}</div>
+        </div>
+        <DeltaBadge delta={delta} unit={deltaUnit} />
+      </div>
+
+      <div className="mt-3">
+        {series.length > 0 ? (
+          <Sparkline values={series} />
+        ) : (
+          <div className="h-9 rounded bg-gray-100 dark:bg-gray-800 animate-pulse" />
+        )}
+      </div>
+
+      {hint && <div className="mt-2 text-xs text-gray-500">{hint}</div>}
     </div>
   );
 }
+
 
 function ShortcutCard({ href, title, desc }: { href: string; title: string; desc: string }) {
   return (
