@@ -11,9 +11,15 @@ type TimeLike = string | number | Date | null | undefined;
 
 type Daily = {
   date: string;                 // JST日（YYYY-MM-DD）
-  win_rate?: number | null;
-  avg_pnl_pct?: number | null;
+  win_rate?: number | null;     // 0.42 など（%換算は表示側）
+  avg_pnl_pct?: number | null;  // その日の平均損益率（%換算は表示側）
   total_trades: number;
+
+  // 追加（あれば使う）：日次の平均保有時間（時間）
+  avg_holding_hours?: number | null;
+
+  // 追加（任意）：その日の総合PnL%（あるなら使う。無ければ avg_pnl_pct を近似使用）
+  total_pnl_pct?: number | null;
 };
 
 type Position = {
@@ -27,7 +33,7 @@ type Position = {
   // ↓ API /public/positions/open_with_price の追加フィールド
   current_price?: number | null;
   unrealized_pnl_pct?: number | null;
-  price_ts?: string | null;
+  price_ts?: string | number | null;
 };
 
 type KPI = {
@@ -39,25 +45,14 @@ type KPI = {
   avg_holding_hours: number | null;
 };
 
+type PositionWithPriceTS = Position & { price_ts?: string | number | null };
+
 /* =========================
    Helpers (no-any)
    ========================= */
 function apiBase() {
   const isServer = typeof window === "undefined";
   return isServer ? process.env.API_BASE_INTERNAL! : process.env.NEXT_PUBLIC_API_BASE!;
-}
-
-function normSide(side?: string) {
-  return (side ?? "").trim().toUpperCase();
-}
-
-function pillClassForSide(side?: string) {
-  const s = normSide(side);
-  if (s.includes("SHORT"))
-    return "bg-rose-100 text-rose-800 dark:bg-rose-900/30 dark:text-rose-300";
-  if (s.includes("LONG"))
-    return "bg-emerald-100 text-emerald-800 dark:bg-emerald-900/30 dark:text-emerald-300";
-  return "bg-gray-100 text-gray-800 dark:bg-gray-800 dark:text-gray-300";
 }
 
 function parseDateFlexible(v: TimeLike): Date | null {
@@ -83,11 +78,6 @@ function parseDateFlexible(v: TimeLike): Date | null {
   return null;
 }
 
-function fmtJST(v: TimeLike): string {
-  const d = parseDateFlexible(v);
-  return d ? d.toLocaleString("ja-JP", { timeZone: "Asia/Tokyo" }) : "Invalid Date";
-}
-
 // ▼ ここを置換
 function fmtPctSmart(v?: number | null, digits = 1) {
   if (v == null) return "—";
@@ -95,14 +85,6 @@ function fmtPctSmart(v?: number | null, digits = 1) {
   // 1以下なら比率(0.0123=1.23%)、1超なら既に%値(1.23=1.23%)
   const val = abs <= 1 ? v * 100 : v;
   return `${val.toFixed(digits)}%`;
-}
-
-// 価格鮮度（分）
-const STALE_TTL_MIN = 10;
-function isStale(ts?: string | null, ttlMin = STALE_TTL_MIN) {
-  if (!ts) return true;
-  const ageMin = (Date.now() - new Date(ts).getTime()) / 60000;
-  return ageMin > ttlMin;
 }
 
 /* =========================
@@ -143,6 +125,22 @@ async function fetchKPI(symbol?: string): Promise<KPI | null> {
   return res.json();
 }
 
+function fmtJST(v: TimeLike, time: boolean = true): string {
+  const d = parseDateFlexible(v);
+  if (!d) return "";
+  const optsDate: Intl.DateTimeFormatOptions = {
+    timeZone: "Asia/Tokyo",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  };
+  const optsTime: Intl.DateTimeFormatOptions = time
+    ? { hour: "2-digit", minute: "2-digit", hour12: false }
+    : {};
+  // 例: "2025/09/29 11:35" → "/" を "-" に
+  const s = new Intl.DateTimeFormat("ja-JP", { ...optsDate, ...optsTime }).format(d);
+  return s.replace(/\//g, "-");
+}
 
 /* =========================
    Page (SSR)
@@ -169,84 +167,191 @@ export default async function Page({
   ]);
 
   return (
-    <main className="p-6 md:p-8 max-w-6xl mx-auto space-y-8">
+    <main className="p-6 md:p-8 max-w-4xl mx-auto space-y-8">
       <PageHeader
         title="Dashboard"
         description={<>過去<b>{DAYS}日</b>のKPI、簡易チャート、現在の保有ポジションを表示します。</>}
       />
       
       {/* 1. KPI（7日固定） */}
-      <Section title={`KPI（直近 ${DAYS} 日）`}>
+      <Section
+        title="主要指標（直近7日間）"
+        headerRight={
+          (() => {
+            const latest = daily.at(-1)?.date;
+            // KPIの鮮度：当日JSTと一致していなければ stale
+            const jstNow = new Date().toLocaleDateString("ja-JP", { timeZone: "Asia/Tokyo" }).replaceAll("/", "-");
+            const stale = latest && latest !== jstNow;
+            return (
+              <div className="flex items-center gap-2 text-xs text-gray-500">
+                <span>最終更新: {latest ?? "—"} JST</span>
+                {stale && (
+                  <span className="ml-1 rounded px-1.5 py-0.5 bg-yellow-100 text-yellow-800 dark:bg-yellow-900/40 dark:text-yellow-300">
+                    stale
+                  </span>
+                )}
+              </div>
+            );
+          })()
+        }
+      >
         {(() => {
-          // スパークライン用の系列（欠損は0で埋め）
-          const seriesTrades = daily.map(d => d.total_trades ?? 0);
-          const seriesWinRate = daily.map(d => (d.win_rate ?? 0));       // 0.42 等（fmt側で%化）
-          const seriesAvgPnl = daily.map(d => (d.avg_pnl_pct ?? 0));      // 0.8 (=0.8%) または 0.8% の表現に対応
+          // ---------- 共通ユーティリティ ----------
+          const getLastTwo = (arr: Array<number | null | undefined>): [number | null, number | null] => {
+            const vals = arr.filter((v): v is number => typeof v === "number" && !Number.isNaN(v));
+            const n = vals.length;
+            return n >= 2 ? [vals[n - 2], vals[n - 1]] : [null, null];
+          };
+          // 0.42（比率）は%に直し、52 はそのまま扱う。差分も%で返す。
+          const toPctDelta = (a?: number | null, b?: number | null): number | null => {
+            if (a == null || b == null) return null;
+            const conv = (x: number) => Math.abs(x) <= 1 ? x * 100 : x; // 0.42 -> 42
+            return Number((conv(b) - conv(a)).toFixed(2));
+          };
 
-          // Δ（初日→最終日）
-          const first = daily[0];
-          const last  = daily[daily.length - 1];
+          // 7日分 日次系列
+          const seriesTrades   = daily.map(d => d.total_trades ?? 0);
+          const seriesWinRate  = daily.map(d => d.win_rate ?? null);
+          const seriesAvgPnl   = daily.map(d => d.avg_pnl_pct ?? null);
+          const seriesHoldH    = daily.map(d => d.avg_holding_hours ?? null);
 
-          const deltaTrades   = (first && last) ? (last.total_trades - first.total_trades) : null;
-          const deltaWinRate  = (first && last && first.win_rate != null && last.win_rate != null)
-            ? (last.win_rate - first.win_rate) : null;
-          const deltaAvgPnl   = (first && last && first.avg_pnl_pct != null && last.avg_pnl_pct != null)
-            ? (last.avg_pnl_pct - first.avg_pnl_pct) : null;
+          // 前日比（直近2点）
+          const [tPrev,  tLast ] = getLastTwo(daily.map(d => d.total_trades));
+          const [wrPrev, wrLast] = getLastTwo(seriesWinRate);
+          const [apPrev, apLast] = getLastTwo(seriesAvgPnl);
+          const [hhPrev, hhLast] = getLastTwo(seriesHoldH);
+
+          const deltaTrades   = (tPrev != null && tLast != null) ? (tLast - tPrev) : null;           // 件
+          const deltaWinRate  = toPctDelta(wrPrev, wrLast);                                           // %
+          const deltaAvgPnl   = toPctDelta(apPrev, apLast);                                           // %
+          const deltaHoldHour = (hhPrev != null && hhLast != null) ? Number((hhLast - hhPrev).toFixed(1)) : null; // h
+
+          // ---- Max Drawdown / Sharpe / Sortino （7日）----
+          // 7日分の日次リターン（%）を作る：total_pnl_pct があれば優先、無ければ avg_pnl_pct を使用
+          const dayReturnsPct = daily.map(d => {
+            const v = (d.total_pnl_pct ?? d.avg_pnl_pct);
+            if (v == null || Number.isNaN(Number(v))) return 0;
+            // 0.42 -> 42,  2.5 -> 2.5
+            return Math.abs(Number(v)) <= 1 ? Number(v) * 100 : Number(v);
+          });
+
+          // 累積曲線（%ベースの擬似エクイティ）を作成して MaxDD を算出
+          const equity = (() => {
+            let acc = 0;
+            return dayReturnsPct.map(r => (acc += r));
+          })();
+
+          const maxDrawdownPct = (() => {
+            let peak = -Infinity, maxDD = 0;
+            for (const x of equity) {
+              peak = Math.max(peak, x);
+              const dd = x - peak; // マイナス値
+              maxDD = Math.min(maxDD, dd);
+            }
+            return Number(maxDD.toFixed(2)); // 例: -12.34（%）
+          })();
+
+          const sharpeSortino = (() => {
+            const xs = dayReturnsPct;                 // 日次%（例: 1.2, -0.8, ...）
+            const n  = xs.length || 1;
+            const mean = xs.reduce((a, b) => a + b, 0) / n;
+            const std  = Math.sqrt(xs.reduce((s, v) => s + Math.pow(v - mean, 2), 0) / n) || 0;
+
+            const downside = xs.filter(v => v < 0);
+            const dMean = downside.length ? downside.reduce((a, b) => a + b, 0) / downside.length : 0;
+            const dStd  = downside.length
+              ? Math.sqrt(downside.reduce((s, v) => s + Math.pow(v - dMean, 2), 0) / downside.length)
+              : 0;
+
+            // 年率化（参考）：日次→年次換算。営業日換算なら√252でもOK
+            const ann = Math.sqrt(365);
+            const sharpe  = std  ? (mean / std) * ann : 0;
+            const sortino = dStd ? (mean / dStd) * ann : 0;
+
+            return { sharpe: Number(sharpe.toFixed(2)), sortino: Number(sortino.toFixed(2)) };
+          })();
 
           return (
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+              {/* 既存KPI（%表記に統一） */}
               <KpiCardPro
-                title="Trades (7d)"
+                title="取引回数"
                 value={kpi?.trade_count}
                 valueRender={(v) => (v ?? "—")}
-                series={seriesTrades}
+                series={seriesTrades.map(v => v ?? 0)}
                 delta={deltaTrades}
                 deltaUnit=""
                 hint="7日間の合計トレード数"
               />
               <KpiCardPro
-                title="Win Rate (7d)"
+                title="勝率"
                 value={kpi?.win_rate}
-                valueRender={(v) => fmtPctSmart(v as number | null | undefined)}
-                series={seriesWinRate}
-                // win_rateは比率(0.42)を%に直すのでΔは「ポイント(pp)」
-                delta={deltaWinRate != null ? (Math.abs(deltaWinRate) <= 1 ? deltaWinRate * 100 : deltaWinRate) : null}
-                deltaUnit="pp"
-                hint="最終日と初日の差（ポイント）"
+                valueRender={(v) => fmtPctSmart(v as number | null | undefined)}  // 0.42 -> 42.0%
+                series={seriesWinRate.map(v => (v ?? 0))}
+                delta={deltaWinRate}
+                deltaUnit="%"
+                hint="全取引に占める勝ちトレードの割合"
               />
               <KpiCardPro
-                title="Total PnL (7d)"
+                title="総損益"
                 value={kpi?.total_pnl}
-                valueRender={(v) => (v != null ? (Number(v).toFixed(2)) : "—")}
-                series={seriesAvgPnl}
-                // 合計PnLのトレンドは日次Avg PnL%の傾向を補助的に表示
-                delta={deltaAvgPnl != null ? (Math.abs(deltaAvgPnl) <= 1 ? deltaAvgPnl * 100 : deltaAvgPnl) : null}
-                deltaUnit="pp"
-                hint="日次Avg PnL%の推移を補助的に表示"
+                valueRender={(v) => (v != null ? Number(v).toFixed(2) : "—")}
+                series={seriesAvgPnl.map(v => (v ?? 0))}
+                delta={deltaAvgPnl}
+                deltaUnit="%"
+                hint="7日間の合計損益額"
               />
               <KpiCardPro
-                title="Avg PnL% (7d)"
+                title="平均損益率"
                 value={kpi?.avg_pnl_pct}
                 valueRender={(v) => fmtPctSmart(v as number | null | undefined)}
-                series={seriesAvgPnl}
-                delta={deltaAvgPnl != null ? (Math.abs(deltaAvgPnl) <= 1 ? deltaAvgPnl * 100 : deltaAvgPnl) : null}
-                deltaUnit="pp"
-                hint="平均損益率（7日平均）と推移"
+                series={seriesAvgPnl.map(v => (v ?? 0))}
+                delta={deltaAvgPnl}
+                deltaUnit="%"
+                hint="1トレードあたりの平均損益率"
               />
               <KpiCardPro
-                title="Avg Holding Hours (7d)"
+                title="平均保有時間"
                 value={kpi?.avg_holding_hours}
                 valueRender={(v) => (v != null ? Number(v).toFixed(1) : "—")}
-                series={daily.map(() => 0)} // データがなければフラット
+                series={seriesHoldH.map(v => (v ?? 0))}
+                delta={deltaHoldHour}
+                deltaUnit="h"
+                hint="1ポジションの平均保有時間"
+              />
+
+              {/* 追加KPI：MaxDD / Sharpe / Sortino（7日） */}
+              <KpiCardPro
+                title="最大ドローダウン"
+                value={maxDrawdownPct}
+                valueRender={(v) => (v != null ? `${Number(v).toFixed(2)}%` : "—")}
+                series={equity}                            // 疑似エクイティ曲線
                 delta={null}
                 deltaUnit=""
-                hint="平均保有時間（時間）"
+                hint="7日間での累積最大下落率"
+              />
+              <KpiCardPro
+                title="シャープレシオ"
+                value={sharpeSortino.sharpe}
+                valueRender={(v) => (v != null ? Number(v).toFixed(2) : "—")}
+                series={dayReturnsPct}
+                delta={null}
+                deltaUnit=""
+                hint="リスクあたりの収益性（年率換算）。1以上なら安定的に良好"
+              />
+              <KpiCardPro
+                title="ソルティノレシオ"
+                value={sharpeSortino.sortino}
+                valueRender={(v) => (v != null ? Number(v).toFixed(2) : "—")}
+                series={dayReturnsPct}
+                delta={null}
+                deltaUnit=""
+                hint="下方リスク限定のリスク調整リターン（年率換算）。1以上なら望ましい水準"
               />
             </div>
           );
         })()}
       </Section>
-
 
       {/* 2. パフォーマンス（簡易チャート、7日固定） */}
       <Section
@@ -265,65 +370,43 @@ export default async function Page({
       </Section>
 
       {/* 3. 現在の保有ポジション（最新シグナルの代替） */}
-      <Section title="現在の保有ポジション">
+      <Section
+        title="現在の保有ポジション"
+        headerRight={
+          (() => {
+            // positions の price_ts の最大（最新）を取得して時刻表示
+            const toDateMs = (v: string | number | null | undefined): number | null => {
+              const d = parseDateFlexible(v);
+              return d ? d.getTime() : null;
+            };
+            const times = positions
+              .map(p => toDateMs(p.price_ts))
+              .filter((t): t is number => typeof t === "number");
+            const latestMs = times.length ? Math.max(...times) : null;
+
+            const latestLabel = latestMs ? fmtJST(latestMs) : "—";
+            // しきい値：5分より古ければ stale
+            const stale = latestMs ? (Date.now() - latestMs) > 5 * 60 * 1000 : false;
+
+            return (
+              <div className="flex items-center gap-2 text-xs text-gray-500">
+                <span>更新: {latestLabel}</span>
+                {stale && (
+                  <span className="ml-1 rounded px-1.5 py-0.5 bg-yellow-100 text-yellow-800 dark:bg-yellow-900/40 dark:text-yellow-300">
+                    stale
+                  </span>
+                )}
+              </div>
+            );
+          })()
+        }
+      >
         {positions.length === 0 ? (
           <div className="text-sm text-gray-500">保有中のポジションはありません。</div>
         ) : (
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-            {positions.map((p) => (
-              <article
-                key={String(p.position_id ?? `${p.symbol}-${p.entry_time ?? ""}-${p.side}`)}
-                className="rounded-2xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 p-4 shadow-sm"
-              >
-                {/* 1段目：方向ピル＋シンボル */}
-                <div className="flex items-center justify-between">
-                  <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-semibold ${pillClassForSide(p.side)}`}>
-                    {normSide(p.side).includes("SHORT") ? "SHORT" : "LONG"}
-                  </span>
-                  <span className="inline-flex items-center rounded-full px-2 py-0.5 text-xs border border-gray-200 dark:border-gray-700">
-                    {p.symbol}
-                  </span>
-                </div>
-
-                {/* 2段目：サイズ・建値 */}
-                <div className="mt-3 text-sm">
-                  <div>size: <b>{p.size}</b></div>
-                  <div>entry: <b>{p.entry_price?.toLocaleString?.('ja-JP') ?? p.entry_price ?? '—'}</b></div>
-                </div>
-
-                {/* 3段目：エントリー時刻 */}
-                <div className="mt-2 text-xs text-gray-500">
-                  Entry Time: {fmtJST(p.entry_time)}
-                </div>
-
-                {/* 価格 + 鮮度バッジ */}
-                <div className="mt-1 text-xs">
-                  Price: {p.current_price != null ? p.current_price.toLocaleString('ja-JP') : '—'}
-                  {isStale(p.price_ts) && (
-                    <span className="ml-2 rounded px-1.5 py-0.5 text-[10px] bg-yellow-100 text-yellow-800 dark:bg-yellow-900/40 dark:text-yellow-300">
-                      stale
-                    </span>
-                  )}
-                </div>
-
-                {/* 含み損益％（色分け） */}
-                <div className="mt-1 text-base font-semibold">
-                  <span
-                    className={
-                      "text-sm " +
-                      (p.unrealized_pnl_pct == null
-                        ? "text-gray-500"
-                        : p.unrealized_pnl_pct > 0
-                          ? "text-emerald-600 dark:text-emerald-400"
-                          : p.unrealized_pnl_pct < 0
-                            ? "text-rose-600 dark:text-rose-400"
-                            : "text-gray-500")
-                    }
-                  >
-                    PnL%: {p.unrealized_pnl_pct == null ? '—' : `${p.unrealized_pnl_pct.toFixed(2)}%`}
-                  </span>
-                </div>
-              </article>
+          <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">
+            {positions.map((p, i) => (
+              <PositionCard key={`${p.symbol}-${i}`} p={p} />
             ))}
           </div>
         )}
@@ -478,5 +561,238 @@ function ShortcutCard({ href, title, desc }: { href: string; title: string; desc
       <div className="mt-1 text-sm text-gray-600 dark:text-gray-300">{desc}</div>
       <div className="mt-2 text-xs underline">開く →</div>
     </Link>
+  );
+}
+
+function isStaleTS(ts?: string | number | null, minutes = 5): boolean {
+  if (!ts) return false;
+  const t = typeof ts === "number" ? ts : Date.parse(ts);
+  if (Number.isNaN(t)) return false;
+  const now = Date.now();
+  return now - t > minutes * 60 * 1000;
+}
+
+function Pill({ children, tone = "default" }: { children: React.ReactNode; tone?: "green" | "red" | "default" }) {
+  const map: Record<string, string> = {
+    green: "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300",
+    red:   "bg-rose-100 text-rose-700 dark:bg-rose-900/30 dark:text-rose-300",
+    default: "bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300",
+  };
+  return (
+    <span className={`inline-flex items-center rounded px-2 py-0.5 text-[11px] font-medium ${map[tone]}`}>
+      {children}
+    </span>
+  );
+}
+
+/** PnL% を -10%〜+10% に収めてバー表示（外れ値は端でクリップ） */
+/** PnL% を可視化するメーター。デフォルトは ±10% スケール */
+function PnlMeter({ pct, range = 10 }: { pct: number | null | undefined; range?: number }) {
+  if (pct == null || Number.isNaN(Number(pct))) {
+    return (
+      <div className="mt-2">
+        <div className="h-2 rounded bg-gray-100 dark:bg-gray-800" />
+        <div className="mt-1 flex justify-between text-[10px] text-gray-500">
+          <span>-{range}%</span><span>0%</span><span>+{range}%</span>
+        </div>
+      </div>
+    );
+  }
+
+  const v = Number(pct);
+  const clipped = Math.abs(v) > range;
+  const clamped = Math.max(-range, Math.min(range, v));
+  const pos = ((clamped + range) / (2 * range)) * 100; // 0..100
+
+  return (
+    <div className="mt-2" aria-label={`PnL ${v.toFixed(2)}% （基準 ±${range}%）`}>
+      <div className="relative h-3 rounded bg-gray-100 dark:bg-gray-800 overflow-hidden">
+        {/* 中央線(0%) */}
+        <div className="absolute left-1/2 top-0 bottom-0 w-0.5 bg-gray-300/70 dark:bg-gray-700/70 -translate-x-1/2" />
+        {/* フィル（0% から現在値方向へ伸ばす） */}
+        <div
+          className={`absolute top-0 bottom-0 ${clamped >= 0 ? "bg-emerald-500/80" : "bg-rose-500/80"}`}
+          style={{
+            left: clamped >= 0 ? "50%" : `${pos}%`,
+            right: clamped >= 0 ? `${100 - pos}%` : "50%",
+          }}
+        />
+        {/* クリップ表示（端に到達した合図） */}
+        {clipped && (
+          <div
+            className="absolute top-1/2 -translate-y-1/2 text-[10px] px-1 py-0.5 rounded bg-black/50 text-white"
+            style={{ left: clamped >= 0 ? "calc(100% - 34px)" : "6px" }}
+            title="表示レンジ外（clipped）"
+          >
+            clipped
+          </div>
+        )}
+      </div>
+
+      {/* 目盛りと数値バッジ */}
+      <div className="mt-1 flex items-center justify-between text-[10px] text-gray-500">
+        <span>-{range}%</span>
+        <span>0%</span>
+        <span>+{range}%</span>
+      </div>
+
+      <div className="mt-1 text-right">
+        <span
+          className={[
+            "inline-block text-[11px] px-1.5 py-0.5 rounded",
+            clamped >= 0
+              ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300"
+              : "bg-rose-100 text-rose-700 dark:bg-rose-900/30 dark:text-rose-300",
+          ].join(" ")}
+        >
+          {v >= 0 ? "+" : ""}
+          {v.toFixed(2)}%
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function StatRow({
+  label,
+  value,
+  sub,
+  emphasize = false,
+  valueClassName = "",
+}: {
+  label: string;
+  value: React.ReactNode;
+  sub?: React.ReactNode;
+  emphasize?: boolean;
+  valueClassName?: string;
+}) {
+  return (
+    <div className="space-y-1">
+      <div className="text-xs text-gray-500">{label}</div>
+      <div
+        className={[
+          "tabular-nums break-words leading-tight",
+          emphasize ? "text-xl font-bold" : "text-base font-semibold",
+          valueClassName,
+        ].join(" ")}
+      >
+        {value}
+      </div>
+      {sub && <div className="text-xs text-gray-500">{sub}</div>}
+    </div>
+  );
+}
+
+function PositionCard({ p }: { p: PositionWithPriceTS }) {
+  const symbol = (p?.symbol ?? "").toString().toUpperCase();
+  const side   = (p?.side ?? "").toString().toUpperCase() as "LONG" | "SHORT" | string;
+  const size   = p?.size ?? null;
+  const entryPrice = p?.entry_price ?? null;
+  const entryTime  = p?.entry_time ?? null;
+  const curPrice   = p?.current_price ?? null;
+  const pnlPct     = typeof p?.unrealized_pnl_pct === "number" ? p.unrealized_pnl_pct : null;
+  const priceTS    = p?.price_ts ?? null;
+  const stale      = isStaleTS(priceTS, 5);
+
+  // 金額PnL（size × 価格差）
+  const pnlAbs: number | null = (() => {
+    if (size == null || entryPrice == null || curPrice == null) return null;
+    const diff = side === "SHORT" ? (entryPrice - curPrice) : (curPrice - entryPrice);
+    return diff * size;
+  })();
+
+  // 保有時間（h）
+  const holdH: string | null = (() => {
+    if (!entryTime) return null;
+    const d = new Date(entryTime);
+    if (Number.isNaN(d.getTime())) return null;
+    const h = (Date.now() - d.getTime()) / 3600000;
+    return h >= 0 ? h.toFixed(1) : null;
+  })();
+
+  const sideTone: "green" | "red" = side === "LONG" ? "green" : "red";
+  const pnlTone =
+    pnlPct == null ? "default"
+    : pnlPct >= 0   ? "green"
+    :                 "red";
+
+  return (
+    <article className="rounded-2xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 p-4 shadow-sm">
+      {/* ヘッダ */}
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex items-center gap-2 min-w-0">
+          <div className="text-sm font-semibold truncate">{symbol}</div>
+          <Pill tone={sideTone}>{side}</Pill>
+          {stale && <Pill>stale</Pill>}
+        </div>
+        {p?.position_id != null && (
+          <div className="text-[11px] text-gray-500 shrink-0">ID: {String(p.position_id)}</div>
+        )}
+      </div>
+
+      {/* 本体（すべて縦並び、行間ゆったり） */}
+      <div className="mt-4 space-y-4">
+        {/* 1) 現在価格 */}
+        <StatRow
+          label="現在価格"
+          value={
+            <span className="whitespace-nowrap">
+              {curPrice != null ? `￥${curPrice.toLocaleString("ja-JP")}` : "—"}
+            </span>
+          }
+          emphasize
+        />
+
+        {/* 2) 含み損益（額＋%） */}
+        <StatRow
+          label="含み損益"
+          value={
+            <span className={[
+              pnlTone === "green" ? "text-emerald-600" : pnlTone === "red" ? "text-rose-600" : "",
+              "whitespace-nowrap",
+            ].join(" ")}>
+              {pnlAbs == null ? "—" : pnlAbs.toLocaleString("ja-JP")}
+              <span className="ml-1 text-xs text-gray-500">
+                {pnlPct == null ? "" : `(${pnlPct.toFixed(2)}%)`}
+              </span>
+            </span>
+          }
+          sub={<PnlMeter pct={typeof pnlPct === "number" ? pnlPct : null} range={10} />}
+          emphasize
+        />
+
+        {/* 3) サイズ / エントリー */}
+        <StatRow
+          label="サイズ / エントリー"
+          value={
+            entryPrice != null && size != null ? (
+              <span className="break-words">
+                <span className="whitespace-nowrap">{size}</span>
+                <span className="mx-1">@</span>
+                <span className="whitespace-nowrap">{Number(entryPrice).toLocaleString("ja-JP")}</span>
+              </span>
+            ) : "—"
+          }
+        />
+
+        {/* 補足行（必要なら出す） */}
+        <div className="text-sm text-gray-600 dark:text-gray-300">
+          保有時間: <span className="font-semibold">{holdH ?? "—"} 時間</span>
+        </div>
+      </div>
+
+      {/* 詳細リンク */}
+      {p?.symbol && (
+        <div className="mt-3 text-right">
+          <Link
+            href={`/transparency?days=7&symbol=${encodeURIComponent(p.symbol)}`}
+            className="text-xs underline"
+            prefetch={false}
+          >
+            この銘柄の詳細 →
+          </Link>
+        </div>
+      )}
+    </article>
   );
 }
