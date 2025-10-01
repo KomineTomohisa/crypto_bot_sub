@@ -12,6 +12,10 @@ import io, csv
 import json
 from fastapi.responses import JSONResponse
 from app.routers import public_performance
+from typing import Optional
+import logging
+
+logger = logging.getLogger("uvicorn.error")
 
 JST = timezone(timedelta(hours=9))
 
@@ -161,6 +165,80 @@ ORDER BY 1 ASC
 """).bindparams(
     sa.bindparam("days", type_=sa.Integer)
 )
+
+OPEN_POSITIONS_SQL = sa.text("""
+    SELECT
+      p.position_id,
+      p.symbol,
+      p.side,
+      p.size,
+      p.avg_entry_price AS entry_price,
+      p.opened_at::timestamptz AS entry_time
+    FROM positions p
+    WHERE
+      -- オープン判定：size が 0 でない & side が LONG/SHORT
+      COALESCE(p.size, 0) <> 0
+      AND lower(p.side) IN ('long', 'short')
+      -- trades にクローズ済みレコードが無いものだけ
+      AND NOT EXISTS (
+        SELECT 1 FROM trades t
+        WHERE t.entry_position_id = p.position_id
+          AND (t.closed_at IS NOT NULL OR t.exit_price IS NOT NULL)
+      )
+      -- ★ 直近3日以内にオープンしたものだけ
+      AND p.opened_at >= NOW() - INTERVAL '3 days'
+      AND (:symbol IS NULL OR lower(p.symbol) = lower(:symbol))
+    ORDER BY p.opened_at DESC
+""")
+
+OPEN_WITH_PRICE_SQL = sa.text("""
+    SELECT
+      p.position_id,
+      p.symbol,
+      p.side,
+      p.size,
+      p.avg_entry_price AS entry_price,
+      p.opened_at::timestamptz AS entry_time,
+      CASE
+        WHEN pc.ts >= NOW() - INTERVAL '10 minutes' THEN pc.last
+        ELSE NULL
+      END AS current_price,
+      CASE
+        WHEN pc.ts < NOW() - INTERVAL '10 minutes' THEN NULL
+        WHEN pc.last IS NULL OR p.avg_entry_price IS NULL OR p.size = 0 THEN NULL
+        WHEN lower(p.side) = 'long'  THEN (pc.last / NULLIF(p.avg_entry_price,0) - 1) * 100
+        WHEN lower(p.side) = 'short' THEN (NULLIF(p.avg_entry_price,0) / pc.last - 1) * 100
+        ELSE NULL
+      END AS unrealized_pnl_pct,
+      pc.ts AS price_ts
+    FROM positions p
+    LEFT JOIN price_cache pc
+      ON lower(btrim(pc.symbol)) = lower(btrim(p.symbol))
+    WHERE
+      COALESCE(p.size, 0) <> 0
+      AND NOT EXISTS (
+        SELECT 1 FROM trades t
+        WHERE t.entry_position_id = p.position_id
+          AND (t.closed_at IS NOT NULL OR t.exit_price IS NOT NULL)
+      )
+      AND (:symbol IS NULL OR lower(p.symbol) = lower(:symbol))
+      AND p.opened_at >= (NOW() AT TIME ZONE 'UTC') - INTERVAL '3 days'
+    ORDER BY p.opened_at DESC
+""").bindparams(
+    sa.bindparam("symbol", type_=sa.String)
+)
+
+OPEN_KPI_SQL = sa.text("""
+    SELECT
+      COUNT(*)::int AS trade_count,
+      SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END)::int AS win_count,
+      SUM(pnl)::numeric AS total_pnl,
+      AVG(pnl_pct)::numeric AS avg_pnl_pct,
+      AVG(holding_hours)::numeric AS avg_holding_hours
+    FROM trades
+    WHERE closed_at >= NOW() - INTERVAL '7 days'
+      AND (:symbol IS NULL OR lower(symbol) = lower(:symbol))
+""")
 
 @app.get("/public/metrics", response_model=PublicMetricsOut)
 def get_public_metrics():
@@ -453,3 +531,88 @@ def get_symbols(days: int = Query(90, ge=1, le=365)):
     with engine.begin() as conn:
         rows = conn.execute(SYMBOLS_SQL, {"days": days}).mappings().all()
     return JSONResponse([r["symbol"] for r in rows])
+
+@app.get("/public/positions/open")
+def get_open_positions(symbol: Optional[str] = Query(None, description="例: btc_jpy")):
+    try:
+        with engine.begin() as conn:  # ← あなたのプロジェクトの engine に合わせてください
+            rows = conn.execute(OPEN_POSITIONS_SQL, {"symbol": symbol}).mappings().all()
+    except Exception as e:
+        logger.exception("GET /public/positions/open failed")
+        raise HTTPException(status_code=500, detail=f"positions query failed: {e}")
+
+    # JSON 整形（Decimal/datetime対策）
+    result = []
+    for r in rows:
+        t = r.get("entry_time")
+        result.append({
+            "position_id": r.get("position_id"),
+            "symbol": r.get("symbol"),
+            "side": r.get("side"),
+            "size": float(r["size"]) if r.get("size") is not None else None,
+            "entry_price": float(r["entry_price"]) if r.get("entry_price") is not None else None,
+            "entry_time": t.isoformat() if hasattr(t, "isoformat") else t,  # 例: 2025-09-26T00:30:13.578+09:00
+        })
+    return result
+
+@app.get("/public/positions/open_with_price")
+def get_open_positions_with_price(symbol: str | None = Query(None)):
+    with engine.begin() as conn:
+        rows = conn.execute(OPEN_WITH_PRICE_SQL, {"symbol": symbol}).mappings().all()
+    # JSON化
+    return [
+        {
+            "position_id": r["position_id"],
+            "symbol": r["symbol"],
+            "side": r["side"],
+            "size": float(r["size"]) if r["size"] is not None else None,
+            "entry_price": float(r["entry_price"]) if r["entry_price"] is not None else None,
+            "entry_time": r["entry_time"].isoformat() if r["entry_time"] else None,
+            "current_price": float(r["current_price"]) if r["current_price"] is not None else None,
+            "unrealized_pnl_pct": float(r["unrealized_pnl_pct"]) if r["unrealized_pnl_pct"] is not None else None,
+            "price_ts": r["price_ts"].isoformat() if r["price_ts"] else None,
+        }
+        for r in rows
+    ]
+
+@app.get("/public/kpi/7days")
+def get_kpi_7days(symbol: str | None = Query(None)):
+    try:
+        with engine.begin() as conn:
+            row = conn.execute(OPEN_KPI_SQL, {"symbol": symbol}).mappings().first()
+    except Exception as e:
+        logger.exception("GET /public/kpi/7days failed")
+        raise HTTPException(status_code=500, detail=f"kpi query failed: {e}")
+
+    if not row:
+        return {}
+
+    def _f(v): return float(v) if v is not None else None
+
+    return {
+        "trade_count": row["trade_count"],
+        "win_count": row["win_count"],
+        "win_rate": (row["win_count"] / row["trade_count"] * 100.0) if row["trade_count"] else None,
+        "total_pnl": _f(row["total_pnl"]),
+        "avg_pnl_pct": _f(row["avg_pnl_pct"]),
+        "avg_holding_hours": _f(row["avg_holding_hours"]),
+    }
+
+@app.get("/healthz")
+def healthz():
+    try:
+        with engine.begin() as conn:
+            # DB生存 & 価格キャッシュの鮮度を軽く確認
+            pong = conn.execute(sa.text("SELECT 1")).scalar_one()
+            fresh_cnt = conn.execute(sa.text("""
+                SELECT COUNT(*) FROM price_cache WHERE ts >= NOW() - INTERVAL '10 minutes'
+            """)).scalar_one()
+            return {
+                "ok": True,
+                "db": pong == 1,
+                "price_cache_fresh_count": int(fresh_cnt),
+                "ttl_minutes": 10
+            }
+    except Exception as e:
+        logger.exception("healthz failed")
+        raise HTTPException(status_code=500, detail=f"healthz error: {e}")

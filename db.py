@@ -715,3 +715,14 @@ def get_public_metrics_daily(start, end) -> List[Dict[str, Any]]:
     with engine.connect() as conn:
         rows = conn.execute(sql, {"start": start, "end": end}).mappings().all()
     return [dict(r) for r in rows]
+
+def upsert_price_cache(symbol: str, last: float, ts: datetime | None = None) -> None:
+    stmt = sa.text("""
+        INSERT INTO price_cache (symbol, last, ts)
+        VALUES (:symbol, :last, :ts)
+        ON CONFLICT (symbol) DO UPDATE
+        SET last = EXCLUDED.last,
+            ts   = EXCLUDED.ts
+    """)
+    with engine.begin() as conn:
+        conn.execute(stmt, {"symbol": symbol, "last": float(last), "ts": ts or utcnow()})
