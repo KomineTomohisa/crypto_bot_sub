@@ -11,7 +11,7 @@ from fastapi.responses import StreamingResponse
 import io, csv
 import json
 from fastapi.responses import JSONResponse
-from app.routers import public_performance, strategies, virtual
+from app.routers import public_performance, strategies, virtual, monitor
 from typing import Optional
 import logging
 
@@ -28,6 +28,7 @@ app = FastAPI(
 app.include_router(public_performance.router)
 app.include_router(strategies.router)
 app.include_router(virtual.router)
+app.include_router(monitor.router)
 
 # --- CORS（必要に応じて調整） ---
 app.add_middleware(
