@@ -34,9 +34,22 @@ from db import get_trades_between
 from db import insert_signal
 from db import update_signal_status
 from db import upsert_price_cache
-from notifiers.line_messaging import LineMessaging
-from notifications.message_templates import compose_exit_message, ExitPerf
-from notifications.message_templates import compose_signal_message, IndicatorSnapshot, SignalContext
+
+is_backtest_mode = "backtest" in sys.argv
+
+if not is_backtest_mode:
+    from notifiers.line_messaging import LineMessaging
+    from notifications.message_templates import compose_exit_message, ExitPerf
+    from notifications.message_templates import compose_signal_message, IndicatorSnapshot, SignalContext
+else:
+    class LineMessaging:
+        def send_text(self, *args, **kwargs): return True
+        def send_text_bulk(self, *args, **kwargs): return True
+    def compose_exit_message(*args, **kwargs): return "Exit message"
+    class ExitPerf: pass
+    def compose_signal_message(*args, **kwargs): return "Signal message"
+    class IndicatorSnapshot: pass
+    class SignalContext: pass
 try:
     from reports.daily_report import build_daily_report_message
 except ImportError:
