@@ -11,7 +11,7 @@ from fastapi.responses import StreamingResponse
 import io, csv
 import json
 from fastapi.responses import JSONResponse
-from app.routers import public_performance
+from app.routers import public_performance, strategies, virtual
 from typing import Optional
 import logging
 
@@ -26,13 +26,15 @@ app = FastAPI(
 )
 
 app.include_router(public_performance.router)
+app.include_router(strategies.router)
+app.include_router(virtual.router)
 
 # --- CORS（必要に応じて調整） ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://198-13-61-186.sslip.io"],  # ← 自サイトのみ許可
     allow_credentials=False,  # Cookie/SameSite 等を使わないなら False でOK
-    allow_methods=["GET", "OPTIONS"],  # OPTIONS も必須（プリフライト用）
+    allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],  # OPTIONS も必須（プリフライト用）
     allow_headers=["Content-Type", "Authorization"],  # 必要なヘッダだけ許可
 )
 

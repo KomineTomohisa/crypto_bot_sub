@@ -356,13 +356,27 @@ def upsert_fill(
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential_jitter(0.2, 1.5))
 def upsert_position(
-    position_id: str, symbol: str, side: str, size: float, avg_entry_price: float,
-    opened_at: Optional[datetime], updated_at: Optional[datetime], raw: Optional[Dict[str, Any]] = None,
-    conn: Optional[Connection] = None
+    position_id: str,
+    symbol: str,
+    side: str,
+    size: float,
+    avg_entry_price: float,
+    opened_at: Optional[datetime],
+    updated_at: Optional[datetime],
+    raw: Optional[Dict[str, Any]] = None,
+    strategy_id: Optional[str] = None,
+    *,
+    user_id: Optional[int] = None,
+    source: Optional[str] = None,
+    conn: Optional[Connection] = None,
 ) -> None:
     stmt = sa.text("""
-        INSERT INTO positions (position_id, symbol, side, size, avg_entry_price, opened_at, updated_at, raw)
-        VALUES (:position_id, :symbol, :side, :size, :avg_entry_price, :opened_at, :updated_at, :raw)
+        INSERT INTO positions (
+            position_id, user_id, symbol, side, size, avg_entry_price, opened_at, updated_at, raw, strategy_id, source
+        )
+        VALUES (
+            :position_id, :user_id, :symbol, :side, :size, :avg_entry_price, :opened_at, :updated_at, :raw, :strategy_id, :source
+        )
         ON CONFLICT (position_id) DO UPDATE
         SET symbol = EXCLUDED.symbol,
             side   = EXCLUDED.side,
@@ -370,39 +384,68 @@ def upsert_position(
             avg_entry_price = EXCLUDED.avg_entry_price,
             opened_at  = COALESCE(EXCLUDED.opened_at, positions.opened_at),
             updated_at = COALESCE(EXCLUDED.updated_at, EXCLUDED.opened_at, positions.updated_at),
-            raw = COALESCE(EXCLUDED.raw, positions.raw)
+            raw = COALESCE(EXCLUDED.raw, positions.raw),
+            strategy_id = COALESCE(positions.strategy_id, EXCLUDED.strategy_id),
+            user_id     = COALESCE(positions.user_id, EXCLUDED.user_id),
+            source      = COALESCE(positions.source, EXCLUDED.source)
     """)
-    params = dict(position_id=position_id, symbol=symbol, side=side, size=size,
-                  avg_entry_price=avg_entry_price, opened_at=opened_at,
-                  updated_at=updated_at or utcnow(), raw=_jsonable(raw))
+    params = dict(
+        position_id=position_id,
+        user_id=user_id,
+        symbol=symbol,
+        side=side,
+        size=size,
+        avg_entry_price=avg_entry_price,
+        opened_at=opened_at,
+        updated_at=updated_at or utcnow(),
+        raw=_jsonable(raw),
+        strategy_id=strategy_id,
+        source=source,
+     )
     _exec(stmt, params, conn)
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential_jitter(0.2, 1.5))
 def insert_trade(
-    trade_id: Optional[str], symbol: str, side: str,
-    entry_position_id: Optional[str], exit_order_id: Optional[str],
-    entry_price: float, exit_price: float, size: float,
-    pnl: float, pnl_pct: float, holding_hours: Optional[float],
-    closed_at: datetime, raw: Optional[Dict[str, Any]] = None,
-    conn: Optional[Connection] = None
+    trade_id: Optional[str],
+    symbol: str,
+    side: str,
+    entry_position_id: Optional[str],
+    exit_order_id: Optional[str],
+    entry_price: float,
+    exit_price: float,
+    size: float,
+    pnl: float,
+    pnl_pct: float,
+    holding_hours: Optional[float],
+    closed_at: datetime,
+    raw: Optional[Dict[str, Any]] = None,
+    strategy_id: Optional[str] = None,
+    *,
+    user_id: Optional[int] = None,
+    source: Optional[str] = None,
+    conn: Optional[Connection] = None,
 ) -> str:
     tid = trade_id or str(uuid4())
     stmt = sa.text("""
         INSERT INTO trades (
-            trade_id, symbol, side, entry_position_id, exit_order_id,
-            entry_price, exit_price, size, pnl, pnl_pct, holding_hours, closed_at, raw
+            trade_id, user_id, symbol, side, entry_position_id, exit_order_id,
+            entry_price, exit_price, size, pnl, pnl_pct, holding_hours, closed_at, raw, strategy_id, source
         )
         VALUES (
-            :trade_id, :symbol, :side, :entry_position_id, :exit_order_id,
-            :entry_price, :exit_price, :size, :pnl, :pnl_pct, :holding_hours, :closed_at, :raw
+            :trade_id, :user_id, :symbol, :side, :entry_position_id, :exit_order_id,
+            :entry_price, :exit_price, :size, :pnl, :pnl_pct, :holding_hours, :closed_at, :raw, :strategy_id, :source
         )
         ON CONFLICT (trade_id) DO NOTHING
     """)
-    params = dict(trade_id=tid, symbol=symbol, side=side,
-                  entry_position_id=entry_position_id, exit_order_id=exit_order_id,
-                  entry_price=entry_price, exit_price=exit_price, size=size,
-                  pnl=pnl, pnl_pct=pnl_pct, holding_hours=holding_hours,
-                  closed_at=closed_at, raw=_jsonable(raw))
+    params = dict(
+        trade_id=tid, user_id=user_id, symbol=symbol, side=side,
+        entry_position_id=entry_position_id, exit_order_id=exit_order_id,
+        entry_price=entry_price, exit_price=exit_price, size=size,
+        pnl=pnl, pnl_pct=pnl_pct, holding_hours=holding_hours,
+        closed_at=closed_at, raw=_jsonable(raw),
+        strategy_id=strategy_id,
+        source=source,
+    )
     _exec(stmt, params, conn)
     return tid
 
@@ -463,17 +506,18 @@ def insert_signal(
     version: Optional[str] = None,
     status: Optional[str] = "new",
     raw: Optional[Dict[str, Any]] = None,
+    source: Optional[str] = None,
 ) -> str:
     sid = signal_id or str(uuid4())
     stmt = sa.text("""
         INSERT INTO signals (
             signal_id, user_id, symbol, timeframe, side, strength_score,
             rsi, adx, atr, di_plus, di_minus, ema_fast, ema_slow, price,
-            generated_at, strategy_id, version, status, raw
+            generated_at, strategy_id, version, status, raw, source
         ) VALUES (
             :signal_id, :user_id, :symbol, :timeframe, :side, :strength_score,
             :rsi, :adx, :atr, :di_plus, :di_minus, :ema_fast, :ema_slow, :price,
-            :generated_at, :strategy_id, :version, :status, :raw
+            :generated_at, :strategy_id, :version, :status, :raw, :source
         )
         ON CONFLICT (signal_id) DO NOTHING
     """)
@@ -491,7 +535,8 @@ def insert_signal(
         generated_at=generated_at or datetime.now(timezone.utc),
         strategy_id=strategy_id, version=version,
         status=status,
-        raw=_jsonable(raw),   # ← 既存ヘルパを活用
+        raw=_jsonable(raw),
+        source=source,
     )
     with engine.begin() as conn:
         conn.execute(stmt, params)
