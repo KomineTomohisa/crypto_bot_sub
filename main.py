@@ -7,12 +7,10 @@ from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 import sqlalchemy as sa
 from db import engine
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 import io, csv
 import json
-from fastapi.responses import JSONResponse
 from app.routers import public_performance, strategies, virtual, monitor
-from typing import Optional
 import logging
 
 logger = logging.getLogger("uvicorn.error")
@@ -46,7 +44,6 @@ def _to_plain(x):
     if isinstance(x, (bool, int, float, str)):
         return x
     if isinstance(x, Decimal):
-        # 小数はfloatへ（丸めが必要なら round(x, 4) などに変更）
         return float(x)
     if isinstance(x, datetime):
         return x.isoformat()
@@ -92,48 +89,55 @@ LATEST_SQL = sa.text("""
     LIMIT 1
 """)
 
+# === signals 系（source='real' に限定） ===
 LATEST_SIGNALS_SQL = sa.text("""
   SELECT symbol, side, price, generated_at, strength_score
   FROM signals
+  WHERE source = 'real'
   ORDER BY generated_at DESC
   LIMIT :limit
 """)
 
-# ---- SQL（COUNT と ページング本体）----
 COUNT_SIGNALS_SQL = sa.text("""
     SELECT COUNT(*)::bigint AS cnt
     FROM signals
-    WHERE (:symbol IS NULL OR lower(symbol) = lower(:symbol))
+    WHERE source = 'real'
+      AND (:symbol IS NULL OR lower(symbol) = lower(:symbol))
       AND (:since  IS NULL OR generated_at >= :since)
 """)
 
 FILTERED_SIGNALS_SQL = sa.text("""
     SELECT symbol, side, price, generated_at, strength_score
     FROM signals
-    WHERE (:symbol IS NULL OR lower(symbol) = lower(:symbol))
+    WHERE source = 'real'
+      AND (:symbol IS NULL OR lower(symbol) = lower(:symbol))
       AND (:since  IS NULL OR generated_at >= :since)
     ORDER BY generated_at DESC
     LIMIT :limit OFFSET :offset
 """)
 
+# === 日次系列（メトリクスは従来どおり public_metrics_daily を参照） ===
 DAILY_SERIES_SQL = sa.text("""
 SELECT d AS metric_date,
        COALESCE(m.total_trades, 0) AS total_trades,
        m.win_rate,
        m.avg_pnl_pct
 FROM generate_series(:start_date, :end_date, INTERVAL '1 day') AS d
-LEFT JOIN public_metrics_daily m ON m.metric_date = d
+LEFT JOIN public_metrics_daily m
+  ON m.metric_date = d
+ AND m.source = 'real'  -- ★実運用のみ
 ORDER BY d ASC
 """).bindparams(
     sa.bindparam("start_date", type_=sa.Date),
     sa.bindparam("end_date", type_=sa.Date),
 )
 
-# === signals のCSV ===
+# === signals のCSV（real 限定） ===
 EXPORT_SIGNALS_SQL = sa.text("""
     SELECT symbol, side, price, generated_at, strength_score
     FROM signals
-    WHERE (:symbol IS NULL OR lower(symbol) = lower(:symbol))
+    WHERE source = 'real'
+      AND (:symbol IS NULL OR lower(symbol) = lower(:symbol))
       AND (:since  IS NULL OR generated_at >= :since)
     ORDER BY generated_at DESC
     LIMIT :limit
@@ -154,21 +158,25 @@ FETCH_DAILY_ROWS_SQL = sa.text("""
 SELECT metric_date, total_trades, symbols
 FROM public_metrics_daily
 WHERE metric_date BETWEEN :start_date AND :end_date
+  AND source = 'real'  -- ★追加
 ORDER BY metric_date ASC
 """).bindparams(
     sa.bindparam("start_date", type_=sa.Date),
     sa.bindparam("end_date", type_=sa.Date),
 )
 
+# === シンボル候補（real 限定） ===
 SYMBOLS_SQL = sa.text("""
 SELECT DISTINCT LOWER(symbol) AS symbol
 FROM signals
-WHERE (:days IS NULL) OR generated_at >= (NOW() AT TIME ZONE 'UTC') - (:days || ' days')::interval
+WHERE source = 'real'
+  AND ((:days IS NULL) OR generated_at >= (NOW() AT TIME ZONE 'UTC') - (:days || ' days')::interval)
 ORDER BY 1 ASC
 """).bindparams(
     sa.bindparam("days", type_=sa.Integer)
 )
 
+# === オープンポジション（real 限定・未クローズ判定は trades.source='real' に限定） ===
 OPEN_POSITIONS_SQL = sa.text("""
     SELECT
       p.position_id,
@@ -179,16 +187,15 @@ OPEN_POSITIONS_SQL = sa.text("""
       p.opened_at::timestamptz AS entry_time
     FROM positions p
     WHERE
-      -- オープン判定：size が 0 でない & side が LONG/SHORT
-      COALESCE(p.size, 0) <> 0
+      p.source = 'real'
+      AND COALESCE(p.size, 0) <> 0
       AND lower(p.side) IN ('long', 'short')
-      -- trades にクローズ済みレコードが無いものだけ
       AND NOT EXISTS (
         SELECT 1 FROM trades t
         WHERE t.entry_position_id = p.position_id
+          AND t.source = 'real'
           AND (t.closed_at IS NOT NULL OR t.exit_price IS NOT NULL)
       )
-      -- ★ 直近3日以内にオープンしたものだけ
       AND p.opened_at >= NOW() - INTERVAL '3 days'
       AND (:symbol IS NULL OR lower(p.symbol) = lower(:symbol))
     ORDER BY p.opened_at DESC
@@ -218,10 +225,12 @@ OPEN_WITH_PRICE_SQL = sa.text("""
     LEFT JOIN price_cache pc
       ON lower(btrim(pc.symbol)) = lower(btrim(p.symbol))
     WHERE
-      COALESCE(p.size, 0) <> 0
+      p.source = 'real'
+      AND COALESCE(p.size, 0) <> 0
       AND NOT EXISTS (
         SELECT 1 FROM trades t
         WHERE t.entry_position_id = p.position_id
+          AND t.source = 'real'
           AND (t.closed_at IS NOT NULL OR t.exit_price IS NOT NULL)
       )
       AND (:symbol IS NULL OR lower(p.symbol) = lower(:symbol))
@@ -231,6 +240,7 @@ OPEN_WITH_PRICE_SQL = sa.text("""
     sa.bindparam("symbol", type_=sa.String)
 )
 
+# === KPI 7days（trades を real 限定で集計） ===
 OPEN_KPI_SQL = sa.text("""
     SELECT
       COUNT(*)::int AS trade_count,
@@ -239,9 +249,82 @@ OPEN_KPI_SQL = sa.text("""
       AVG(pnl_pct)::numeric AS avg_pnl_pct,
       AVG(holding_hours)::numeric AS avg_holding_hours
     FROM trades
-    WHERE closed_at >= NOW() - INTERVAL '7 days'
+    WHERE source = 'real'
+      AND closed_at >= NOW() - INTERVAL '7 days'
       AND (:symbol IS NULL OR lower(symbol) = lower(:symbol))
 """)
+
+# === real-only 日次（全体集計）: trades 由来 ===
+DAILY_SERIES_FROM_TRADES_REAL = sa.text("""
+WITH days AS (
+  SELECT d::date AS metric_date
+  FROM generate_series(:start_date, :end_date, INTERVAL '1 day') AS d
+),
+daily_real AS (
+  SELECT
+    t.closed_at::date                          AS d,
+    COUNT(*)::int                              AS total_trades,
+    AVG(CASE WHEN t.pnl > 0 THEN 1.0 ELSE 0.0 END) AS win_rate,
+    AVG(t.pnl_pct)::numeric                    AS avg_pnl_pct
+  FROM trades t
+  WHERE t.closed_at IS NOT NULL
+    AND t.source = :source                     -- ★ 実運用のみ（デフォ: 'real'）
+    AND t.closed_at::date BETWEEN :start_date AND :end_date
+  GROUP BY t.closed_at::date
+)
+SELECT
+  d.metric_date,
+  COALESCE(r.total_trades, 0) AS total_trades,
+  r.win_rate,
+  r.avg_pnl_pct
+FROM days d
+LEFT JOIN daily_real r ON r.d = d.metric_date
+ORDER BY d.metric_date ASC
+""").bindparams(
+    sa.bindparam("start_date", type_=sa.Date),
+    sa.bindparam("end_date", type_=sa.Date),
+    sa.bindparam("source", type_=sa.String),
+)
+
+# === real-only 日次（シンボル別）: trades 由来 ===
+DAILY_BY_SYMBOL_FROM_TRADES_REAL = sa.text("""
+WITH days AS (
+  SELECT d::date AS metric_date
+  FROM generate_series(:start_date, :end_date, INTERVAL '1 day') AS d
+),
+daily_real AS (
+  SELECT
+    t.closed_at::date                          AS d,
+    LOWER(t.symbol)                            AS symbol,
+    COUNT(*)::int                              AS trades,
+    AVG(CASE WHEN t.pnl > 0 THEN 1.0 ELSE 0.0 END) AS win_rate,
+    AVG(t.pnl_pct)::numeric                    AS avg_pnl_pct
+  FROM trades t
+  WHERE t.closed_at IS NOT NULL
+    AND t.source = :source                     -- ★ 実運用のみ（デフォ: 'real'）
+    AND t.closed_at::date BETWEEN :start_date AND :end_date
+    AND (:symbol IS NULL OR LOWER(t.symbol) = LOWER(:symbol))
+  GROUP BY t.closed_at::date, LOWER(t.symbol)
+)
+SELECT
+  days.metric_date,
+  daily_real.symbol,
+  COALESCE(daily_real.trades, 0) AS trades,
+  daily_real.win_rate,
+  daily_real.avg_pnl_pct
+FROM days
+LEFT JOIN daily_real
+  ON daily_real.d = days.metric_date
+ORDER BY days.metric_date ASC, daily_real.symbol NULLS LAST
+""").bindparams(
+    sa.bindparam("start_date", type_=sa.Date),
+    sa.bindparam("end_date", type_=sa.Date),
+    sa.bindparam("source", type_=sa.String),
+    sa.bindparam("symbol", type_=sa.String),
+)
+
+
+# ------------------- エンドポイント -------------------
 
 @app.get("/public/metrics", response_model=PublicMetricsOut)
 def get_public_metrics():
@@ -252,11 +335,8 @@ def get_public_metrics():
         raise HTTPException(status_code=500, detail=f"DB error: {e}")
 
     if not row:
-        # スナップショットがまだ無い（aggregate_public_metrics.py が未実行など）
         raise HTTPException(status_code=404, detail="no public metrics found")
 
-    # symbols は JSONB → dict として返ってくる想定（psycopg2）
-    # Decimal などを含む可能性があるので plain 化してから Pydantic へ
     payload = {
         "period_start": row["period_start"],
         "period_end": row["period_end"],
@@ -266,16 +346,6 @@ def get_public_metrics():
         "symbols": _to_plain(row["symbols"]) or {},
     }
     return payload
-
-@app.get("/healthz")
-def healthz():
-    # 簡易ヘルスチェック
-    try:
-        with engine.begin() as conn:
-            conn.execute(sa.text("SELECT 1"))
-        return {"ok": True}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"unhealthy: {e}")
 
 @app.get("/public/signals")
 def get_public_signals(
@@ -304,13 +374,11 @@ def get_public_signals(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DB error: {e}")
 
-    # メタ情報はヘッダで
     response.headers["X-Total-Count"] = str(total)
     response.headers["X-Page"] = str(page)
     response.headers["X-Limit"] = str(limit)
     response.headers["X-Has-Next"] = "true" if (offset + len(rows)) < total else "false"
 
-    # 互換のため配列返却（フロントはそのまま動く）
     return [{
         "symbol": r["symbol"],
         "side": r["side"],
@@ -320,16 +388,20 @@ def get_public_signals(
     } for r in rows]
 
 @app.get("/public/performance/daily")
-def get_performance_daily(days: int = Query(30, ge=1, le=365)):
+def get_performance_daily(
+    days: int = Query(30, ge=1, le=365),
+    source: str = Query("real", pattern="^(real|virtual)$")  # ← 追加：将来の切り替え用、今は 'real' がデフォ
+):
     today_jst = datetime.now(JST).date()
     start_date = today_jst - timedelta(days=days - 1)
     end_date = today_jst
 
     try:
         with engine.begin() as conn:
-            rows = conn.execute(DAILY_SERIES_SQL, {
-                "start_date": start_date,  # ← Pythonのdateをそのまま渡す
+            rows = conn.execute(DAILY_SERIES_FROM_TRADES_REAL, {
+                "start_date": start_date,
                 "end_date": end_date,
+                "source": source,
             }).mappings().all()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DB error: {e}")
@@ -341,17 +413,20 @@ def get_performance_daily(days: int = Query(30, ge=1, le=365)):
         "avg_pnl_pct": float(r["avg_pnl_pct"]) if r["avg_pnl_pct"] is not None else None,
     } for r in rows]
 
-# === 30日系列のCSV ===
 @app.get("/public/export/performance/daily.csv")
-def export_performance_daily_csv(days: int = Query(30, ge=1, le=365)):
+def export_performance_daily_csv(
+    days: int = Query(30, ge=1, le=365),
+    source: str = Query("real", pattern="^(real|virtual)$")
+):
     today_jst = datetime.now(JST).date()
     start_date = today_jst - timedelta(days=days - 1)
     end_date = today_jst
 
     with engine.begin() as conn:
-        rows = conn.execute(DAILY_SERIES_SQL, {
+        rows = conn.execute(DAILY_SERIES_FROM_TRADES_REAL, {
             "start_date": start_date,
-            "end_date": end_date
+            "end_date": end_date,
+            "source": source,
         }).mappings().all()
 
     buf = io.StringIO()
@@ -366,11 +441,11 @@ def export_performance_daily_csv(days: int = Query(30, ge=1, le=365)):
         ])
 
     csv_bytes = buf.getvalue().encode("utf-8")
-    filename = f"performance_daily_{days}d.csv"
+    filename = f"performance_daily_{source}_{days}d.csv"
     return StreamingResponse(
         iter([csv_bytes]),
         media_type="text/csv",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+        headers={"Content-Disposition": f'attachment; filename=\"{filename}\"'}
     )
 
 @app.get("/public/export/signals.csv")
@@ -406,7 +481,7 @@ def export_signals_csv(
     return StreamingResponse(
         iter([csv_bytes]),
         media_type="text/csv",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+        headers={"Content-Disposition": f'attachment; filename=\"{filename}\"'}
     )
 
 def _pick_symbol_case_insensitive(symbols_obj: Dict[str, Any], symbol: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -424,109 +499,99 @@ def _pick_symbol_case_insensitive(symbols_obj: Dict[str, Any], symbol: Optional[
 def get_performance_daily_by_symbol(
     symbol: Optional[str] = Query(None, min_length=1, max_length=50, description="省略時は全シンボル"),
     days: int = Query(30, ge=1, le=365),
+    source: str = Query("real", pattern="^(real|virtual)$")
 ):
     today_jst = datetime.now(JST).date()
     start_date = today_jst - timedelta(days=days - 1)
     end_date = today_jst
 
-    try:
-        with engine.begin() as conn:
-            days_rows = conn.execute(DAILY_SERIES_DATE_SQL, {
-                "start_date": start_date, "end_date": end_date
-            }).mappings().all()
-            data_rows = conn.execute(FETCH_DAILY_ROWS_SQL, {
-                "start_date": start_date, "end_date": end_date
-            }).mappings().all()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"DB error: {e}")
+    with engine.begin() as conn:
+        rows = conn.execute(DAILY_BY_SYMBOL_FROM_TRADES_REAL, {
+            "start_date": start_date,
+            "end_date": end_date,
+            "symbol": symbol,
+            "source": source,
+        }).mappings().all()
 
-    by_date = { r["metric_date"]: r for r in data_rows }
-
-    # ---- 単一シンボル（従来互換：配列） ----
     if symbol:
+        # 従来互換：配列 [{date, total_trades, win_rate, avg_pnl_pct}, ...]
         out = []
-        for dr in days_rows:
-            d = dr["metric_date"]
-            row = by_date.get(d)
-            if row:
-                symbols_obj = row["symbols"] if isinstance(row["symbols"], dict) else (
-                    json.loads(row["symbols"]) if row["symbols"] else {}
-                )
-                s = _pick_symbol_case_insensitive(symbols_obj or {}, symbol)
-                if s:
-                    out.append({
-                        "date": d.isoformat(),
-                        "total_trades": int(s.get("trades") or s.get("total_trades") or 0),
-                        "win_rate": float(s.get("win_rate")) if s.get("win_rate") is not None else None,
-                        "avg_pnl_pct": float(s.get("avg_pnl_pct")) if s.get("avg_pnl_pct") is not None else None,
-                    })
-                else:
-                    out.append({"date": d.isoformat(), "total_trades": 0, "win_rate": None, "avg_pnl_pct": None})
-            else:
-                out.append({"date": d.isoformat(), "total_trades": 0, "win_rate": None, "avg_pnl_pct": None})
+        # rows は指定シンボルの行に限定されているので、日付の欠損を0埋めしたい場合は days テーブル再構築が必要
+        # ここでは SQL 側で generate_series 済み
+        for r in rows:
+            out.append({
+                "date": r["metric_date"].isoformat(),
+                "total_trades": int(r["trades"]) if r["trades"] is not None else 0,
+                "win_rate": float(r["win_rate"]) if r["win_rate"] is not None else None,
+                "avg_pnl_pct": float(r["avg_pnl_pct"]) if r["avg_pnl_pct"] is not None else None,
+            })
         return out
 
-    # ---- 省略時：全シンボルをまとめて返す ----
-    items_by_symbol: Dict[str, list] = {}
-    for dr in days_rows:
-        d = dr["metric_date"]
-        row = by_date.get(d)
-        symbols_obj = {}
-        if row:
-            symbols_obj = row["symbols"] if isinstance(row["symbols"], dict) else (
-                json.loads(row["symbols"]) if row["symbols"] else {}
-            )
-        # 全キーを展開
-        for sym, s in (symbols_obj or {}).items():
-            items_by_symbol.setdefault(sym, []).append({
-                "date": d.isoformat(),
-                "total_trades": int(s.get("trades") or s.get("total_trades") or 0),
-                "win_rate": float(s.get("win_rate")) if s.get("win_rate") is not None else None,
-                "avg_pnl_pct": float(s.get("avg_pnl_pct")) if s.get("avg_pnl_pct") is not None else None,
-            })
+    # 省略時：全シンボルを dict[symbol] -> list に整形
+    items_by_symbol: dict[str, list] = {}
+    for r in rows:
+        sym = r["symbol"]
+        if sym is None:
+            # symbol が NULL の行（結合で日があってもシンボルなし）はスキップ
+            continue
+        items_by_symbol.setdefault(sym, []).append({
+            "date": r["metric_date"].isoformat(),
+            "total_trades": int(r["trades"]) if r["trades"] is not None else 0,
+            "win_rate": float(r["win_rate"]) if r["win_rate"] is not None else None,
+            "avg_pnl_pct": float(r["avg_pnl_pct"]) if r["avg_pnl_pct"] is not None else None,
+        })
     return {"days": days, "items_by_symbol": items_by_symbol}
 
 @app.get("/public/export/performance/daily_by_symbol.csv")
 def export_performance_daily_by_symbol_csv(
     symbol: Optional[str] = Query(None, min_length=1, max_length=50, description="省略時は全シンボル"),
     days: int = Query(30, ge=1, le=365),
+    source: str = Query("real", pattern="^(real|virtual)$")
 ):
-    # 上のJSON関数を再利用（省略時は dict、指定時は配列）
-    data = get_performance_daily_by_symbol(symbol=symbol, days=days)
+    today_jst = datetime.now(JST).date()
+    start_date = today_jst - timedelta(days=days - 1)
+    end_date = today_jst
+
+    with engine.begin() as conn:
+        rows = conn.execute(DAILY_BY_SYMBOL_FROM_TRADES_REAL, {
+            "start_date": start_date,
+            "end_date": end_date,
+            "symbol": symbol,
+            "source": source,
+        }).mappings().all()
 
     buf = io.StringIO()
     w = csv.writer(buf)
 
     if symbol:
-        # 互換：4列
         w.writerow(["date", "trades", "win_rate", "avg_pnl_pct"])
-        for r in data:  # data は配列
+        for r in rows:
             w.writerow([
-                r["date"],
-                r.get("total_trades", 0),
-                r["win_rate"] if r["win_rate"] is not None else "",
-                r["avg_pnl_pct"] if r["avg_pnl_pct"] is not None else "",
+                r["metric_date"].isoformat(),
+                int(r["trades"]) if r["trades"] is not None else 0,
+                float(r["win_rate"]) if r["win_rate"] is not None else "",
+                float(r["avg_pnl_pct"]) if r["avg_pnl_pct"] is not None else "",
             ])
-        filename = f"performance_daily_{symbol}_{days}d.csv"
+        filename = f"performance_daily_{symbol}_{source}_{days}d.csv"
     else:
-        # 全件：5列（symbol 列を追加）
         w.writerow(["date", "symbol", "trades", "win_rate", "avg_pnl_pct"])
-        items_by_symbol = data.get("items_by_symbol", {})
-        for sym, rows in items_by_symbol.items():
-            for r in rows:
-                w.writerow([
-                    r["date"], sym,
-                    r.get("total_trades", 0),
-                    r["win_rate"] if r["win_rate"] is not None else "",
-                    r["avg_pnl_pct"] if r["avg_pnl_pct"] is not None else "",
-                ])
-        filename = f"performance_daily_all_{days}d.csv"
+        for r in rows:
+            if r["symbol"] is None:
+                continue
+            w.writerow([
+                r["metric_date"].isoformat(),
+                r["symbol"],
+                int(r["trades"]) if r["trades"] is not None else 0,
+                float(r["win_rate"]) if r["win_rate"] is not None else "",
+                float(r["avg_pnl_pct"]) if r["avg_pnl_pct"] is not None else "",
+            ])
+        filename = f"performance_daily_all_{source}_{days}d.csv"
 
     csv_bytes = buf.getvalue().encode("utf-8")
     return StreamingResponse(
         iter([csv_bytes]),
         media_type="text/csv",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+        headers={"Content-Disposition": f'attachment; filename=\"{filename}\"'}
     )
 
 @app.get("/public/symbols")
@@ -538,13 +603,12 @@ def get_symbols(days: int = Query(90, ge=1, le=365)):
 @app.get("/public/positions/open")
 def get_open_positions(symbol: Optional[str] = Query(None, description="例: btc_jpy")):
     try:
-        with engine.begin() as conn:  # ← あなたのプロジェクトの engine に合わせてください
+        with engine.begin() as conn:
             rows = conn.execute(OPEN_POSITIONS_SQL, {"symbol": symbol}).mappings().all()
     except Exception as e:
         logger.exception("GET /public/positions/open failed")
         raise HTTPException(status_code=500, detail=f"positions query failed: {e}")
 
-    # JSON 整形（Decimal/datetime対策）
     result = []
     for r in rows:
         t = r.get("entry_time")
@@ -554,7 +618,7 @@ def get_open_positions(symbol: Optional[str] = Query(None, description="例: btc
             "side": r.get("side"),
             "size": float(r["size"]) if r.get("size") is not None else None,
             "entry_price": float(r["entry_price"]) if r.get("entry_price") is not None else None,
-            "entry_time": t.isoformat() if hasattr(t, "isoformat") else t,  # 例: 2025-09-26T00:30:13.578+09:00
+            "entry_time": t.isoformat() if hasattr(t, "isoformat") else t,
         })
     return result
 
@@ -562,7 +626,6 @@ def get_open_positions(symbol: Optional[str] = Query(None, description="例: btc
 def get_open_positions_with_price(symbol: str | None = Query(None)):
     with engine.begin() as conn:
         rows = conn.execute(OPEN_WITH_PRICE_SQL, {"symbol": symbol}).mappings().all()
-    # JSON化
     return [
         {
             "position_id": r["position_id"],
@@ -577,6 +640,25 @@ def get_open_positions_with_price(symbol: str | None = Query(None)):
         }
         for r in rows
     ]
+
+# 統合版ヘルスチェック（DB & price_cache 鮮度）
+@app.get("/healthz")
+def healthz():
+    try:
+        with engine.begin() as conn:
+            pong = conn.execute(sa.text("SELECT 1")).scalar_one()
+            fresh_cnt = conn.execute(sa.text("""
+                SELECT COUNT(*) FROM price_cache WHERE ts >= NOW() - INTERVAL '10 minutes'
+            """)).scalar_one()
+            return {
+                "ok": True,
+                "db": pong == 1,
+                "price_cache_fresh_count": int(fresh_cnt),
+                "ttl_minutes": 10
+            }
+    except Exception as e:
+        logger.exception("healthz failed")
+        raise HTTPException(status_code=500, detail=f"healthz error: {e}")
 
 @app.get("/public/kpi/7days")
 def get_kpi_7days(symbol: str | None = Query(None)):
@@ -600,22 +682,3 @@ def get_kpi_7days(symbol: str | None = Query(None)):
         "avg_pnl_pct": _f(row["avg_pnl_pct"]),
         "avg_holding_hours": _f(row["avg_holding_hours"]),
     }
-
-@app.get("/healthz")
-def healthz():
-    try:
-        with engine.begin() as conn:
-            # DB生存 & 価格キャッシュの鮮度を軽く確認
-            pong = conn.execute(sa.text("SELECT 1")).scalar_one()
-            fresh_cnt = conn.execute(sa.text("""
-                SELECT COUNT(*) FROM price_cache WHERE ts >= NOW() - INTERVAL '10 minutes'
-            """)).scalar_one()
-            return {
-                "ok": True,
-                "db": pong == 1,
-                "price_cache_fresh_count": int(fresh_cnt),
-                "ttl_minutes": 10
-            }
-    except Exception as e:
-        logger.exception("healthz failed")
-        raise HTTPException(status_code=500, detail=f"healthz error: {e}")
