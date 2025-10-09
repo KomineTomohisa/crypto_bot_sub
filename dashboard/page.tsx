@@ -3,6 +3,7 @@ export const revalidate = 0;
 import Link from "next/link";
 import { PageHeader, Section } from "@/components/ui";
 import ChartClient from "@/app/performance/ChartClient";
+import EquityChartClient from "./EquityChartClient";
 
 /* =========================
    Types
@@ -10,16 +11,13 @@ import ChartClient from "@/app/performance/ChartClient";
 type TimeLike = string | number | Date | null | undefined;
 
 type Daily = {
-  date: string;                 // JST日（YYYY-MM-DD）
-  win_rate?: number | null;     // 0.42 など（%換算は表示側）
-  avg_pnl_pct?: number | null;  // その日の平均損益率（%換算は表示側）
+  date: string;
+  win_rate?: number | null;
+  avg_pnl_pct?: number | null;
   total_trades: number;
-
-  // 追加（あれば使う）：日次の平均保有時間（時間）
   avg_holding_hours?: number | null;
-
-  // 追加（任意）：その日の総合PnL%（あるなら使う。無ければ avg_pnl_pct を近似使用）
-  total_pnl_pct?: number | null;
+  total_pnl?: number | null;   // ← 追加：その日の損益（円）
+  total_pnl_pct?: number | null; // （既存コメントのままでOK。未使用なら放置）
 };
 
 type Position = {
@@ -76,15 +74,6 @@ function parseDateFlexible(v: TimeLike): Date | null {
     return isNaN(d.getTime()) ? null : d;
   }
   return null;
-}
-
-// ▼ ここを置換
-function fmtPctSmart(v?: number | null, digits = 1) {
-  if (v == null) return "—";
-  const abs = Math.abs(v);
-  // 1以下なら比率(0.0123=1.23%)、1超なら既に%値(1.23=1.23%)
-  const val = abs <= 1 ? v * 100 : v;
-  return `${val.toFixed(digits)}%`;
 }
 
 /* =========================
@@ -173,13 +162,12 @@ export default async function Page({
         description={<>過去<b>{DAYS}日</b>のKPI、簡易チャート、現在の保有ポジションを表示します。</>}
       />
       
-      {/* 1. KPI（7日固定） */}
+      {/* 主要指標 & パフォーマンス（直近7日）〔統合版〕 */}
       <Section
-        title="主要指標（直近7日間）"
+        title="直近7日間 成績"
         headerRight={
           (() => {
             const latest = daily.at(-1)?.date;
-            // KPIの鮮度：当日JSTと一致していなければ stale
             const jstNow = new Date().toLocaleDateString("ja-JP", { timeZone: "Asia/Tokyo" }).replaceAll("/", "-");
             const stale = latest && latest !== jstNow;
             return (
@@ -196,177 +184,222 @@ export default async function Page({
         }
       >
         {(() => {
-          // ---------- 共通ユーティリティ ----------
+          // ★ 追加: 資産推移（円）
+          const INITIAL = 100_000;
+          let cur = INITIAL;
+          const dates = daily.map(d => d.date);
+          const equityYen: number[] = daily.map(d => {
+            const pnl = typeof d.total_pnl === "number" ? d.total_pnl : 0;
+            cur += pnl;
+            return cur;
+          });
+          const peakYenAt: number[] = [];
+          let peak = INITIAL;
+          for (const v of equityYen) {
+            peak = Math.max(peak, v);
+            peakYenAt.push(peak);
+          }
+          // ドローダウン%（ピーク比）
+          const ddPct: number[] = equityYen.map((v, i) => {
+            const pk = peakYenAt[i] || v;
+            return pk > 0 ? ((v - pk) / pk) * 100 : 0;
+          });
+          // 指数(=100起点) も作っておく（右軸の代替表示用）
+          const equityIdx: number[] = equityYen.map(v => (v / INITIAL) * 100);
+
+          const equityData = dates.map((date, i) => ({
+            date,
+            equity_yen: equityYen[i] ?? INITIAL,
+            win_rate: daily[i]?.win_rate ?? 0,
+            dd_pct: ddPct[i] ?? 0,
+          }));
+
+          // ---------- 集計・差分計算 ----------
           const getLastTwo = (arr: Array<number | null | undefined>): [number | null, number | null] => {
             const vals = arr.filter((v): v is number => typeof v === "number" && !Number.isNaN(v));
             const n = vals.length;
             return n >= 2 ? [vals[n - 2], vals[n - 1]] : [null, null];
           };
-          // 0.42（比率）は%に直し、52 はそのまま扱う。差分も%で返す。
+
           const toPctDelta = (a?: number | null, b?: number | null): number | null => {
             if (a == null || b == null) return null;
-            const conv = (x: number) => Math.abs(x) <= 1 ? x * 100 : x; // 0.42 -> 42
+            const conv = (x: number) => Math.abs(x) <= 1 ? x * 100 : x; // 0.42→42
             return Number((conv(b) - conv(a)).toFixed(2));
           };
 
-          // 7日分 日次系列
           const seriesTrades   = daily.map(d => d.total_trades ?? 0);
           const seriesWinRate  = daily.map(d => d.win_rate ?? null);
           const seriesAvgPnl   = daily.map(d => d.avg_pnl_pct ?? null);
           const seriesHoldH    = daily.map(d => d.avg_holding_hours ?? null);
 
-          // 前日比（直近2点）
-          const [tPrev,  tLast ] = getLastTwo(daily.map(d => d.total_trades));
+          const [tPrev,  tLast ] = getLastTwo(seriesTrades);
           const [wrPrev, wrLast] = getLastTwo(seriesWinRate);
           const [apPrev, apLast] = getLastTwo(seriesAvgPnl);
           const [hhPrev, hhLast] = getLastTwo(seriesHoldH);
 
-          const deltaTrades   = (tPrev != null && tLast != null) ? (tLast - tPrev) : null;           // 件
-          const deltaWinRate  = toPctDelta(wrPrev, wrLast);                                           // %
-          const deltaAvgPnl   = toPctDelta(apPrev, apLast);                                           // %
+          const deltaTrades   = (tPrev != null && tLast != null) ? (tLast - tPrev) : null;    // 件
+          const deltaWinRate  = toPctDelta(wrPrev, wrLast);                                    // %
+          const deltaAvgPnl   = toPctDelta(apPrev, apLast);                                    // %
           const deltaHoldHour = (hhPrev != null && hhLast != null) ? Number((hhLast - hhPrev).toFixed(1)) : null; // h
 
-          // ---- Max Drawdown / Sharpe / Sortino （7日）----
-          // 7日分の日次リターン（%）を作る：total_pnl_pct があれば優先、無ければ avg_pnl_pct を使用
+          // 追加指標（MaxDD / Sharpe / Sortino）
           const dayReturnsPct = daily.map(d => {
             const v = (d.total_pnl_pct ?? d.avg_pnl_pct);
             if (v == null || Number.isNaN(Number(v))) return 0;
-            // 0.42 -> 42,  2.5 -> 2.5
             return Math.abs(Number(v)) <= 1 ? Number(v) * 100 : Number(v);
           });
-
-          // 累積曲線（%ベースの擬似エクイティ）を作成して MaxDD を算出
-          const equity = (() => {
-            let acc = 0;
-            return dayReturnsPct.map(r => (acc += r));
-          })();
-
+          const equity = (() => { let acc = 0; return dayReturnsPct.map(r => (acc += r)); })();
           const maxDrawdownPct = (() => {
             let peak = -Infinity, maxDD = 0;
-            for (const x of equity) {
-              peak = Math.max(peak, x);
-              const dd = x - peak; // マイナス値
-              maxDD = Math.min(maxDD, dd);
-            }
-            return Number(maxDD.toFixed(2)); // 例: -12.34（%）
+            for (const x of equity) { peak = Math.max(peak, x); maxDD = Math.min(maxDD, x - peak); }
+            return Number(maxDD.toFixed(2));
           })();
-
           const sharpeSortino = (() => {
-            const xs = dayReturnsPct;                 // 日次%（例: 1.2, -0.8, ...）
-            const n  = xs.length || 1;
+            const xs = dayReturnsPct, n = xs.length || 1;
             const mean = xs.reduce((a, b) => a + b, 0) / n;
             const std  = Math.sqrt(xs.reduce((s, v) => s + Math.pow(v - mean, 2), 0) / n) || 0;
-
             const downside = xs.filter(v => v < 0);
             const dMean = downside.length ? downside.reduce((a, b) => a + b, 0) / downside.length : 0;
             const dStd  = downside.length
               ? Math.sqrt(downside.reduce((s, v) => s + Math.pow(v - dMean, 2), 0) / downside.length)
               : 0;
-
-            // 年率化（参考）：日次→年次換算。営業日換算なら√252でもOK
             const ann = Math.sqrt(365);
-            const sharpe  = std  ? (mean / std) * ann : 0;
-            const sortino = dStd ? (mean / dStd) * ann : 0;
-
-            return { sharpe: Number(sharpe.toFixed(2)), sortino: Number(sortino.toFixed(2)) };
+            return {
+              sharpe:  Number(((std  ? (mean / std)  * ann : 0)).toFixed(2)),
+              sortino: Number(((dStd ? (mean / dStd) * ann : 0)).toFixed(2)),
+            };
           })();
 
+          /* ---------- レイアウト（上=グラフ / 下=KPIグリッド、広めの余白＋内枠なし） ---------- */
           return (
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-              {/* 既存KPI（%表記に統一） */}
-              <KpiCardPro
-                title="取引回数"
-                value={kpi?.trade_count}
-                valueRender={(v) => (v ?? "—")}
-                series={seriesTrades.map(v => v ?? 0)}
-                delta={deltaTrades}
-                deltaUnit=""
-                hint="7日間の合計トレード数"
-              />
-              <KpiCardPro
-                title="勝率"
-                value={kpi?.win_rate}
-                valueRender={(v) => fmtPctSmart(v as number | null | undefined)}  // 0.42 -> 42.0%
-                series={seriesWinRate.map(v => (v ?? 0))}
-                delta={deltaWinRate}
-                deltaUnit="%"
-                hint="全取引に占める勝ちトレードの割合"
-              />
-              <KpiCardPro
-                title="総損益"
-                value={kpi?.total_pnl}
-                valueRender={(v) => (v != null ? Number(v).toFixed(2) : "—")}
-                series={seriesAvgPnl.map(v => (v ?? 0))}
-                delta={deltaAvgPnl}
-                deltaUnit="%"
-                hint="7日間の合計損益額"
-              />
-              <KpiCardPro
-                title="平均損益率"
-                value={kpi?.avg_pnl_pct}
-                valueRender={(v) => fmtPctSmart(v as number | null | undefined)}
-                series={seriesAvgPnl.map(v => (v ?? 0))}
-                delta={deltaAvgPnl}
-                deltaUnit="%"
-                hint="1トレードあたりの平均損益率"
-              />
-              <KpiCardPro
-                title="平均保有時間"
-                value={kpi?.avg_holding_hours}
-                valueRender={(v) => (v != null ? Number(v).toFixed(1) : "—")}
-                series={seriesHoldH.map(v => (v ?? 0))}
-                delta={deltaHoldHour}
-                deltaUnit="h"
-                hint="1ポジションの平均保有時間"
-              />
+            <div>
+              <div className="mb-10">
+                <div className="flex items-center justify-between mb-3">
+                  <div className="text-base font-semibold">資産推移（初期 ¥100,000 ベース）</div>
+                  <div className="text-xs text-gray-500">
+                    最小: ¥{Math.round(Math.min(...equityYen, INITIAL)).toLocaleString("ja-JP")} / 最大: ¥{Math.round(Math.max(...equityYen, INITIAL)).toLocaleString("ja-JP")}
+                  </div>
+                </div>
+                <EquityChartClient data={equityData} />
+              </div>
+              {/* 上：日次推移グラフ */}
+              <div className="mb-16"> {/* ← 余白をたっぷり確保（約64px） */}
+                <div className="flex items-center justify-between mb-4">
+                  <div className="text-base font-semibold">日次推移（Win Rate / Avg PnL%）</div>
+                  <Link
+                    className="text-sm underline text-gray-600 dark:text-gray-300 hover:text-gray-800 dark:hover:text-gray-100 transition"
+                    href={`/performance?days=${DAYS}${symbol ? `&symbol=${encodeURIComponent(symbol)}` : ""}`}
+                  >
+                    詳細へ →
+                  </Link>
+                </div>
 
-              {/* 追加KPI：MaxDD / Sharpe / Sortino（7日） */}
-              <KpiCardPro
-                title="最大ドローダウン"
-                value={maxDrawdownPct}
-                valueRender={(v) => (v != null ? `${Number(v).toFixed(2)}%` : "—")}
-                series={equity}                            // 疑似エクイティ曲線
-                delta={null}
-                deltaUnit=""
-                hint="7日間での累積最大下落率"
-              />
-              <KpiCardPro
-                title="シャープレシオ"
-                value={sharpeSortino.sharpe}
-                valueRender={(v) => (v != null ? Number(v).toFixed(2) : "—")}
-                series={dayReturnsPct}
-                delta={null}
-                deltaUnit=""
-                hint="リスクあたりの収益性（年率換算）。1以上なら安定的に良好"
-              />
-              <KpiCardPro
-                title="ソルティノレシオ"
-                value={sharpeSortino.sortino}
-                valueRender={(v) => (v != null ? Number(v).toFixed(2) : "—")}
-                series={dayReturnsPct}
-                delta={null}
-                deltaUnit=""
-                hint="下方リスク限定のリスク調整リターン（年率換算）。1以上なら望ましい水準"
-              />
+                <div className="h-[260px]">
+                  {daily.length > 0 ? (
+                    <ChartClient data={daily} />
+                  ) : (
+                    <div className="h-full grid place-items-center text-sm text-gray-500">
+                      データがありません。
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* 下：主要指標（カードグリッド） */}
+              <div className="mt-20 grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-x-6 gap-y-10">
+                <KpiCardPro
+                  title="取引回数"
+                  value={kpi?.trade_count}
+                  valueRender={(v) => (v ?? "—")}
+                  series={seriesTrades.map(v => v ?? 0)}
+                  delta={deltaTrades}
+                  deltaUnit=""
+                  hint="7日間の合計トレード数"
+                />
+                <KpiCardPro
+                  title="勝率"
+                  value={kpi?.win_rate}
+                  valueRender={(v) =>
+                    v == null ? "—" : (Math.abs(v) <= 1 ? (v*100).toFixed(1) : v.toFixed(1)) + "%"
+                  }
+                  series={seriesWinRate.map(v => (v ?? 0))}
+                  delta={deltaWinRate}
+                  deltaUnit="%"
+                  hint="全取引に占める勝ちトレードの割合"
+                />
+                <KpiCardPro
+                  title="総損益"
+                  value={kpi?.total_pnl}
+                  valueRender={(v) =>
+                    v != null ? Number(v).toLocaleString("ja-JP") : "—"
+                  }
+                  series={seriesAvgPnl.map(v => (v ?? 0))}
+                  delta={deltaAvgPnl}
+                  deltaUnit="%"
+                  hint="7日間の合計損益額"
+                />
+                <KpiCardPro
+                  title="平均損益率"
+                  value={kpi?.avg_pnl_pct}
+                  valueRender={(v) =>
+                    v == null
+                      ? "—"
+                      : (Math.abs(v) <= 1 ? (v*100).toFixed(2) : v.toFixed(2)) + "%"
+                  }
+                  series={seriesAvgPnl.map(v => (v ?? 0))}
+                  delta={deltaAvgPnl}
+                  deltaUnit="%"
+                  hint="1トレードあたりの平均損益率"
+                />
+                <KpiCardPro
+                  title="平均保有時間"
+                  value={kpi?.avg_holding_hours}
+                  valueRender={(v) =>
+                    v != null ? Number(v).toFixed(1) : "—"
+                  }
+                  series={seriesHoldH.map(v => (v ?? 0))}
+                  delta={deltaHoldHour}
+                  deltaUnit="h"
+                  hint="1ポジションの平均保有時間"
+                />
+                <KpiCardPro
+                  title="最大ドローダウン"
+                  value={maxDrawdownPct}
+                  valueRender={(v) =>
+                    v != null ? `${Number(v).toFixed(2)}%` : "—"
+                  }
+                  series={equity}
+                  delta={null}
+                  deltaUnit=""
+                  hint="7日間での累積最大下落率"
+                />
+                <KpiCardPro
+                  title="シャープレシオ"
+                  value={sharpeSortino.sharpe}
+                  valueRender={(v) =>
+                    v != null ? Number(v).toFixed(2) : "—"
+                  }
+                  series={dayReturnsPct}
+                  delta={null}
+                  deltaUnit=""
+                  hint="リスクあたりの収益性（年率換算）"
+                />
+                <KpiCardPro
+                  title="ソルティノレシオ"
+                  value={sharpeSortino.sortino}
+                  valueRender={(v) =>
+                    v != null ? Number(v).toFixed(2) : "—"
+                  }
+                  series={dayReturnsPct}
+                  delta={null}
+                  deltaUnit=""
+                  hint="下方リスク限定のリスク調整リターン（年率換算）"
+                />
+              </div>
             </div>
           );
-        })()}
-      </Section>
 
-      {/* 2. パフォーマンス（簡易チャート、7日固定） */}
-      <Section
-        title={`パフォーマンス（直近 ${DAYS} 日）`}
-        headerRight={
-          <Link className="text-sm underline" href={`/performance?days=${DAYS}${symbol ? `&symbol=${encodeURIComponent(symbol)}` : ""}`}>
-            詳細へ →
-          </Link>
-        }
-      >
-        {daily.length > 0 ? (
-          <ChartClient data={daily} />
-        ) : (
-          <div className="h-32 grid place-items-center text-sm text-gray-500">データがありません。</div>
-        )}
+        })()}
       </Section>
 
       {/* 3. 現在の保有ポジション（最新シグナルの代替） */}
@@ -785,7 +818,7 @@ function PositionCard({ p }: { p: PositionWithPriceTS }) {
       {p?.symbol && (
         <div className="mt-3 text-right">
           <Link
-            href={`/transparency?days=7&symbol=${encodeURIComponent(p.symbol)}`}
+            href={`/performance?days=7&symbol=${encodeURIComponent(p.symbol)}`}
             className="text-xs underline"
             prefetch={false}
           >

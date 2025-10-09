@@ -23,7 +23,7 @@ app = FastAPI(
     description="Public endpoints for metrics and signals."
 )
 
-app.include_router(public_performance.router)
+app.include_router(public_performance.router, prefix="/api")
 app.include_router(strategies.router)
 app.include_router(virtual.router)
 app.include_router(monitor.router)
@@ -264,17 +264,19 @@ daily_real AS (
   SELECT
     t.closed_at::date                          AS d,
     COUNT(*)::int                              AS total_trades,
+    SUM(t.pnl)::numeric                        AS total_pnl,        -- ★追加：損益合計
     AVG(CASE WHEN t.pnl > 0 THEN 1.0 ELSE 0.0 END) AS win_rate,
     AVG(t.pnl_pct)::numeric                    AS avg_pnl_pct
   FROM trades t
   WHERE t.closed_at IS NOT NULL
-    AND t.source = :source                     -- ★ 実運用のみ（デフォ: 'real'）
+    AND t.source = :source
     AND t.closed_at::date BETWEEN :start_date AND :end_date
   GROUP BY t.closed_at::date
 )
 SELECT
   d.metric_date,
   COALESCE(r.total_trades, 0) AS total_trades,
+  r.total_pnl,                    -- ★追加
   r.win_rate,
   r.avg_pnl_pct
 FROM days d
@@ -298,10 +300,11 @@ daily_real AS (
     LOWER(t.symbol)                            AS symbol,
     COUNT(*)::int                              AS trades,
     AVG(CASE WHEN t.pnl > 0 THEN 1.0 ELSE 0.0 END) AS win_rate,
-    AVG(t.pnl_pct)::numeric                    AS avg_pnl_pct
+    AVG(t.pnl_pct)::numeric                    AS avg_pnl_pct,
+    SUM(t.pnl)::numeric                        AS total_pnl     -- ★ 追加
   FROM trades t
   WHERE t.closed_at IS NOT NULL
-    AND t.source = :source                     -- ★ 実運用のみ（デフォ: 'real'）
+    AND t.source = :source                     -- 'real'
     AND t.closed_at::date BETWEEN :start_date AND :end_date
     AND (:symbol IS NULL OR LOWER(t.symbol) = LOWER(:symbol))
   GROUP BY t.closed_at::date, LOWER(t.symbol)
@@ -309,9 +312,10 @@ daily_real AS (
 SELECT
   days.metric_date,
   daily_real.symbol,
-  COALESCE(daily_real.trades, 0) AS trades,
+  COALESCE(daily_real.trades, 0)   AS trades,
   daily_real.win_rate,
-  daily_real.avg_pnl_pct
+  daily_real.avg_pnl_pct,
+  COALESCE(daily_real.total_pnl,0) AS total_pnl   -- ★ 追加
 FROM days
 LEFT JOIN daily_real
   ON daily_real.d = days.metric_date
@@ -322,7 +326,6 @@ ORDER BY days.metric_date ASC, daily_real.symbol NULLS LAST
     sa.bindparam("source", type_=sa.String),
     sa.bindparam("symbol", type_=sa.String),
 )
-
 
 # ------------------- エンドポイント -------------------
 
@@ -409,6 +412,7 @@ def get_performance_daily(
     return [{
         "date": r["metric_date"].isoformat(),
         "total_trades": int(r["total_trades"]) if r["total_trades"] is not None else 0,
+        "total_pnl": float(r["total_pnl"]) if r["total_pnl"] is not None else 0.0,  # ★追加
         "win_rate": float(r["win_rate"]) if r["win_rate"] is not None else None,
         "avg_pnl_pct": float(r["avg_pnl_pct"]) if r["avg_pnl_pct"] is not None else None,
     } for r in rows]
@@ -499,7 +503,7 @@ def _pick_symbol_case_insensitive(symbols_obj: Dict[str, Any], symbol: Optional[
 def get_performance_daily_by_symbol(
     symbol: Optional[str] = Query(None, min_length=1, max_length=50, description="省略時は全シンボル"),
     days: int = Query(30, ge=1, le=365),
-    source: str = Query("real", pattern="^(real|virtual)$")
+    source: str = Query("real", pattern="^(real|virtual)$"),
 ):
     today_jst = datetime.now(JST).date()
     start_date = today_jst - timedelta(days=days - 1)
@@ -514,31 +518,28 @@ def get_performance_daily_by_symbol(
         }).mappings().all()
 
     if symbol:
-        # 従来互換：配列 [{date, total_trades, win_rate, avg_pnl_pct}, ...]
         out = []
-        # rows は指定シンボルの行に限定されているので、日付の欠損を0埋めしたい場合は days テーブル再構築が必要
-        # ここでは SQL 側で generate_series 済み
         for r in rows:
             out.append({
                 "date": r["metric_date"].isoformat(),
                 "total_trades": int(r["trades"]) if r["trades"] is not None else 0,
                 "win_rate": float(r["win_rate"]) if r["win_rate"] is not None else None,
                 "avg_pnl_pct": float(r["avg_pnl_pct"]) if r["avg_pnl_pct"] is not None else None,
+                "total_pnl": float(r["total_pnl"]) if r["total_pnl"] is not None else 0.0,  # ★ 追加
             })
         return out
 
-    # 省略時：全シンボルを dict[symbol] -> list に整形
     items_by_symbol: dict[str, list] = {}
     for r in rows:
         sym = r["symbol"]
         if sym is None:
-            # symbol が NULL の行（結合で日があってもシンボルなし）はスキップ
             continue
         items_by_symbol.setdefault(sym, []).append({
             "date": r["metric_date"].isoformat(),
             "total_trades": int(r["trades"]) if r["trades"] is not None else 0,
             "win_rate": float(r["win_rate"]) if r["win_rate"] is not None else None,
             "avg_pnl_pct": float(r["avg_pnl_pct"]) if r["avg_pnl_pct"] is not None else None,
+            "total_pnl": float(r["total_pnl"]) if r["total_pnl"] is not None else 0.0,  # ★ 追加
         })
     return {"days": days, "items_by_symbol": items_by_symbol}
 
@@ -564,17 +565,18 @@ def export_performance_daily_by_symbol_csv(
     w = csv.writer(buf)
 
     if symbol:
-        w.writerow(["date", "trades", "win_rate", "avg_pnl_pct"])
+        w.writerow(["date", "trades", "win_rate", "avg_pnl_pct", "total_pnl"])
         for r in rows:
             w.writerow([
                 r["metric_date"].isoformat(),
                 int(r["trades"]) if r["trades"] is not None else 0,
                 float(r["win_rate"]) if r["win_rate"] is not None else "",
                 float(r["avg_pnl_pct"]) if r["avg_pnl_pct"] is not None else "",
+                float(r["total_pnl"]) if r["total_pnl"] is not None else "",        # ★ 追加
             ])
         filename = f"performance_daily_{symbol}_{source}_{days}d.csv"
     else:
-        w.writerow(["date", "symbol", "trades", "win_rate", "avg_pnl_pct"])
+        w.writerow(["date", "symbol", "trades", "win_rate", "avg_pnl_pct", "total_pnl"])
         for r in rows:
             if r["symbol"] is None:
                 continue
@@ -584,6 +586,7 @@ def export_performance_daily_by_symbol_csv(
                 int(r["trades"]) if r["trades"] is not None else 0,
                 float(r["win_rate"]) if r["win_rate"] is not None else "",
                 float(r["avg_pnl_pct"]) if r["avg_pnl_pct"] is not None else "",
+                float(r["total_pnl"]) if r["total_pnl"] is not None else "",        # ★ 追加
             ])
         filename = f"performance_daily_all_{source}_{days}d.csv"
 
