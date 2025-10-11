@@ -430,7 +430,8 @@ class CryptoTradingBot:
                 strategy_id=strategy_id, version=version,
                 status=status,
                 raw=raw,
-                signal_id=signal_id
+                signal_id=signal_id,
+                source=("backtest" if is_backtest_mode else "real"),  # ★追加
             )
             self.logger.info(f"✅ シグナル記録: signal_id={sid} {symbol} {timeframe} {side} price={price}")
             return sid
