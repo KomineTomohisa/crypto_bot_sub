@@ -17,6 +17,7 @@ type Daily = {
   total_trades: number;
   win_rate?: number | null;
   avg_pnl_pct?: number | null;
+  total_pnl: number;  // ← optional/null をやめて number に固定
 };
 
 function apiBase() {
@@ -28,16 +29,35 @@ function apiBase() {
 async function fetchDaily(days = 30, symbol?: string): Promise<Daily[]> {
   const base = apiBase();
   const url = new URL(
-    symbol
-      ? `${base}/public/performance/daily/by-symbol`
-      : `${base}/public/performance/daily`
+    symbol ? `${base}/public/performance/daily/by-symbol`
+           : `${base}/public/performance/daily`
   );
   url.searchParams.set("days", String(days));
   if (symbol) url.searchParams.set("symbol", symbol);
+  url.searchParams.set("source", "real");
 
   const res = await fetch(url.toString(), { cache: "no-store" });
   if (!res.ok) throw new Error(`Failed: ${res.status}`);
-  return res.json();
+
+  const raw = await res.json();
+
+  const coerceNumber = (v: unknown): number =>
+    typeof v === "number" ? v :
+    v == null ? 0 :
+    Number.isFinite(Number(v)) ? Number(v) : 0;
+
+  return Array.isArray(raw)
+    ? raw.map((r: unknown): Daily => {
+        const rec = r as { date?: unknown; total_trades?: unknown; win_rate?: unknown; avg_pnl_pct?: unknown; total_pnl?: unknown; };
+        return {
+          date: String(rec.date ?? ""),
+          total_trades: coerceNumber(rec.total_trades),
+          win_rate: typeof rec.win_rate === "number" ? rec.win_rate : null,
+          avg_pnl_pct: typeof rec.avg_pnl_pct === "number" ? rec.avg_pnl_pct : null,
+          total_pnl: coerceNumber(rec.total_pnl),         // ← ここで number を保証
+        };
+      })
+    : []; // 想定外レスポンスは空に
 }
 
 /** シンボル候補（UI用） */
@@ -86,17 +106,15 @@ export default async function Page({
 
     // CSVリンク（全体 or シンボル別）
     const csvDailyUrl = symbol
-      ? `/api/public/export/performance/daily_by_symbol.csv?symbol=${encodeURIComponent(
-          symbol
-        )}&days=${days}`
-      : `/api/public/export/performance/daily.csv?days=${days}`;
+      ? `/api/public/export/performance/daily_by_symbol.csv?symbol=${encodeURIComponent(symbol)}&days=${days}&source=real`
+      : `/api/public/export/performance/daily.csv?days=${days}&source=real`;
 
     return (
-      <main className="p-6 md:p-8 max-w-3xl mx-auto space-y-8">
+      <main className="p-6 md:p-8 max-w-4xl mx-auto space-y-8">
         {/* ヘッダ */}
         <PageHeader
-          title="Performance（日次集計）"
-          description={<>直近{days}日の Win Rate / Avg PnL% / Trades を公開。シンボル切替・CSVダウンロードに対応。</>}
+          title="Performance"
+          description={<>過去の取引結果を公開。シンボル切替・CSVダウンロードに対応。</>}
         />
 
         {/* フィルタ欄：2段構成（1段目: クイック、2段目: 入力群 を箱いっぱいで） */}
@@ -238,8 +256,12 @@ export default async function Page({
                   <th scope="col" className="px-3 py-2 text-right">
                     <abbr title="当日の pnl_pct の単純平均（JST日単位）">Avg PnL</abbr>
                   </th>
+                  <th scope="col" className="px-3 py-2 text-right">
+                    <abbr title="当日の全トレード損益合計（JPY）">Total PnL（¥）</abbr>
+                  </th>
                 </tr>
               </thead>
+
               <tbody>
                 {data.map((r, i) => (
                   <tr key={i} className="border-t border-gray-100 dark:border-gray-800">
@@ -247,11 +269,41 @@ export default async function Page({
                     <td className="px-3 py-2 text-right">{r.total_trades}</td>
                     <td className="px-3 py-2 text-right">{pct(r.win_rate, 1)}</td>
                     <td className="px-3 py-2 text-right">{pct(r.avg_pnl_pct, 2)}</td>
+                    <td className="px-3 py-2 text-right">
+                      {Number(r.total_pnl).toLocaleString("ja-JP", { maximumFractionDigits: 0 })}
+                    </td>
                   </tr>
                 ))}
+
+                {/* 合計行（データがあるときのみ表示） */}
+                {data.length > 0 && (() => {
+                  const sum = data.reduce((acc, cur) => acc + (cur.total_pnl ?? 0), 0);
+                  const sign = sum > 0 ? "+" : sum < 0 ? "−" : "";
+                  const abs = Math.abs(sum);
+                  const cls =
+                    sum > 0 ? "text-green-600 dark:text-green-400"
+                  : sum < 0 ? "text-red-600 dark:text-red-400"
+                            : "text-gray-600 dark:text-gray-300";
+
+                  return (
+                    <tr className="border-t border-gray-200 dark:border-gray-700 bg-gray-50/70 dark:bg-gray-800/40">
+                      {/* ラベルは先頭〜Avg PnL までまとめて表示 */}
+                      <td className="px-3 py-2 font-medium" colSpan={4}>
+                        合計
+                      </td>
+                      <td className="px-3 py-2 text-right font-semibold">
+                        <span className={cls}>
+                          {sign}
+                          {abs.toLocaleString("ja-JP", { maximumFractionDigits: 0 })}円
+                        </span>
+                      </td>
+                    </tr>
+                  );
+                })()}
+
                 {data.length === 0 && (
                   <tr>
-                    <td className="px-3 py-6 text-center text-gray-500" colSpan={4}>
+                    <td className="px-3 py-6 text-center text-gray-500" colSpan={5}>
                       <div className="space-y-2">
                         <div>データがありません。</div>
                         <div className="flex gap-2 justify-center">
