@@ -1,101 +1,39 @@
 from __future__ import annotations
+
 import os
 import json
+import logging
 from contextlib import contextmanager
 from datetime import datetime, date, timezone, timedelta
 from decimal import Decimal
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Sequence
 from uuid import uuid4
-from pathlib import Path  
+from pathlib import Path
+
 from dotenv import load_dotenv
 from tenacity import retry, stop_after_attempt, wait_exponential_jitter
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine, Connection
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import text
+
 try:
     from psycopg2.extras import Json as _PsycoJson
 except Exception:
     _PsycoJson = None
-from sqlalchemy import text
 
+# -----------------------------------------------------------------------------
+# 環境
+# -----------------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
-load_dotenv(BASE_DIR / ".env")  # ←絶対パスで .env を読む
+load_dotenv(BASE_DIR / ".env")
+
 DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is not set")
 
 JST = timezone(timedelta(hours=9))
 
-def _as_utc(dt):
-    """naive→UTC付与 / JST→UTC変換 / すでにtz付き→UTC変換"""
-    if dt.tzinfo is None:
-        # naive は UTC として扱う（必要ならここを JST 想定に変える）
-        return dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
-
-def get_trades_between(start_dt, end_dt, symbols=None, min_abs_pnl=None):
-    """
-    [start_dt, end_dt) に closed_at が入る trades を返却（辞書の配列）。
-    - start_dt/end_dt: datetime（naive でも tz 付きでもOK）
-    - symbols: 例 ["ltc_jpy","eth_jpy"]（None なら全件）
-    - min_abs_pnl: 絶対値でこのPnLを下限にフィルタ（例: 0.0）
-    """
-    start_utc = _as_utc(start_dt)
-    end_utc   = _as_utc(end_dt)
-
-    where = ["closed_at >= :start_dt", "closed_at < :end_dt"]
-    params = {"start_dt": start_utc, "end_dt": end_utc}
-
-    if symbols:
-        where.append("symbol = ANY(:syms)")
-        params["syms"] = list(symbols)
-
-    if min_abs_pnl is not None:
-        where.append("ABS(pnl) >= :min_abs_pnl")
-        params["min_abs_pnl"] = float(min_abs_pnl)
-
-    sql = f"""
-        SELECT trade_id, symbol, side, entry_position_id, exit_order_id,
-               entry_price, exit_price, size, pnl, pnl_pct,
-               holding_hours, closed_at, raw
-          FROM trades
-         WHERE {' AND '.join(where)}
-         ORDER BY closed_at ASC
-    """
-    with engine.begin() as conn:
-        rows = conn.execute(sa.text(sql), params).mappings().all()
-    # dict のリストで返す
-    return [dict(r) for r in rows]
-
-def _json_param(v):
-    if v is None:
-        return None
-    # psycopg2 の Json ラッパーが使えるなら最優先
-    if _PsycoJson and isinstance(v, (dict, list)):
-        return _PsycoJson(v)
-    # フォールバック：文字列化
-    if isinstance(v, (dict, list)):
-        return json.dumps(v, ensure_ascii=False)
-    return v
-
-def get_trades_for_day_jst(day_dt):
-    """
-    JST の 00:00〜24:00 を作り、その範囲の trades を返す（辞書配列）。
-    day_dt: datetime（naive 可）— naive の場合は JST とみなす
-    """
-    day = day_dt
-    if day.tzinfo is None:
-        day = day.replace(tzinfo=JST)
-    else:
-        day = day.astimezone(JST)
-
-    start_jst = day.replace(hour=0, minute=0, second=0, microsecond=0)
-    end_jst   = start_jst + timedelta(days=1)
-
-    # UTC に直してからクエリ
-    return get_trades_between(start_jst, end_jst)
-
-# === 起動時に接続先をログ出力（パスワード隠し） ===
 def _redact_url(u: str) -> str:
-    # postgresql+psycopg2://user:***@host:5432/db という形にする
     try:
         from urllib.parse import urlparse
         p = urlparse(u)
@@ -107,24 +45,36 @@ def _redact_url(u: str) -> str:
     except Exception:
         return "unknown"
 
-try:
-    import logging
-    logging.basicConfig(level=logging.INFO)
-    logging.getLogger(__name__).info("DB target: %s", _redact_url(DATABASE_URL or "unset"))
-except Exception:
-    pass
+logging.basicConfig(level=logging.INFO)
+logging.getLogger(__name__).info("DB target: %s", _redact_url(DATABASE_URL))
 
-# --- 接続とユーティリティ --------------------------------------------------
-load_dotenv()
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL is not set")
-
+# -----------------------------------------------------------------------------
+# 接続（AUTOCOMMITを撤廃。begin() ヘルパで明示トランザクション運用）
+# -----------------------------------------------------------------------------
 engine: Engine = sa.create_engine(
     DATABASE_URL,
-    pool_pre_ping=True,                # 死んだ接続を自動再接続
-    isolation_level="AUTOCOMMIT",      # シンプルにイベント単位でコミット
+    pool_pre_ping=True,
+    # isolation_level="AUTOCOMMIT",  # ← 撤廃：原子性担保のため
 )
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+def _as_utc(dt: datetime | None) -> datetime | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+@contextmanager
+def begin() -> Connection:
+    """
+    明示トランザクション。複数の upsert/insert/update を
+    ひとまとまりに原子的に実行したい時に使う。
+    """
+    with engine.begin() as conn:
+        yield conn
 
 def _exec(stmt: sa.TextClause, params: dict, conn: Connection | None) -> None:
     if conn is not None:
@@ -133,16 +83,42 @@ def _exec(stmt: sa.TextClause, params: dict, conn: Connection | None) -> None:
         with engine.begin() as c:
             c.execute(stmt, params)
 
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+# -----------------------------------------------------------------------------
+# JSON / 変換
+# -----------------------------------------------------------------------------
+try:
+    import numpy as np
+except Exception:
+    np = None
 
-@contextmanager
-def begin() -> Connection:
-    """明示トランザクション。複数の upsert を1イベントで確定したい時に使う"""
-    with engine.begin() as conn:
-        yield conn
+def _to_plain(obj):
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    if isinstance(obj, Decimal):
+        return float(obj)
+    if np is not None:
+        if isinstance(obj, (np.floating,)): return float(obj)
+        if isinstance(obj, (np.integer,)):  return int(obj)
+        if isinstance(obj, (np.bool_,)):    return bool(obj)
+        if isinstance(obj, (np.ndarray,)):  return obj.tolist()
+    if isinstance(obj, dict):
+        return {str(k): _to_plain(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_to_plain(v) for v in obj]
+    return str(obj)
 
-# --- スキーマのメタ（Alembicで作ったテーブル名に一致させる） --------------
+def _jsonable(v):
+    # psycopg2.Json を使える場合は優先。なければプレーン（dict/list は事前plain化）
+    if isinstance(v, (dict, list, tuple, set)):
+        plain = _to_plain(v)
+        return _PsycoJson(plain) if _PsycoJson else plain
+    return _to_plain(v)
+
+# -----------------------------------------------------------------------------
+# テーブル（メタ）
+# -----------------------------------------------------------------------------
 orders = sa.table(
     "orders",
     sa.column("order_id", sa.String),
@@ -155,6 +131,7 @@ orders = sa.table(
     sa.column("placed_at", sa.DateTime(timezone=True)),
     sa.column("raw", sa.JSON),
 )
+
 fills = sa.table(
     "fills",
     sa.column("fill_id", sa.String),
@@ -165,9 +142,11 @@ fills = sa.table(
     sa.column("executed_at", sa.DateTime(timezone=True)),
     sa.column("raw", sa.JSON),
 )
+
 positions = sa.table(
     "positions",
     sa.column("position_id", sa.String),
+    sa.column("user_id", sa.BigInteger),
     sa.column("symbol", sa.String),
     sa.column("side", sa.String),
     sa.column("size", sa.Numeric),
@@ -175,10 +154,14 @@ positions = sa.table(
     sa.column("opened_at", sa.DateTime(timezone=True)),
     sa.column("updated_at", sa.DateTime(timezone=True)),
     sa.column("raw", sa.JSON),
+    sa.column("strategy_id", sa.String),
+    sa.column("source", sa.String),
 )
+
 trades = sa.table(
     "trades",
     sa.column("trade_id", sa.String),
+    sa.column("user_id", sa.BigInteger),
     sa.column("symbol", sa.String),
     sa.column("side", sa.String),
     sa.column("entry_position_id", sa.String),
@@ -191,7 +174,10 @@ trades = sa.table(
     sa.column("holding_hours", sa.Numeric),
     sa.column("closed_at", sa.DateTime(timezone=True)),
     sa.column("raw", sa.JSON),
+    sa.column("strategy_id", sa.String),
+    sa.column("source", sa.String),
 )
+
 balance_snapshots = sa.table(
     "balance_snapshots",
     sa.column("ts", sa.DateTime(timezone=True)),
@@ -200,6 +186,7 @@ balance_snapshots = sa.table(
     sa.column("profit_loss", sa.Numeric),
     sa.column("raw", sa.JSON),
 )
+
 errors = sa.table(
     "errors",
     sa.column("id", sa.BigInteger),
@@ -209,6 +196,7 @@ errors = sa.table(
     sa.column("stack", sa.Text),
     sa.column("raw", sa.JSON),
 )
+
 user_integrations = sa.table(
     "user_integrations",
     sa.column("user_id", sa.BigInteger),
@@ -219,6 +207,7 @@ user_integrations = sa.table(
     sa.column("created_at", sa.DateTime(timezone=True)),
     sa.column("updated_at", sa.DateTime(timezone=True)),
 )
+
 user_line_endpoints = sa.table(
     "user_line_endpoints",
     sa.column("user_id", sa.BigInteger),
@@ -229,6 +218,7 @@ user_line_endpoints = sa.table(
     sa.column("created_at", sa.DateTime(timezone=True)),
     sa.column("updated_at", sa.DateTime(timezone=True)),
 )
+
 line_channels = sa.table(
     "line_channels",
     sa.column("id", sa.BigInteger),
@@ -238,6 +228,7 @@ line_channels = sa.table(
     sa.column("created_at", sa.DateTime(timezone=True)),
     sa.column("updated_at", sa.DateTime(timezone=True)),
 )
+
 signals = sa.table(
     "signals",
     sa.column("signal_id", sa.String),
@@ -259,66 +250,79 @@ signals = sa.table(
     sa.column("version", sa.String),
     sa.column("status", sa.String),
     sa.column("raw", sa.JSON),
+    sa.column("source", sa.String),   # ← 追加：実スキーマ準拠
 )
 
-try:
-    import numpy as np
-except Exception:
-    np = None
+# -----------------------------------------------------------------------------
+# 参照系
+# -----------------------------------------------------------------------------
+def get_trades_between(start_dt, end_dt, symbols=None, min_abs_pnl=None):
+    start_utc = _as_utc(start_dt)
+    end_utc   = _as_utc(end_dt)
+    where = ["closed_at >= :start_dt", "closed_at < :end_dt"]
+    params = {"start_dt": start_utc, "end_dt": end_utc}
+    if symbols:
+        where.append("symbol = ANY(:syms)")
+        params["syms"] = list(symbols)
+    if min_abs_pnl is not None:
+        where.append("ABS(pnl) >= :min_abs_pnl")
+        params["min_abs_pnl"] = float(min_abs_pnl)
+    sql = f"""
+        SELECT trade_id, symbol, side, entry_position_id, exit_order_id,
+               entry_price, exit_price, size, pnl, pnl_pct,
+               holding_hours, closed_at, raw
+          FROM trades
+         WHERE {' AND '.join(where)}
+         ORDER BY closed_at ASC
+    """
+    with engine.begin() as conn:
+        rows = conn.execute(sa.text(sql), params).mappings().all()
+    return [dict(r) for r in rows]
 
-def _to_plain(obj):
-    """raw を JSON セーフな素の Python 型へ再帰変換"""
-    # None / プリミティブ
-    if obj is None or isinstance(obj, (str, int, float, bool)):
-        return obj
+def get_trades_for_day_jst(day_dt):
+    day = day_dt
+    if day.tzinfo is None: day = day.replace(tzinfo=JST)
+    else:                  day = day.astimezone(JST)
+    start_jst = day.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_jst   = start_jst + timedelta(days=1)
+    return get_trades_between(start_jst, end_jst)
 
-    # 日付・日時
-    if isinstance(obj, (datetime, date)):
-        return obj.isoformat()
+def get_signals_between(start_dt, end_dt, *, symbol: str | None = None, timeframe: str | None = None):
+    where = ["generated_at >= :start_dt", "generated_at < :end_dt"]
+    params = {"start_dt": start_dt, "end_dt": end_dt}
+    if symbol:
+        where.append("symbol = :symbol"); params["symbol"] = symbol
+    if timeframe:
+        where.append("timeframe = :timeframe"); params["timeframe"] = timeframe
+    sql = f"""
+        SELECT *
+          FROM signals
+         WHERE {' AND '.join(where)}
+         ORDER BY generated_at DESC
+    """
+    with engine.begin() as conn:
+        rows = conn.execute(sa.text(sql), params).mappings().all()
+    return [dict(r) for r in rows]
 
-    # Decimal
-    if isinstance(obj, Decimal):
-        # 精度を保ちたいなら str(obj) でもOK
-        return float(obj)
+def get_public_metrics_daily(start, end) -> List[Dict[str, Any]]:
+    sql = text("""
+        SELECT metric_date, symbols
+          FROM public_metrics_daily
+         WHERE metric_date >= :start AND metric_date <= :end
+         ORDER BY metric_date ASC
+    """)
+    with engine.connect() as conn:
+        rows = conn.execute(sql, {"start": start, "end": end}).mappings().all()
+    return [dict(r) for r in rows]
 
-    # numpy 系
-    if np is not None:
-        if isinstance(obj, (np.floating,)):
-            return float(obj)
-        if isinstance(obj, (np.integer,)):
-            return int(obj)
-        if isinstance(obj, (np.bool_,)):
-            return bool(obj)
-        if isinstance(obj, (np.ndarray,)):
-            return obj.tolist()
-
-    # 辞書
-    if isinstance(obj, dict):
-        return {str(k): _to_plain(v) for k, v in obj.items()}
-
-    # リスト/タプル/セット
-    if isinstance(obj, (list, tuple, set)):
-        return [_to_plain(v) for v in obj]
-
-    # それ以外はとりあえず文字列化（最後の保険）
-    return str(obj)
-
-def _jsonable(v):
-    from psycopg2.extras import Json as _PsycoJson  # 既にtry import済みなら不要
-    # コンテナは plain 化してそのまま返す（Jsonラッパ or プレーン）
-    if isinstance(v, (dict, list, tuple, set)):
-        plain = _to_plain(v)
-        return _PsycoJson(plain) if _PsycoJson else plain
-    # スカラはプレーンに
-    return _to_plain(v)
-    
-# --- Upsert/Insert API（冪等） ----------------------------------------------
-
+# -----------------------------------------------------------------------------
+# 書き込み系（すべて conn オプションを受け取り、_exec(..., conn=conn) で統一）
+# -----------------------------------------------------------------------------
 @retry(stop=stop_after_attempt(3), wait=wait_exponential_jitter(0.2, 1.5))
 def insert_order(
     order_id: str, symbol: str, side: str, type_: str, size: float,
     status: str, requested_at: Optional[datetime], placed_at: Optional[datetime],
-    raw: Optional[Dict[str, Any]] = None, conn: Optional[Connection] = None
+    raw: Optional[Dict[str, Any]] = None, *, conn: Optional[Connection] = None
 ) -> None:
     stmt = sa.text("""
         INSERT INTO orders (order_id, symbol, side, type, size, status, requested_at, placed_at, raw)
@@ -328,16 +332,20 @@ def insert_order(
             placed_at = COALESCE(EXCLUDED.placed_at, orders.placed_at),
             raw = COALESCE(EXCLUDED.raw, orders.raw)
     """)
-    params = dict(order_id=order_id, symbol=symbol, side=side, type=type_,
-                  size=size, status=status, requested_at=requested_at,
-                  placed_at=placed_at, raw=_jsonable(raw))
+    params = dict(
+        order_id=order_id, symbol=symbol, side=side, type=type_,
+        size=size, status=status,
+        requested_at=_as_utc(requested_at),
+        placed_at=_as_utc(placed_at),
+        raw=_jsonable(raw),
+    )
     _exec(stmt, params, conn)
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential_jitter(0.2, 1.5))
 def upsert_fill(
     fill_id: Optional[str], order_id: str, price: float, size: float,
     fee: Optional[float], executed_at: datetime, raw: Optional[Dict[str, Any]] = None,
-    conn: Optional[Connection] = None
+    *, conn: Optional[Connection] = None
 ) -> str:
     fid = fill_id or str(uuid4())
     stmt = sa.text("""
@@ -349,8 +357,10 @@ def upsert_fill(
             fee   = COALESCE(EXCLUDED.fee, fills.fee),
             raw   = COALESCE(EXCLUDED.raw, fills.raw)
     """)
-    params = dict(fill_id=fid, order_id=order_id, price=price, size=size,
-                  fee=fee, executed_at=executed_at, raw=_jsonable(raw))
+    params = dict(
+        fill_id=fid, order_id=order_id, price=price, size=size,
+        fee=fee, executed_at=_as_utc(executed_at), raw=_jsonable(raw)
+    )
     _exec(stmt, params, conn)
     return fid
 
@@ -396,8 +406,8 @@ def upsert_position(
         side=side,
         size=size,
         avg_entry_price=avg_entry_price,
-        opened_at=opened_at,
-        updated_at=updated_at or utcnow(),
+        opened_at=_as_utc(opened_at),
+        updated_at=_as_utc(updated_at) or utcnow(),
         raw=_jsonable(raw),
         strategy_id=strategy_id,
         source=source,
@@ -442,9 +452,8 @@ def insert_trade(
         entry_position_id=entry_position_id, exit_order_id=exit_order_id,
         entry_price=entry_price, exit_price=exit_price, size=size,
         pnl=pnl, pnl_pct=pnl_pct, holding_hours=holding_hours,
-        closed_at=closed_at, raw=_jsonable(raw),
-        strategy_id=strategy_id,
-        source=source,
+        closed_at=_as_utc(closed_at), raw=_jsonable(raw),
+        strategy_id=strategy_id, source=source,
     )
     _exec(stmt, params, conn)
     return tid
@@ -453,7 +462,7 @@ def insert_trade(
 def insert_balance_snapshot(
     ts: Optional[datetime], total_balance: float,
     available_margin: Optional[float], profit_loss: Optional[float],
-    raw: Optional[Dict[str, Any]] = None, conn: Optional[Connection] = None
+    raw: Optional[Dict[str, Any]] = None, *, conn: Optional[Connection] = None
 ) -> None:
     stmt = sa.text("""
         INSERT INTO balance_snapshots (ts, total_balance, available_margin, profit_loss, raw)
@@ -465,7 +474,7 @@ def insert_balance_snapshot(
             raw = COALESCE(EXCLUDED.raw, balance_snapshots.raw)
     """)
     params = dict(
-        ts=ts or utcnow(),
+        ts=_as_utc(ts) or utcnow(),
         total_balance=total_balance,
         available_margin=available_margin,
         profit_loss=profit_loss,
@@ -485,6 +494,7 @@ def insert_error(where: str, message: str, stack: Optional[str] = None, raw: Any
     except Exception:
         pass
 
+# signals は conn を受け取れるように修正（呼び出し側Txに参加）
 def insert_signal(
     *,
     signal_id: Optional[str] = None,
@@ -507,6 +517,7 @@ def insert_signal(
     status: Optional[str] = "new",
     raw: Optional[Dict[str, Any]] = None,
     source: Optional[str] = None,
+    conn: Optional[Connection] = None,  # ← ここはそのままでOK
 ) -> str:
     sid = signal_id or str(uuid4())
     stmt = sa.text("""
@@ -532,58 +543,63 @@ def insert_signal(
         di_plus=di_plus, di_minus=di_minus,
         ema_fast=ema_fast, ema_slow=ema_slow,
         price=price,
-        generated_at=generated_at or datetime.now(timezone.utc),
+        generated_at=_as_utc(generated_at) or utcnow(),
         strategy_id=strategy_id, version=version,
         status=status,
         raw=_jsonable(raw),
         source=source,
     )
-    with engine.begin() as conn:
-        conn.execute(stmt, params)
+    _exec(stmt, params, conn)
     return sid
 
-# --- 便利: 注文→約定 の一括トランザクション例 -------------------------------
+def update_signal_status(signal_id: str, new_status: str, *, conn: Optional[Connection] = None) -> None:
+    stmt = sa.text("""
+        UPDATE signals SET status = :new_status
+         WHERE signal_id = :signal_id
+    """)
+    _exec(stmt, {"new_status": new_status, "signal_id": signal_id}, conn)
 
+# 注文→約定（fills upsert + orders EXECUTED）も呼び出し側Txに参加可能に
 def mark_order_executed_with_fill(
     order_id: str, executed_size: float, price: float, fee: Optional[float],
     executed_at: datetime, fill_raw: Optional[Dict[str, Any]] = None,
-    order_raw: Optional[Dict[str, Any]] = None,
+    order_raw: Optional[Dict[str, Any]] = None, *,
+    conn: Optional[Connection] = None,
 ) -> None:
-    """orders.status を EXECUTED にし、fills を upsert（同一トランザクション）"""
-    with begin() as conn:
-        # status 更新
-        conn.execute(sa.text("""
-            UPDATE orders SET status = 'EXECUTED', raw = COALESCE(:raw, raw)
-            WHERE order_id = :oid
+    def _do(c: Connection):
+        # orders を EXECUTED に
+        c.execute(sa.text("""
+            UPDATE orders
+               SET status = 'EXECUTED',
+                   raw    = COALESCE(:raw, raw)
+             WHERE order_id = :oid
         """), {"oid": order_id, "raw": _jsonable(order_raw)})
 
-        # fill upsert
+        # fills upsert
         upsert_fill(
             fill_id=None, order_id=order_id, price=price, size=executed_size,
-            fee=fee, executed_at=executed_at, raw=fill_raw, conn=conn
+            fee=fee, executed_at=_as_utc(executed_at) or utcnow(),
+            raw=fill_raw, conn=c
         )
 
-def ping_db_once():
-    try:
-        with engine.begin() as conn:
-            conn.execute(sa.text("SELECT current_database() as db, current_user as usr, now() as ts"))
-        # ここで errors にも 1 行残して「ping OK」を見える化（同じDBに入るか確認用）
-        insert_error("boot/ping", "ping ok", raw={"url": _redact_url(DATABASE_URL)})
-    except Exception as e:
-        insert_error("boot/ping", f"ping failed: {e}")
+    if conn is not None:
+        _do(conn)
+    else:
+        with begin() as c:
+            _do(c)
 
+# -----------------------------------------------------------------------------
+# LINE関連（必要に応じて呼び出し側Txへ参加可のものは conn を増設）
+# -----------------------------------------------------------------------------
 @retry(stop=stop_after_attempt(3), wait=wait_exponential_jitter(0.2, 1.5))
 def upsert_user_integration_token(
     user_id: int,
     provider: str,
-    token_enc: bytes,       # ← 暗号化済（Fernet等）。平文はここに渡さない
+    token_enc: bytes,
     token_last4: str,
     status: str = "active",
-    conn: Optional[Connection] = None,
+    *, conn: Optional[Connection] = None,
 ) -> None:
-    """
-    暗号化済みトークンを保存（既存があれば更新）。1ユーザー×1プロバイダ=1行で維持。
-    """
     stmt = sa.text("""
         INSERT INTO user_integrations (user_id, provider, access_token_enc, token_last4, status)
         VALUES (:user_id, :provider, :access_token_enc, :token_last4, :status)
@@ -600,14 +616,8 @@ def upsert_user_integration_token(
     _exec(stmt, params, conn)
 
 def get_active_user_integration_token(
-    user_id: int,
-    provider: str,
-    conn: Optional[Connection] = None,
+    user_id: int, provider: str, *, conn: Optional[Connection] = None,
 ) -> Optional[tuple[bytes, str]]:
-    """
-    アクティブな暗号化済みトークンを取得（見つからなければ None）。
-    戻り値: (token_enc, token_last4)
-    """
     stmt = sa.text("""
         SELECT access_token_enc, token_last4
           FROM user_integrations
@@ -627,14 +637,8 @@ def get_active_user_integration_token(
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential_jitter(0.2, 1.5))
 def set_user_integration_status(
-    user_id: int,
-    provider: str,
-    status: str,   # 'revoked' | 'error' | 'active'
-    conn: Optional[Connection] = None,
+    user_id: int, provider: str, status: str, *, conn: Optional[Connection] = None,
 ) -> None:
-    """
-    ステータス更新（失効/エラー時などに使用）。
-    """
     stmt = sa.text("""
         UPDATE user_integrations
            SET status = :status,
@@ -645,7 +649,6 @@ def set_user_integration_status(
     params = dict(user_id=user_id, provider=provider, status=status)
     _exec(stmt, params, conn)
 
-# 1) ユーザーごとの送信先（LINE userId=U...）を登録/更新
 @retry(stop=stop_after_attempt(3), wait=wait_exponential_jitter(0.2, 1.5))
 def upsert_line_endpoint(user_id: int, line_user_id: str, display_name: Optional[str] = None) -> None:
     stmt = sa.text("""
@@ -659,7 +662,6 @@ def upsert_line_endpoint(user_id: int, line_user_id: str, display_name: Optional
     """)
     _exec(stmt, {"user_id": user_id, "line_user_id": line_user_id, "display_name": display_name}, None)
 
-# 2) 単一ユーザーのLINE userId を取得（なければ None）
 def get_line_user_id(user_id: int) -> Optional[str]:
     stmt = sa.text("""
         SELECT line_user_id
@@ -671,7 +673,6 @@ def get_line_user_id(user_id: int) -> Optional[str]:
         row = c.execute(stmt, {"user_id": user_id}).fetchone()
     return row[0] if row else None
 
-# 3) 複数ユーザー分のLINE userIdを配列で取得（multicast 用）
 def get_line_user_ids_for_users(user_ids: Sequence[int]) -> list[str]:
     if not user_ids:
         return []
@@ -684,7 +685,6 @@ def get_line_user_ids_for_users(user_ids: Sequence[int]) -> list[str]:
         rows = c.execute(stmt, {"ids": list(user_ids)}).fetchall()
     return [r[0] for r in rows]
 
-# 4) エンドポイントの状態更新（例: ブロック検出時に 'blocked' へ）
 @retry(stop=stop_after_attempt(3), wait=wait_exponential_jitter(0.2, 1.5))
 def set_line_endpoint_status(user_id: int, status: str) -> None:
     stmt = sa.text("""
@@ -693,9 +693,6 @@ def set_line_endpoint_status(user_id: int, status: str) -> None:
          WHERE user_id = :user_id
     """)
     _exec(stmt, {"user_id": user_id, "status": status}, None)
-
-# --- （任意）チャネル・トークンをDBで運用する場合 --------------------------
-#  * 現状は .env の LINE_CHANNEL_ACCESS_TOKEN でOK。将来マルチテナント時に活用。
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential_jitter(0.2, 1.5))
 def upsert_line_channel_token(provider_key: str, access_token_enc: bytes, status: str = "active") -> None:
@@ -720,54 +717,39 @@ def get_line_channel_token(provider_key: str) -> Optional[bytes]:
         row = c.execute(stmt, {"k": provider_key}).fetchone()
     return row[0] if row else None
 
-def update_signal_status(signal_id: str, new_status: str) -> None:
+@retry(stop=stop_after_attempt(3), wait=wait_exponential_jitter(0.2, 1.5))
+def upsert_price_cache(
+    symbol: str,
+    price: float,
+    ts: datetime,
+    *, conn: Optional[Connection] = None,
+) -> None:
+    """
+    現在価格の簡易キャッシュをUPSERT（symbol単位で最新値を保持）
+    期待スキーマ:
+        CREATE TABLE IF NOT EXISTS price_cache (
+            symbol text PRIMARY KEY,
+            price numeric,
+            ts timestamptz NOT NULL
+        );
+    """
     stmt = sa.text("""
-        UPDATE signals SET status = :new_status
-         WHERE signal_id = :signal_id
-    """)
-    with engine.begin() as conn:
-        conn.execute(stmt, {"new_status": new_status, "signal_id": signal_id})
-
-def get_signals_between(start_dt, end_dt, *, symbol: str | None = None, timeframe: str | None = None):
-    where = ["generated_at >= :start_dt", "generated_at < :end_dt"]
-    params = {"start_dt": start_dt, "end_dt": end_dt}
-    if symbol:
-        where.append("symbol = :symbol"); params["symbol"] = symbol
-    if timeframe:
-        where.append("timeframe = :timeframe"); params["timeframe"] = timeframe
-    sql = f"""
-        SELECT *
-          FROM signals
-         WHERE {' AND '.join(where)}
-         ORDER BY generated_at DESC
-    """
-    with engine.begin() as conn:
-        rows = conn.execute(sa.text(sql), params).mappings().all()
-    return [dict(r) for r in rows]
-
-def get_public_metrics_daily(start, end) -> List[Dict[str, Any]]:
-    """
-    public_metrics_daily から日次行を取得
-    返り値: [{'metric_date': date, 'symbols': {...}}, ...]
-    """
-    sql = text("""
-        SELECT metric_date, symbols
-        FROM public_metrics_daily
-        WHERE metric_date >= :start AND metric_date <= :end
-        ORDER BY metric_date ASC
-    """)
-    # engine は既存の db.py で定義されている想定
-    with engine.connect() as conn:
-        rows = conn.execute(sql, {"start": start, "end": end}).mappings().all()
-    return [dict(r) for r in rows]
-
-def upsert_price_cache(symbol: str, last: float, ts: datetime | None = None) -> None:
-    stmt = sa.text("""
-        INSERT INTO price_cache (symbol, last, ts)
-        VALUES (:symbol, :last, :ts)
+        INSERT INTO price_cache (symbol, price, ts)
+        VALUES (:symbol, :price, :ts)
         ON CONFLICT (symbol) DO UPDATE
-        SET last = EXCLUDED.last,
-            ts   = EXCLUDED.ts
+        SET price = EXCLUDED.price,
+            ts    = EXCLUDED.ts
     """)
-    with engine.begin() as conn:
-        conn.execute(stmt, {"symbol": symbol, "last": float(last), "ts": ts or utcnow()})
+    params = dict(symbol=symbol, price=price, ts=_as_utc(ts) or utcnow())
+    _exec(stmt, params, conn)
+
+# -----------------------------------------------------------------------------
+# ユーティリティ
+# -----------------------------------------------------------------------------
+def ping_db_once():
+    try:
+        with engine.begin() as conn:
+            conn.execute(sa.text("SELECT current_database() as db, current_user as usr, now() as ts"))
+        insert_error("boot/ping", "ping ok", raw={"url": _redact_url(DATABASE_URL)})
+    except Exception as e:
+        insert_error("boot/ping", f"ping failed: {e}")

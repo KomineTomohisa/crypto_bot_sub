@@ -26,7 +26,8 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import socket
 from db import (
-    insert_order, mark_order_executed_with_fill,
+    begin,
+    insert_order, upsert_fill,                 # ★ upsert_fill を追加
     upsert_position, insert_trade, insert_balance_snapshot, utcnow, insert_error
 )
 from db import get_line_user_id, get_line_user_ids_for_users  # 既に追加済みのDB関数
@@ -34,6 +35,7 @@ from db import get_trades_between
 from db import insert_signal
 from db import update_signal_status
 from db import upsert_price_cache
+from uuid import UUID
 
 is_backtest_mode = "backtest" in sys.argv
 
@@ -136,6 +138,23 @@ def row_to_report_trade(row):
         "entry_price": row.get("entry_price"),
         "holding_hours": row.get("holding_hours"),
     }
+
+def to_uuid_or_none(v: str | None) -> str | None:
+    if not v:
+        return None
+    try:
+        # 正規化した文字列表現（ハイフン付き）に変換
+        return str(UUID(str(v)))
+    except Exception:
+        return None
+
+def default_source_from_env(self) -> str:
+    # liveならreal、バックテストならbacktest、なければsim
+    if getattr(self, "is_backtest_mode", False):
+        return "backtest"
+    if self.exchange_settings_gmo.get("live_trade"):
+        return "real"
+    return "sim"
 
 class PriceCacheRefresher:
     def __init__(self, symbols, get_price_fn, interval_sec=30, logger=None):
@@ -1792,24 +1811,6 @@ class CryptoTradingBot:
                     order_id = str(data)
                 self.logger.info(f"注文成功: {gmo_symbol} {side} {size}, 注文ID: {order_id}")
 
-                # --- DB: 注文レコードを登録（冪等） ---
-                try:
-                    self.logger.info("[DBHOOK] insert_order about to call: order_id=%s symbol=%s side=%s size=%s",order_id, symbol, side, size)
-
-                    insert_order(
-                        order_id=str(order_id),
-                        symbol=symbol,                       # 直上でも使っている symbol を渡す
-                        side=side,                           # このコードでは "BUY"/"SELL"
-                        type_="MARKET",                      # ここが成行なら MARKET。変数があれば置き換え可
-                        size=float(size),
-                        status="ORDERED",
-                        requested_at=utcnow(),
-                        placed_at=utcnow(),
-                        raw=response                         # GMOのレスポンスをそのまま保存
-                    )
-                except Exception as e:
-                    insert_error("place_order/insert_order", str(e), raw={"order_id": order_id})
-
                 # --- 直後のポジション同期で「建玉の建値」と「実約定サイズ」を取得する ---
                 position_id = None
                 avg_entry = 0.0              # 取得できたら更新
@@ -1869,22 +1870,42 @@ class CryptoTradingBot:
 
                 # --- DB: ポジションを upsert ---
                 if position_id and executed_size_pos > 0:
-                    try:
-                        self.logger.info("[DBHOOK] upsert_position: pos_id=%s size=%s avg=%s", position_id, executed_size_pos, avg_entry)
-                        upsert_position(
-                            position_id=str(position_id),
-                            symbol=symbol,
-                            side=("long" if side == "BUY" else "short"),
-                            size=float(executed_size_pos),
-                            avg_entry_price=float(avg_entry) if avg_entry else 0.0,
-                            opened_at=utcnow(),
-                            updated_at=utcnow(),
-                            raw=response
-                        )
-                    except Exception as e:
-                        insert_error("place_order/upsert_position", str(e),
-                                    raw={"position_id": position_id, "avg_entry": avg_entry, "size": executed_size_pos})
-    
+                    # source は NOT NULL 想定：live なら "real"、模擬なら "sim" をデフォルトに
+                    default_source = getattr(self, "source", None) or (
+                        "real" if self.exchange_settings_gmo.get("live_trade") else "sim"
+                    )
+                    # --- UUID検証（不正ならNoneに落とす or 必要ならuuid4()を発行） ---
+                    def _to_uuid_or_none(v):
+                        if not v:
+                            return None
+                        try:
+                            import uuid
+                            return str(uuid.UUID(str(v)))
+                        except Exception:
+                            return None
+
+                    strategy_uuid = _to_uuid_or_none(getattr(self, "strategy_id", None))
+                    # 必須なら: strategy_uuid = strategy_uuid or str(uuid.uuid4())
+
+                    # --- DBUPSERT：握りつぶさずFail-Fastに変更（原因追跡のため） ---
+                    self.logger.info(
+                        "[DBHOOK] upsert_position: pos_id=%s size=%s avg=%s strat=%s src=%s user=%s",
+                        position_id, executed_size_pos, avg_entry, strategy_uuid,
+                        default_source, getattr(self, "user_id", None)
+                    )
+                    upsert_position(
+                        position_id=str(position_id),               # DB: varchar(80)
+                        symbol=symbol,                               # DB: varchar(32)
+                        side=("long" if side == "BUY" else "short"), # DB: varchar(8) 想定
+                        size=float(executed_size_pos),               # DB: numeric(24,8)
+                        avg_entry_price=float(avg_entry) if avg_entry else 0.0,
+                        opened_at=utcnow(),                          # DB: timestamptz
+                        updated_at=utcnow(),                          # DB: timestamptz
+                        raw={"order_response": response},
+                        strategy_id=strategy_uuid,          # None 可ならこのまま
+                        source=default_source,              # ← ここを必ず非NULLに
+                        user_id=getattr(self, "user_id", None)        # DB: int8
+                    )
 
                 # 建玉から建値が取れたら entry_prices を更新
                 if avg_entry > 0:
@@ -2240,13 +2261,6 @@ class CryptoTradingBot:
                     time.sleep(2)
                     continue
 
-                # （追加）エントリー signals を 'sent' に更新（注文が通った時点）
-                try:
-                    if signal_id:
-                        update_signal_status(signal_id, "sent")
-                except Exception as e:
-                    self.logger.warning(f"シグナルstatus更新失敗: {e}")
-
                 # 2) 約定確認（数回試行）
                 for check in range(5):
                     time.sleep(3)
@@ -2257,34 +2271,81 @@ class CryptoTradingBot:
 
                         # 決済注文ならローカルのポジション情報クリア
                         if current_position is not None:
-                            if (current_position == 'long' and order_type == 'sell') or \
-                            (current_position == 'short' and order_type == 'buy'):
+                            _ot = str(order_type).lower()
+                            if (current_position == 'long' and _ot == 'sell') or \
+                               (current_position == 'short' and _ot == 'buy'):
                                 self.logger.info(f"{symbol}のポジションを決済しました")
                                 self.positions[symbol] = None
                                 self.entry_prices[symbol] = 0
                                 self.entry_times[symbol] = None
                                 self.entry_sizes[symbol] = 0
 
-                        # 決済の約定確認: executed_size > 0 が取れた直後に
+                        # 約定確認直後：DB書き込みを一体トランザクションで確定
                         try:
-                            exec_price = float(self.get_current_price(symbol) or 0.0)  # 取引所から即時取得できる最新価格で代替
-                            self.logger.info("[DBHOOK] mark_order_executed_with_fill (CLOSE): order_id=%s exec_size=%s price=%s symbol=%s",
-                                            order_id, executed_size, exec_price, symbol)
-                            mark_order_executed_with_fill(
-                                order_id=str(order_id),
-                                executed_size=float(executed_size),
-                                price=exec_price,
-                                fee=None,
-                                executed_at=utcnow(),
-                                fill_raw={
-                                    "source": order_type,
-                                    "symbol": symbol,
-                                    # （追加）signal_id を橋渡し：後続分析でトレース可能
-                                    "signal_id": signal_id or None
-                                }
+                            exec_price = float(self.get_current_price(symbol) or 0.0)
+                            self.logger.info(
+                                "[DBTX] committing order+fill(+signal) atomically: order_id=%s exec_size=%s price=%s symbol=%s",
+                                order_id, executed_size, exec_price, symbol
                             )
+                            from datetime import datetime, timezone
+                            with begin() as conn:
+                                # 1) 注文（冪等）
+                                insert_order(
+                                    order_id=str(order_id),
+                                    symbol=symbol,
+                                    side=("BUY" if str(order_type).lower()=="buy" else "SELL"),
+                                    type_="MARKET",
+                                    size=float(executed_size),
+                                    status="EXECUTED",
+                                    requested_at=utcnow(),
+                                    placed_at=utcnow(),
+                                    raw={"place_order_response": order_result}
+                                         | {"execution_check":"direct"}
+                                         | {"signal_id": signal_id or None},
+                                    conn=conn,
+                                )
+                                # 2) フィル（冪等, 同一Tx）
+                                upsert_fill(
+                                    fill_id=None,
+                                    order_id=str(order_id),
+                                    price=float(exec_price),
+                                    size=float(executed_size),
+                                    fee=None,
+                                    executed_at=utcnow(),
+                                    raw={
+                                        "source": "entry_tx",
+                                        "symbol": symbol,
+                                        "signal_id": signal_id or None,
+                                        "order_type": str(order_type).lower(),  # 参照用
+                                    },
+                                    conn=conn,
+                                )
+                                # 2.5) ポジション（約定が確定し position_id が既知なら同一Txで反映）
+                                _pos_id = self.position_ids.get(symbol)
+                                if _pos_id:
+                                    sid = to_uuid_or_none(getattr(self, "strategy_id", None))
+                                    upsert_position(
+                                        position_id=str(_pos_id),
+                                        symbol=symbol,
+                                        side=("long" if str(order_type).lower()=="buy" else "short"),
+                                        size=float(executed_size),
+                                        avg_entry_price=float(exec_price),
+                                        opened_at=utcnow(),
+                                        updated_at=utcnow(),
+                                        raw={"source": "entry_tx"},
+                                        strategy_id=sid,                               # uuid or None
+                                        user_id=getattr(self, "user_id", None),
+                                        source=default_source_from_env(self),          # ← 非NULLを保証
+                                        conn=conn,
+                                    )                             
+                                # 3) シグナルstatus（エントリー時だけ）
+                                if signal_id:
+                                    update_signal_status(signal_id, "sent", conn=conn)
                         except Exception as e:
-                            insert_error("exit/fill", str(e), raw={"order_id": order_id, "symbol": symbol, "signal_id": signal_id or None})
+                            # Fail-Fast：Tx障害時は成功扱いにしない
+                            insert_error("entry/tx_commit", str(e),
+                                         raw={"order_id": order_id, "symbol": symbol, "signal_id": signal_id or None})
+                            raise
 
                         return {
                             'success': True,
@@ -2326,6 +2387,21 @@ class CryptoTradingBot:
                                     "signal_id": signal_id or None
                                 }
                             )
+                            # --- メモリ側も同期（エントリー/エグジット双方の整合性向上） ---
+                            if current_position is None:
+                                # フォールバック成立 = エントリー成功とみなす
+                                self.positions[symbol] = ("long" if str(order_type).lower()=="buy" else "short")
+                                self.entry_prices[symbol] = float(exec_price or 0.0)
+                                self.entry_times[symbol] = datetime.now()
+                                self.entry_sizes[symbol] = float(abs(net_size))
+                            else:
+                                # フォールバック成立 = 決済成功とみなす
+                                _ot = str(order_type).lower()
+                                if (current_position == 'long' and _ot == 'sell') or (current_position == 'short' and _ot == 'buy'):
+                                    self.positions[symbol] = None
+                                    self.entry_prices[symbol] = 0
+                                    self.entry_times[symbol] = None
+                                    self.entry_sizes[symbol] = 0
                         except Exception as e:
                             insert_error(
                                 "execute_order_with_confirmation/fallback_fill",
@@ -5494,11 +5570,11 @@ class CryptoTradingBot:
                     return
 
             # 複数ポジションを決済
+            total_order_ids = []
             close_results = []
             success_count = 0
             failed_count = 0
             total_executed_size = 0
-            total_order_ids = []
 
             # GMOコインの形式に変換
             gmo_symbol = self.symbol_mapping.get(symbol, symbol.upper().replace('_', ''))
@@ -5563,21 +5639,6 @@ class CryptoTradingBot:
                     if response.get("status") == 0:
                         order_id = str(response.get("data"))
                         self.logger.info(f"決済注文成功: 注文ID={order_id}")
-                        try:
-                            insert_order(
-                                order_id=str(order_id),
-                                symbol=symbol,        # DBは "ada_jpy" のような自分のシンボルを保存
-                                side=side,            # long決済→SELL / short決済→BUY（直前で決めている変数）
-                                type_="MARKET",       # 成行決済なら MARKET
-                                size=float(pos_size), # そのポジションの決済サイズ
-                                status="ORDERED",
-                                requested_at=utcnow(),
-                                placed_at=utcnow(),
-                                raw=response          # 取引所レスポンスをそのまま残す
-                            )
-                        except Exception as e:
-                            insert_error("close_position/insert_order", str(e),
-                                        raw={"order_id": order_id, "symbol": symbol})
                         success_count += 1
                         total_order_ids.append(order_id)
                         
@@ -5622,17 +5683,144 @@ class CryptoTradingBot:
                         executed_size = self.check_order_execution(order_id, symbol)
                         if executed_size > 0:
                             total_executed_size += float(executed_size)
-                
-                # 成功した決済がある場合
+                            
+                # Tx前で確定しておく（クリアされる前に掴む）
+                entry_pos_id_for_trade = self.position_ids.get(symbol)
+
+                # 成功した決済がある場合：ここで注文+フィルを原子的に確定
                 self.logger.info(f"{symbol}のポジション決済結果: 成功={success_count}, 失敗={failed_count}, 総約定サイズ={total_executed_size}")
-                
+
+                # 代表注文ID（成功したものの先頭）
+                repr_order_id = next((r.get('order_id') for r in close_results if r.get('success')), None)
+
+                # 事前ガード：IDなし or 約定サイズ0 なら、DB書込/トレード作成はしない
+                if not repr_order_id or float(total_executed_size) <= 0.0:
+                    insert_error(
+                        "close/skip_db_no_exec",
+                        f"repr_order_id={repr_order_id}, total_executed_size={total_executed_size}",
+                        raw={"symbol": symbol, "results": close_results},
+                    )
+                    # ローカル状態や通知も「クローズ未確定」として扱うなら、ここで return して様子見
+                    return
+
+                try:
+                    exec_price = float(self.get_current_price(symbol) or 0.0)
+                    closed_size = float(total_executed_size)
+                    saved_scores = self.entry_scores.get(symbol, {})
+                    
+                    trade_log_exit = {
+                        "symbol": symbol,
+                        "type": position,
+                        "entry_price": float(entry_price),
+                        "exit_price": float(exec_price),
+                        "size": closed_size,
+                        "profit": (exec_price - entry_price) * closed_size if position == "long" else (entry_price - exec_price) * closed_size,
+                        "profit_pct": ((exec_price - entry_price) / entry_price * 100.0) if position == "long" else ((entry_price - exec_price) / entry_price * 100.0),
+                        "holding_hours": hours,
+                        "exit_reason": exit_reason,
+                        # 参考情報（rawに残す用）
+                        "entry_time": entry_time,
+                        "scores": {
+                            "entry_atr": saved_scores.get("entry_atr", 0),
+                            "entry_adx": saved_scores.get("entry_adx", 0),
+                            "rsi_score_long":  saved_scores.get("rsi_score_long", 0),
+                            "rsi_score_short": saved_scores.get("rsi_score_short", 0),
+                            "cci_score_long":  saved_scores.get("cci_score_long", 0),
+                            "cci_score_short": saved_scores.get("cci_score_short", 0),
+                            "volume_score":    saved_scores.get("volume_score", 0),
+                            "bb_score_long":   saved_scores.get("bb_score_long", 0),
+                            "bb_score_short":  saved_scores.get("bb_score_short", 0),
+                            "ma_score_long":   saved_scores.get("ma_score_long", 0),
+                            "ma_score_short":  saved_scores.get("ma_score_short", 0),
+                            "adx_score_long":  saved_scores.get("adx_score_long", 0),
+                            "adx_score_short": saved_scores.get("adx_score_short", 0),
+                            "mfi_score_long":  saved_scores.get("mfi_score_long", 0),
+                            "mfi_score_short": saved_scores.get("mfi_score_short", 0),
+                            "atr_score_long":  saved_scores.get("atr_score_long", 0),
+                            "atr_score_short": saved_scores.get("atr_score_short", 0),
+                            "macd_score_long": saved_scores.get("macd_score_long", 0),
+                            "macd_score_short":saved_scores.get("macd_score_short", 0),
+                        },
+                    }
+
+                    trade_logs.append(trade_log_exit)
+
+                    from sqlalchemy.exc import IntegrityError
+                    with begin() as conn:
+                        # 1) 注文（冪等）
+                        upsert_order(  # ← 置換: insert_order -> upsert_order
+                            order_id=str(repr_order_id),
+                            symbol=symbol,
+                            side=side,               # "BUY"/"SELL"
+                            type_="MARKET",
+                            size=float(closed_size),
+                            status="EXECUTED",
+                            requested_at=utcnow(),
+                            placed_at=utcnow(),
+                            raw={"close_results": close_results},
+                            conn=conn,
+                        )
+
+                        # 2) フィル（冪等: (order_id, executed_at) 等でON CONFLICT）
+                        executed_at = self._choose_fill_time(close_results) or utcnow()  # 取引所の時刻があれば利用
+                        upsert_fill(
+                            fill_id=None,
+                            order_id=str(repr_order_id),
+                            price=float(exec_price),
+                            size=float(closed_size),
+                            fee=None,
+                            executed_at=executed_at,
+                            raw={"source": "exit_tx", "symbol": symbol},
+                            conn=conn,
+                        )
+
+                        # 2.5) ポジション（クローズ更新）
+                        _pos_id = self.position_ids.get(symbol)
+                        if _pos_id:
+                            sid = to_uuid_or_none(getattr(self, "strategy_id", None))
+                            upsert_position(
+                                position_id=str(_pos_id),
+                                symbol=symbol,
+                                side=position,         # "long"/"short"（保持側）
+                                size=0.0,              # ← クローズ確定
+                                avg_entry_price=float(self.entry_prices.get(symbol) or 0.0),
+                                opened_at=None,        # 実装側で COALESCE して既存保持
+                                updated_at=utcnow(),
+                                raw={"closed_by": "auto", "close_results": close_results},
+                                strategy_id=sid,
+                                user_id=getattr(self, "user_id", None),
+                                source=default_source_from_env(self),
+                                conn=conn,
+                            )
+
+                        # 3) トレード（entry_position_idはTx前に退避したものを使用）
+                        insert_trade(
+                            trade_id=None,
+                            symbol=trade_log_exit["symbol"],
+                            side=trade_log_exit.get("type", "long"),
+                            entry_position_id=entry_pos_id_for_trade,     # ← 退避値を使う
+                            exit_order_id=str(repr_order_id),
+                            entry_price=_num(trade_log_exit["entry_price"]),
+                            exit_price=_num(trade_log_exit["exit_price"]),
+                            size=_num(trade_log_exit["size"]),
+                            pnl=_num(trade_log_exit["profit"]),
+                            pnl_pct=_num(trade_log_exit["profit_pct"]),
+                            holding_hours=_num(trade_log_exit.get("holding_hours")),
+                            closed_at=utcnow(),
+                            raw=trade_log_exit,
+                            conn=conn,
+                        )
+
+                except IntegrityError as ie:
+                    insert_error("close/tx_commit/integrity", str(ie), raw={"symbol": symbol, "results": close_results})
+                    raise   # ← Fail-Fast（ここで止める）
+                except Exception as e:
+                    insert_error("close/tx_commit", str(e), raw={"symbol": symbol, "results": close_results})
+                    raise   # ← Fail-Fast（ここで止める）
+                    
                 # 損益計算
-                if position == 'long':
-                    profit = (current_price - entry_price) * entry_size
-                    profit_pct = (current_price - entry_price) / entry_price * 100
-                else:  # 'short'
-                    profit = (entry_price - current_price) * entry_size
-                    profit_pct = (entry_price - current_price) / entry_price * 100
+                profit = trade_log_exit["profit"]
+                profit_pct = trade_log_exit["profit_pct"]
                 
                 # 手数料を考慮
                 #profit *= 0.9976  # 0.24%の手数料
@@ -5664,8 +5852,8 @@ class CryptoTradingBot:
                         # こちらに差し替え
                         self._send_exit_detail(
                             symbol,
-                            exit_price=current_price,      # 約定平均が取れればそちらを渡す
-                            timeframe="5m",                # 主に使う時間足を指定
+                            exit_price=trade_log_exit["exit_price"],      # 約定平均が取れればそちらを渡す
+                            timeframe="15m",                # 主に使う時間足を指定
                             reason=exit_reason
                         )
                     except Exception as e:
@@ -5680,74 +5868,6 @@ class CryptoTradingBot:
                             score=None,
                             reason_tags=[exit_reason] if exit_reason else None
                         )
-                
-                # 保存されていたスコア値を取得
-                saved_scores = self.entry_scores.get(symbol, {})
-
-                # 取引ログを記録
-                trade_log_exit = {
-                    'symbol': symbol,
-                    'type': position,
-                    'entry_price': entry_price,
-                    'entry_time': entry_time,
-                    'entry_atr': saved_scores.get('entry_atr', 0),  # ← この行を追加
-                    'entry_adx': saved_scores.get('entry_adx', 0),  
-                    'exit_price': current_price,
-                    'exit_time': datetime.now(),
-                    'size': entry_size,
-                    'profit': profit,
-                    'profit_pct': profit_pct,
-                    'exit_reason': exit_reason,
-                    'holding_hours': hours,
-                    # 保存されたスコア値を使用
-                    'rsi_score_long': saved_scores.get('rsi_score_long', 0),
-                    'rsi_score_short': saved_scores.get('rsi_score_short', 0),
-                    'cci_score_long': saved_scores.get('cci_score_long', 0),
-                    'cci_score_short': saved_scores.get('cci_score_short', 0),
-                    'volume_score': saved_scores.get('volume_score', 0),
-                    'bb_score_long': saved_scores.get('bb_score_long', 0),
-                    'bb_score_short': saved_scores.get('bb_score_short', 0),
-                    'ma_score_long': saved_scores.get('ma_score_long', 0),
-                    'ma_score_short': saved_scores.get('ma_score_short', 0),
-                    'adx_score_long': saved_scores.get('adx_score_long', 0),
-                    'adx_score_short': saved_scores.get('adx_score_short', 0),
-                    'mfi_score_long': saved_scores.get('mfi_score_long', 0),
-                    'mfi_score_short': saved_scores.get('mfi_score_short', 0),
-                    'atr_score_long': saved_scores.get('atr_score_long', 0),
-                    'atr_score_short': saved_scores.get('atr_score_short', 0),
-                    'macd_score_long': saved_scores.get('macd_score_long', 0),
-                    'macd_score_short': saved_scores.get('macd_score_short', 0) 
-                }
-                trade_logs.append(trade_log_exit)
-                # --- DB: 決済トレードを記録 ---
-                self.logger.info("[DBHOOK] insert_trade: %s", trade_log_exit)
-
-                try:
-                    raw_safe = dict(trade_log_exit)
-                    for k in ("entry_time", "exit_time"):
-                        v = raw_safe.get(k)
-                        if hasattr(v, "isoformat"):
-                            raw_safe[k] = v.isoformat()
-
-                    # trade_log_exit のキー名 → insert_trade の引数にマッピング
-                    insert_trade(
-                        trade_id=None,
-                        symbol=trade_log_exit["symbol"],
-                        side=trade_log_exit.get("type", "long"),
-                        entry_position_id=self.position_ids.get(trade_log_exit["symbol"]),
-                        exit_order_id=str(order_id) if 'order_id' in locals() else None,
-                        entry_price=_num(trade_log_exit["entry_price"]),
-                        exit_price=_num(trade_log_exit["exit_price"]),
-                        size=_num(trade_log_exit["size"]),
-                        pnl=_num(trade_log_exit["profit"]),
-                        pnl_pct=_num(trade_log_exit["profit_pct"]),
-                        holding_hours=_num(trade_log_exit.get("holding_hours")),
-                        closed_at=utcnow(),
-                        raw=trade_log_exit,  # rawはdb側で_jsonable/_to_plainを通る実装
-                    )
-                except Exception as e:
-                    # 何かあれば errors に残す（何が入らなかったか raw も一緒に）
-                    insert_error("exit/insert_trade", str(e), raw=raw_safe)
                 
                 # ポジション情報をリセット
                 self.positions[symbol] = None
