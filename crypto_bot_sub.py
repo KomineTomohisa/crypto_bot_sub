@@ -35,6 +35,7 @@ from db import get_trades_between
 from db import insert_signal
 from db import update_signal_status
 from db import upsert_price_cache
+from db import mark_order_executed_with_fill
 from uuid import UUID
 
 is_backtest_mode = "backtest" in sys.argv
@@ -2212,31 +2213,31 @@ class CryptoTradingBot:
         signal_id = ""
         try:
             current_position_preview = self.positions.get(symbol)
-            if current_position_preview is None:
-                side_for_signal = "long" if str(order_type).lower() == "buy" else "short"
-                try:
-                    current_price_preview = float(self.get_current_price(symbol) or 0.0)
-                except Exception:
-                    current_price_preview = 0.0
+            # if current_position_preview is None:
+            side_for_signal = "long" if str(order_type).lower() == "buy" else "short"
+            try:
+                current_price_preview = float(self.get_current_price(symbol) or 0.0)
+            except Exception:
+                current_price_preview = 0.0
 
-                indicators = {
-                    "RSI": rsi, "ADX": adx, "ATR": atr,
-                    "DI+": di_plus, "DI-": di_minus,
-                    "EMA_fast": ema_fast, "EMA_slow": ema_slow,
-                } if any(v is not None for v in [rsi, adx, atr, di_plus, di_minus, ema_fast, ema_slow]) else None
+            indicators = {
+                "RSI": rsi, "ADX": adx, "ATR": atr,
+                "DI+": di_plus, "DI-": di_minus,
+                "EMA_fast": ema_fast, "EMA_slow": ema_slow,
+            } if any(v is not None for v in [rsi, adx, atr, di_plus, di_minus, ema_fast, ema_slow]) else None
 
-                signal_id = self._record_signal(
-                    symbol=symbol,
-                    timeframe=timeframe or "5m",
-                    side=side_for_signal,
-                    price=current_price_preview,
-                    strength_score=strength_score,
-                    indicators=indicators,
-                    strategy_id=strategy_id,
-                    version=version,
-                    status="new",
-                    raw=(signal_raw or {}) | {"source": "execute_order_with_confirmation/pre_order"}
-                )
+            signal_id = self._record_signal(
+                symbol=symbol,
+                timeframe=timeframe or "15m",
+                side=side_for_signal,
+                price=current_price_preview,
+                strength_score=strength_score,
+                indicators=indicators,
+                strategy_id=strategy_id,
+                version=version,
+                status="new",
+                raw=(signal_raw or {}) | {"source": "execute_order_with_confirmation/pre_order"}
+            )
         except Exception as e:
             self.logger.warning(f"シグナル事前記録スキップ: {e}")
 
@@ -2296,7 +2297,7 @@ class CryptoTradingBot:
                                     side=("BUY" if str(order_type).lower()=="buy" else "SELL"),
                                     type_="MARKET",
                                     size=float(executed_size),
-                                    status="EXECUTED",
+                                    status="ORDERED",
                                     requested_at=utcnow(),
                                     placed_at=utcnow(),
                                     raw={"place_order_response": order_result}
@@ -3346,6 +3347,7 @@ class CryptoTradingBot:
             df_5min.loc[df_5min['cci_score_short'].between(0.3, 0.355),'sell_signal'] = False
             df_5min.loc[df_5min['cci_score_short'].between(0.428, 0.496),'sell_signal'] = False
             df_5min.loc[df_5min['bb_score_long'].between(0.2, 0.235),'buy_signal'] = False
+            df_5min.loc[df_5min['bb_score_long'].between(0.425, 0.49),'buy_signal'] = False
             df_5min.loc[df_5min['bb_score_short'].between(0.457, 0.552),'sell_signal'] = False
             df_5min.loc[df_5min['bb_score_short'] > 0.571, 'sell_signal'] = False
             df_5min.loc[df_5min['ma_score_long'].between(0.2, 0.223),'buy_signal'] = False
@@ -3363,6 +3365,7 @@ class CryptoTradingBot:
             df_5min.loc[df_5min['rsi_score_long'].between(0.691, 0.743),'buy_signal'] = False
             df_5min.loc[df_5min['rsi_score_long'] > 0.768, 'buy_signal'] = False
             df_5min.loc[df_5min['rsi_score_short'].between(0.247, 0.372),'sell_signal'] = False
+            df_5min.loc[df_5min['bb_score_long'].between(0.315, 0.37),'buy_signal'] = False
             df_5min.loc[df_5min['bb_score_short'] > 0.534, 'sell_signal'] = False
             df_5min.loc[df_5min['mfi_score_short'] > 0.62, 'sell_signal'] = False
             df_5min.loc[df_5min['cci_score_long'].between(0.57, 0.616),'buy_signal'] = False
@@ -5747,34 +5750,28 @@ class CryptoTradingBot:
 
                     from sqlalchemy.exc import IntegrityError
                     with begin() as conn:
-                        # 1) 注文（冪等）
-                        upsert_order(  # ← 置換: insert_order -> upsert_order
+                        # 1) 注文+フィル（原子的に一括反映：orders を EXECUTED で UPSERT、fills も UPSERT）
+                        executed_at = utcnow()
+                        mark_order_executed_with_fill(
                             order_id=str(repr_order_id),
-                            symbol=symbol,
-                            side=side,               # "BUY"/"SELL"
-                            type_="MARKET",
-                            size=float(closed_size),
-                            status="EXECUTED",
-                            requested_at=utcnow(),
-                            placed_at=utcnow(),
-                            raw={"close_results": close_results},
-                            conn=conn,
-                        )
-
-                        # 2) フィル（冪等: (order_id, executed_at) 等でON CONFLICT）
-                        executed_at = self._choose_fill_time(close_results) or utcnow()  # 取引所の時刻があれば利用
-                        upsert_fill(
-                            fill_id=None,
-                            order_id=str(repr_order_id),
+                            executed_size=float(closed_size),
                             price=float(exec_price),
-                            size=float(closed_size),
                             fee=None,
                             executed_at=executed_at,
-                            raw={"source": "exit_tx", "symbol": symbol},
-                            conn=conn,
+                            # 付帯情報（監査・デバッグ用）
+                            fill_raw={"source": "exit_tx", "symbol": symbol},
+                            order_raw={"close_results": close_results},
+                            # orders が未作成だった場合の UPSERT 用ヒント
+                            symbol=symbol,
+                            side=side,                 # 既存の "BUY"/"SELL" をそのまま利用
+                            type_="MARKET",
+                            size_hint=float(closed_size),
+                            requested_at=utcnow(),
+                            placed_at=utcnow(),
+                            conn=conn,                 # ← 同一トランザクションに参加
                         )
 
-                        # 2.5) ポジション（クローズ更新）
+                        # 2) ポジション（クローズ更新）
                         _pos_id = self.position_ids.get(symbol)
                         if _pos_id:
                             sid = to_uuid_or_none(getattr(self, "strategy_id", None))
@@ -5797,8 +5794,8 @@ class CryptoTradingBot:
                         insert_trade(
                             trade_id=None,
                             symbol=trade_log_exit["symbol"],
-                            side=trade_log_exit.get("type", "long"),
-                            entry_position_id=entry_pos_id_for_trade,     # ← 退避値を使う
+                            side=trade_log_exit.get("type", "long"),  # 既存の仕様を維持
+                            entry_position_id=entry_pos_id_for_trade, # ← 退避値を使う
                             exit_order_id=str(repr_order_id),
                             entry_price=_num(trade_log_exit["entry_price"]),
                             exit_price=_num(trade_log_exit["exit_price"]),
@@ -5806,7 +5803,7 @@ class CryptoTradingBot:
                             pnl=_num(trade_log_exit["profit"]),
                             pnl_pct=_num(trade_log_exit["profit_pct"]),
                             holding_hours=_num(trade_log_exit.get("holding_hours")),
-                            closed_at=utcnow(),
+                            closed_at=executed_at,     # ここも executed_at を使うと整合的
                             raw=trade_log_exit,
                             conn=conn,
                         )

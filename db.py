@@ -564,29 +564,46 @@ def mark_order_executed_with_fill(
     order_id: str, executed_size: float, price: float, fee: Optional[float],
     executed_at: datetime, fill_raw: Optional[Dict[str, Any]] = None,
     order_raw: Optional[Dict[str, Any]] = None, *,
+    # 追加: ordersを新規に立てるための最低限の情報
+    symbol: Optional[str] = None,
+    side: Optional[str] = None,      # "BUY"/"SELL"
+    type_: str = "MARKET",
+    size_hint: Optional[float] = None,
+    requested_at: Optional[datetime] = None,
+    placed_at: Optional[datetime] = None,
     conn: Optional[Connection] = None,
 ) -> None:
     def _do(c: Connection):
-        # orders を EXECUTED に
+        # 1) orders を UPSERT（なければINSERT, あればEXECUTEDへUPDATE）
         c.execute(sa.text("""
-            UPDATE orders
-               SET status = 'EXECUTED',
-                   raw    = COALESCE(:raw, raw)
-             WHERE order_id = :oid
-        """), {"oid": order_id, "raw": _jsonable(order_raw)})
+            INSERT INTO orders (order_id, symbol, side, type, size, status, requested_at, placed_at, raw)
+            VALUES (:oid, :symbol, :side, :type, :size, 'EXECUTED', :req, :plc, :raw)
+            ON CONFLICT (order_id) DO UPDATE
+            SET status     = 'EXECUTED',
+                placed_at  = COALESCE(EXCLUDED.placed_at, orders.placed_at),
+                requested_at = COALESCE(EXCLUDED.requested_at, orders.requested_at),
+                raw        = COALESCE(EXCLUDED.raw, orders.raw)
+        """), {
+            "oid": order_id,
+            "symbol": symbol,
+            "side": side,
+            "type": type_,
+            "size": size_hint if size_hint is not None else executed_size,
+            "req": _as_utc(requested_at) if requested_at else utcnow(),
+            "plc": _as_utc(placed_at) if placed_at else utcnow(),
+            "raw": _jsonable(order_raw),
+        })
 
-        # fills upsert
+        # 2) fills をUPSERT（既存実装そのまま）
         upsert_fill(
             fill_id=None, order_id=order_id, price=price, size=executed_size,
             fee=fee, executed_at=_as_utc(executed_at) or utcnow(),
             raw=fill_raw, conn=c
         )
 
-    if conn is not None:
-        _do(conn)
+    if conn is not None: _do(conn)
     else:
-        with begin() as c:
-            _do(c)
+        with begin() as c: _do(c)
 
 # -----------------------------------------------------------------------------
 # LINE関連（必要に応じて呼び出し側Txへ参加可のものは conn を増設）
