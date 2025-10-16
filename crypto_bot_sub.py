@@ -3716,6 +3716,7 @@ class CryptoTradingBot:
                     entry_sentiment = {}
                     entry_scores = {}
                     order_size = 0.0  # スレッドローカルな注文サイズ
+                    reentry_block_until = None  # type: ignore  # pd.Timestamp | None
 
                     for i in range(len(df_5min)):
                         row = df_5min.iloc[i]
@@ -3728,6 +3729,12 @@ class CryptoTradingBot:
 
                         # === エントリー判定（方式A：直近2本がTrue → 次バーで入る） ===
                         if position is None:
+                            # 実運用同等：決済直後は「次の15分足始値」まで再エントリー禁止
+                            if reentry_block_until is not None:
+                                now_ts = pd.to_datetime(timestamp)
+                                if now_ts < reentry_block_until:
+                                    # クールダウン中はこのバーのエントリー判定をスキップ
+                                    continue
                             # i-2, i-1（確定済バー）を見る。i は「約定バー」
                             if i >= 2:
                                 prev1 = df_5min.iloc[i-1]
@@ -3944,6 +3951,10 @@ class CryptoTradingBot:
                                 position = None
                                 entry_scores = {}
 
+                                # 実運用同等：次の15分足始値まで再エントリー禁止
+                                ts = pd.to_datetime(timestamp)
+                                reentry_block_until = ts.floor('15min') + pd.Timedelta(minutes=15)
+
                         elif position == 'short':
                             exit_levels = self.calculate_dynamic_exit_levels(symbol, df_5min.iloc[:i+1], 'short', entry_price)
 
@@ -4034,6 +4045,10 @@ class CryptoTradingBot:
 
                                 position = None
                                 entry_scores = {}
+
+                                # 実運用同等：次の15分足始値まで再エントリー禁止
+                                ts = pd.to_datetime(timestamp)
+                                reentry_block_until = ts.floor('15min') + pd.Timedelta(minutes=15)
 
                 except Exception as e:
                     self.logger.error(f"{date_str}の{symbol}バックテスト中にエラー: {e}")
@@ -5749,64 +5764,110 @@ class CryptoTradingBot:
                     trade_logs.append(trade_log_exit)
 
                     from sqlalchemy.exc import IntegrityError
-                    with begin() as conn:
-                        # 1) 注文+フィル（原子的に一括反映：orders を EXECUTED で UPSERT、fills も UPSERT）
-                        executed_at = utcnow()
-                        mark_order_executed_with_fill(
-                            order_id=str(repr_order_id),
-                            executed_size=float(closed_size),
-                            price=float(exec_price),
-                            fee=None,
-                            executed_at=executed_at,
-                            # 付帯情報（監査・デバッグ用）
-                            fill_raw={"source": "exit_tx", "symbol": symbol},
-                            order_raw={"close_results": close_results},
-                            # orders が未作成だった場合の UPSERT 用ヒント
-                            symbol=symbol,
-                            side=side,                 # 既存の "BUY"/"SELL" をそのまま利用
-                            type_="MARKET",
-                            size_hint=float(closed_size),
-                            requested_at=utcnow(),
-                            placed_at=utcnow(),
-                            conn=conn,                 # ← 同一トランザクションに参加
-                        )
+                    def _dbg_dump(label, **kw):
+                        try:
+                            self.logger.info(f"[TXDBG] {label} | " + " | ".join(f"{k}={v!r}" for k,v in kw.items()))
+                        except Exception:
+                            pass
 
-                        # 2) ポジション（クローズ更新）
-                        _pos_id = self.position_ids.get(symbol)
-                        if _pos_id:
-                            sid = to_uuid_or_none(getattr(self, "strategy_id", None))
-                            upsert_position(
-                                position_id=str(_pos_id),
+                    with begin() as conn:
+                        side_order = "SELL" if position == "long" else "BUY"
+                        side_trade = position  # long/short
+                        exec_at = utcnow()
+
+                        # 1) orders/fills
+                        _dbg_dump("before mark_order_executed_with_fill",
+                                order_id=str(repr_order_id), executed_size=float(closed_size), price=float(exec_price),
+                                fee=None, executed_at=exec_at, symbol=symbol, side=side_order, type_="MARKET",
+                                size_hint=float(closed_size))
+                        try:
+                            mark_order_executed_with_fill(
+                                order_id=str(repr_order_id),
+                                executed_size=float(closed_size),
+                                price=float(exec_price),
+                                fee=None,
+                                executed_at=exec_at,
+                                fill_raw={"source": "exit_tx", "symbol": symbol},
+                                order_raw={"close_results": close_results},
                                 symbol=symbol,
-                                side=position,         # "long"/"short"（保持側）
-                                size=0.0,              # ← クローズ確定
-                                avg_entry_price=float(self.entry_prices.get(symbol) or 0.0),
-                                opened_at=None,        # 実装側で COALESCE して既存保持
-                                updated_at=utcnow(),
-                                raw={"closed_by": "auto", "close_results": close_results},
-                                strategy_id=sid,
+                                side=side_order,
+                                type_="MARKET",
+                                size_hint=float(closed_size),
+                                requested_at=exec_at,
+                                placed_at=exec_at,
+                                conn=conn,
+                            )
+                        except Exception as e:
+                            self.logger.error(f"[TXERR] mark_order_executed_with_fill failed: {type(e).__name__} orig={getattr(e,'orig',None)} "
+                                            f"stmt={getattr(e,'statement',None)} params={getattr(e,'params',None)}")
+                            raise
+
+                        # 2) positions
+                        if self.position_ids.get(symbol):
+                            sid = to_uuid_or_none(getattr(self, "strategy_id", None))
+                            _dbg_dump("before upsert_position",
+                                    position_id=str(self.position_ids[symbol]), symbol=symbol, side=side_trade,
+                                    size=0.0, avg_entry_price=float(self.entry_prices.get(symbol) or 0.0),
+                                    updated_at=exec_at, strategy_id=sid, user_id=getattr(self,"user_id",None),
+                                    source=default_source_from_env(self))
+                            try:
+                                upsert_position(
+                                    position_id=str(self.position_ids[symbol]),
+                                    symbol=symbol,
+                                    side=side_trade,
+                                    size=0.0,
+                                    avg_entry_price=float(self.entry_prices.get(symbol) or 0.0),
+                                    opened_at=None,
+                                    updated_at=exec_at,
+                                    raw={"closed_by": "auto", "close_results": close_results},
+                                    strategy_id=sid,
+                                    user_id=getattr(self, "user_id", None),
+                                    source=default_source_from_env(self),
+                                    conn=conn,
+                                )
+                            except Exception as e:
+                                self.logger.error(f"[TXERR] upsert_position failed: {type(e).__name__} orig={getattr(e,'orig',None)} "
+                                                f"stmt={getattr(e,'statement',None)} params={getattr(e,'params',None)}")
+                                raise
+
+                        # 3) trades
+                        _dbg_dump("before insert_trade",
+                                symbol=trade_log_exit.get("symbol"), side=side_trade,
+                                entry_position_id=entry_pos_id_for_trade, exit_order_id=str(repr_order_id),
+                                entry_price=_num(trade_log_exit["entry_price"]),
+                                exit_price=_num(trade_log_exit["exit_price"]),
+                                size=_num(trade_log_exit["size"]),
+                                pnl=_num(trade_log_exit["profit"]),
+                                pnl_pct=_num(trade_log_exit["profit_pct"]),
+                                holding_hours=_num(trade_log_exit.get("holding_hours")),
+                                closed_at=exec_at,
+                                strategy_id=to_uuid_or_none(getattr(self,"strategy_id",None)),
+                                user_id=getattr(self,"user_id",None),
+                                source=default_source_from_env(self))
+                        try:
+                            insert_trade(
+                                trade_id=None,
+                                symbol=trade_log_exit["symbol"],
+                                side=side_trade,
+                                entry_position_id=entry_pos_id_for_trade,
+                                exit_order_id=str(repr_order_id),
+                                entry_price=_num(trade_log_exit["entry_price"]),
+                                exit_price=_num(trade_log_exit["exit_price"]),
+                                size=_num(trade_log_exit["size"]),
+                                pnl=_num(trade_log_exit["profit"]),
+                                pnl_pct=_num(trade_log_exit["profit_pct"]),
+                                holding_hours=_num(trade_log_exit.get("holding_hours")),
+                                closed_at=exec_at,
+                                raw=trade_log_exit,
+                                strategy_id=to_uuid_or_none(getattr(self, "strategy_id", None)),
                                 user_id=getattr(self, "user_id", None),
                                 source=default_source_from_env(self),
                                 conn=conn,
                             )
-
-                        # 3) トレード（entry_position_idはTx前に退避したものを使用）
-                        insert_trade(
-                            trade_id=None,
-                            symbol=trade_log_exit["symbol"],
-                            side=trade_log_exit.get("type", "long"),  # 既存の仕様を維持
-                            entry_position_id=entry_pos_id_for_trade, # ← 退避値を使う
-                            exit_order_id=str(repr_order_id),
-                            entry_price=_num(trade_log_exit["entry_price"]),
-                            exit_price=_num(trade_log_exit["exit_price"]),
-                            size=_num(trade_log_exit["size"]),
-                            pnl=_num(trade_log_exit["profit"]),
-                            pnl_pct=_num(trade_log_exit["profit_pct"]),
-                            holding_hours=_num(trade_log_exit.get("holding_hours")),
-                            closed_at=executed_at,     # ここも executed_at を使うと整合的
-                            raw=trade_log_exit,
-                            conn=conn,
-                        )
+                        except Exception as e:
+                            self.logger.error(f"[TXERR] insert_trade failed: {type(e).__name__} orig={getattr(e,'orig',None)} "
+                                            f"stmt={getattr(e,'statement',None)} params={getattr(e,'params',None)}")
+                            raise
 
                 except IntegrityError as ie:
                     insert_error("close/tx_commit/integrity", str(ie), raw={"symbol": symbol, "results": close_results})
