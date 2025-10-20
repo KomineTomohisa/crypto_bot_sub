@@ -45,6 +45,20 @@ type KPI = {
 
 type PositionWithPriceTS = Position & { price_ts?: string | number | null };
 
+type TradeToday = {
+  trade_id?: number | string | null;
+  symbol: string;
+  side: 'LONG' | 'SHORT' | string;
+  size: number | null;
+  entry_price: number | null;
+  exit_price: number | null;
+  pnl: number | null;
+  pnl_pct: number | null;
+  opened_at: string | null;
+  closed_at: string | null;
+  holding_hours: number | null;
+};
+
 /* =========================
    Helpers (no-any)
    ========================= */
@@ -114,6 +128,18 @@ async function fetchKPI(symbol?: string): Promise<KPI | null> {
   return res.json();
 }
 
+/** 本日の確定トレード（JST当日クローズ） */
+async function fetchTodayTrades(symbol?: string): Promise<TradeToday[]> {
+  const base = apiBase();
+  const url = new URL(`${base}/public/trades/today`);
+  if (symbol) url.searchParams.set("symbol", symbol);
+  // source=real をデフォルト踏襲
+  url.searchParams.set("source", "real");
+  const res = await fetch(url.toString(), { cache: "no-store" });
+  if (!res.ok) return [];
+  return res.json();
+}
+
 function fmtJST(v: TimeLike, time: boolean = true): string {
   const d = parseDateFlexible(v);
   if (!d) return "";
@@ -154,6 +180,8 @@ export default async function Page({
     fetchDaily(symbol),
     fetchOpenPositions(symbol),
   ]);
+
+  const todayTrades = await fetchTodayTrades(symbol);
 
   return (
     <main className="p-6 md:p-8 max-w-4xl mx-auto space-y-8">
@@ -204,8 +232,6 @@ export default async function Page({
             const pk = peakYenAt[i] || v;
             return pk > 0 ? ((v - pk) / pk) * 100 : 0;
           });
-          // 指数(=100起点) も作っておく（右軸の代替表示用）
-          const equityIdx: number[] = equityYen.map(v => (v / INITIAL) * 100);
 
           const equityData = dates.map((date, i) => ({
             date,
@@ -441,6 +467,63 @@ export default async function Page({
             {positions.map((p, i) => (
               <PositionCard key={`${p.symbol}-${i}`} p={p} />
             ))}
+          </div>
+        )}
+      </Section>
+
+      {/* 3.5. 本日の確定トレード（決済済み） - Performanceと同じテーブルスタイル */}
+      <Section
+        title="本日の確定トレード"
+        headerRight={
+          <div className="text-xs text-gray-500">
+            件数: <b>{todayTrades.length}</b>
+          </div>
+        }
+      >
+        {todayTrades.length === 0 ? (
+          <div className="text-sm text-gray-500">本日にクローズしたトレードはありません。</div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="min-w-full text-sm">
+              <thead className="bg-gray-50 dark:bg-gray-800 text-gray-600 dark:text-gray-300">
+                <tr>
+                  <th className="px-3 py-2 text-left">通貨</th>
+                  <th className="px-3 py-2 text-left">サイド</th>
+                  <th className="px-3 py-2 text-right">数量</th>
+                  <th className="px-3 py-2 text-right">損益（¥）</th>
+                  <th className="px-3 py-2 text-right">損益（%）</th>
+                  <th className="px-3 py-2 text-center">保有時間</th>
+                  <th className="px-3 py-2 text-center">決済日時（JST）</th>
+                </tr>
+              </thead>
+              <tbody>
+                {todayTrades.map((t) => {
+                  const pnlValue = t.pnl ?? 0;
+                  const pnlPctValue = t.pnl_pct ?? 0;
+                  const sizeValue = t.size ?? 0;
+                  const holdingValue = t.holding_hours ?? 0;
+                  const sideUp = (t.side ?? "").toUpperCase();
+                  const symUp = (t.symbol ?? "").toUpperCase();
+                  return (
+                    <tr key={t.trade_id ?? `${symUp}-${t.closed_at ?? ""}`} className="border-t border-gray-100 dark:border-gray-800">
+                      <td className="px-3 py-2 font-medium">{symUp}</td>
+                      <td className={`px-3 py-2 font-semibold ${sideUp === "LONG" || sideUp === "BUY" ? "text-green-600" : "text-red-600"}`}>
+                        {sideUp}
+                      </td>
+                      <td className="px-3 py-2 text-right">{sizeValue.toFixed(3)}</td>
+                      <td className={`px-3 py-2 text-right font-semibold ${pnlValue > 0 ? "text-green-600" : pnlValue < 0 ? "text-red-600" : ""}`}>
+                        {t.pnl != null ? pnlValue.toLocaleString("ja-JP", { maximumFractionDigits: 0 }) : "—"}
+                      </td>
+                      <td className={`px-3 py-2 text-right ${pnlPctValue > 0 ? "text-green-600" : pnlPctValue < 0 ? "text-red-600" : ""}`}>
+                        {pnlPctValue.toFixed(2)}%
+                      </td>
+                      <td className="px-3 py-2 text-center">{holdingValue.toFixed(2)}h</td>
+                      <td className="px-3 py-2 text-center">{fmtJST(t.closed_at) || "—"}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
           </div>
         )}
       </Section>
@@ -750,7 +833,21 @@ function PositionCard({ p }: { p: PositionWithPriceTS }) {
     :                 "red";
 
   return (
-    <article className="rounded-2xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 p-4 shadow-sm">
+    <Link
+      href={`/performance?days=7&symbol=${encodeURIComponent(p.symbol)}`}
+      prefetch={false}
+      className="block group rounded-2xl cursor-pointer
+                 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-400
+                 focus-visible:ring-offset-2 focus-visible:ring-offset-transparent"
+      aria-label={`${symbol} の詳細へ`}
+    >
+    <article className="rounded-2xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 p-4
+                       shadow-sm transform will-change-transform
+                       transition-all duration-200 ease-out
+                       hover:shadow-xl hover:border-gray-300 dark:hover:border-gray-700
+                       hover:-translate-y-1.5 hover:scale-[1.01]
+                       focus-visible:-translate-y-1
+                       active:translate-y-0 active:scale-[0.995]">
       {/* ヘッダ */}
       <div className="flex items-center justify-between gap-3">
         <div className="flex items-center gap-2 min-w-0">
@@ -759,7 +856,16 @@ function PositionCard({ p }: { p: PositionWithPriceTS }) {
           {stale && <Pill>stale</Pill>}
         </div>
         {p?.position_id != null && (
-          <div className="text-[11px] text-gray-500 shrink-0">ID: {String(p.position_id)}</div>
+          <div className="flex items-center gap-2 shrink-0">
+            <div className="text-[11px] text-gray-500">ID: {String(p.position_id)}</div>
+            {/* → がホバーでふわっと現れてスライド */}
+            <span
+              aria-hidden
+              className="text-xs text-gray-400 opacity-0 -translate-x-1 transition
+                         group-hover:opacity-100 group-hover:translate-x-0">
+              →
+            </span>
+          </div>
         )}
       </div>
 
@@ -813,19 +919,17 @@ function PositionCard({ p }: { p: PositionWithPriceTS }) {
           保有時間: <span className="font-semibold">{holdH ?? "—"} 時間</span>
         </div>
       </div>
-
-      {/* 詳細リンク */}
-      {p?.symbol && (
-        <div className="mt-3 text-right">
-          <Link
-            href={`/performance?days=7&symbol=${encodeURIComponent(p.symbol)}`}
-            className="text-xs underline"
-            prefetch={false}
-          >
-            この銘柄の詳細 →
-          </Link>
-        </div>
-      )}
+      {/* フッターのホバーインジケータ（視認性強化） */}
+      <div className="mt-2 text-right">
+        <span
+          aria-hidden
+          className="inline-block text-[11px] text-gray-400 opacity-0 translate-x-1
+                     transition-opacity transition-transform duration-200 ease-out
+                     group-hover:opacity-100 group-hover:translate-x-0">
+          詳しく見る →
+        </span>
+      </div>
     </article>
+    </Link>
   );
 }
