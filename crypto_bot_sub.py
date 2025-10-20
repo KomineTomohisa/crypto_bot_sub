@@ -734,7 +734,7 @@ class CryptoTradingBot:
             filename=base_log_path,
             when="midnight",
             interval=1,
-            backupCount=20,     # 古いログは20個まで保持
+            backupCount=7,     # 古いログは20個まで保持
             encoding="utf-8",
             utc=False           # JSTに設定済みならJSTで回る
         )
