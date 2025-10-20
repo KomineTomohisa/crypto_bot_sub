@@ -420,6 +420,18 @@ class CryptoTradingBot:
             self.logger.error(f"Excel評価レポート生成エラー: {str(e)}", exc_info=True)
             return None
 
+    def _get_margin_positions_safe(self, gmo_symbol: str):
+        """
+        liveモードかつ self.gmo_api がある場合のみ実APIを呼び、
+        それ以外（paperモードや未初期化）は空リストでフォールバックする。
+        戻り値フォーマットは既存利用箇所に合わせて data: [] を基本形とする。
+        """
+        is_live = bool(self.exchange_settings_gmo.get("live_trade", False))
+        if is_live and self.gmo_api is not None:
+            return self.gmo_api.get_margin_positions(gmo_symbol)
+        # paper/sim の場合は「オープンポジションなし」として扱う
+        return {"data": []}
+
     def _record_signal(self, *, symbol: str, timeframe: str, side: str, price: float,
                    strength_score: float | None,
                    indicators: dict[str, float] | None,
@@ -467,6 +479,12 @@ class CryptoTradingBot:
         float: 総資産額（JPY）
         """
         try:
+            # paper(=sim) モードでは API を使わず初期残高でフォールバック
+            if not self.exchange_settings_gmo.get("live_trade", False):
+                init = float(getattr(self, "paper_initial_balance", getattr(self, "initial_capital", 1_000_000.0)))
+                self.logger.info(f"Paper mode: 総資産額は初期残高でフォールバック: {init:,.0f}円")
+                return init
+            
             # GMO APIが利用可能か確認
             if not self.gmo_api:
                 self.logger.error("GMOコインAPIが初期化されていません。総資産額を取得できません。")
@@ -614,33 +632,32 @@ class CryptoTradingBot:
             'email': {
                 'smtp_server': "smtp.gmail.com",
                 'smtp_port'  : 587,
-                'sender'     : os.environ["EMAIL_ADDRESS_PIP"],
-                'password'   : os.environ["EMAIL_PASSWORD_PIP"],
-                'recipient'  : "tomokomi1107@gmail.com"
+                # ★KeyError回避：getenvで取得（未設定なら空文字）
+                'sender'     : os.getenv("EMAIL_ADDRESS_PIP", ""),
+                'password'   : os.getenv("EMAIL_PASSWORD_PIP", ""),
+                'recipient'  : "tomokomi1107@gmail.com",
             },
             'send_on_entry': True,
             'send_on_exit' : True,
             'send_on_error': True,
-            'daily_report' : True
+            'daily_report' : True,
         }
 
+        # ★SIM対応：環境変数は get で取得（未設定でもエラーにしない）
+        _env_api_key = os.getenv("GMO_API_KEY", "")
+        _env_api_secret = os.getenv("GMO_API_SECRET", "")
         self.exchange_settings_gmo = {
-            'api_key': os.environ["GMO_API_KEY"],
-            'api_secret': os.environ["GMO_API_SECRET"],
-            'live_trade': True
+            'api_key': _env_api_key,
+            'api_secret': _env_api_secret,
+            # ★初期値は False に変更（後で mode に応じて上書き）
+            'live_trade': False,
         }
+        # ★APIは lazy init（run_live等でlive_trade=Trueが確定してから作る）
+        self.gmo_api = None
 
         # ポジションID管理を追加
         self.position_ids = {symbol: None for symbol in self.symbols}  # ポジションIDを保存
 
-        # GMO APIの初期化
-        self.gmo_api = None
-        if self.exchange_settings_gmo['api_key'] and self.exchange_settings_gmo['api_secret']:
-            # GMOCoinAPIクラスが同じファイル内にある場合
-            self.gmo_api = GMOCoinAPI(
-                self.exchange_settings_gmo['api_key'],
-                self.exchange_settings_gmo['api_secret']
-            )
 
         # 通貨ペアマッピング（BitBank形式からGMO形式へ）
         self.symbol_mapping = {
@@ -727,7 +744,17 @@ class CryptoTradingBot:
         os.makedirs(self.log_dir, exist_ok=True)
 
         # ログファイルパス
-        base_log_path = os.path.join(self.log_dir, "crypto_bot.log")
+        # ログを source(real/sim/backtest) ごとに分離
+        try:
+            _src = getattr(self, "source", None)
+        except Exception:
+            _src = None
+        if not _src:
+            try:
+                _src = default_source_from_env(self)
+            except Exception:
+                _src = "unknown"
+        base_log_path = os.path.join(self.log_dir, f"crypto_bot_{_src}.log")
 
         # 日次ローテーション（ローカルタイムの真夜中）
         self.file_handler = TimedRotatingFileHandler(
@@ -1365,7 +1392,11 @@ class CryptoTradingBot:
         
     def verify_positions(self):
         """GMOコインの信用取引建玉を使用してポジションを検証する"""
-        self.logger.info("取引所ポジション情報の検証を開始...")
+        # paper(sim) モードでは取引所との突き合わせは行わない
+        if not self.exchange_settings_gmo.get("live_trade", False):
+            self.logger.info("Paper mode: 取引所ポジション照合をスキップ（ローカル状態のみ保持）")
+            return False
+        self.logger.info("取引所ポジション情報の検証を開始.")
 
         # ローカルポジション情報のバックアップ
         local_positions_backup = {
@@ -1499,7 +1530,7 @@ class CryptoTradingBot:
             symbol = f"{coin}_jpy"
             gmo_symbol = self.symbol_mapping.get(symbol, symbol.upper().replace('_', ''))
             # 信用取引の建玉情報を取得（symbolパラメータは使わない）
-            margin_response = self.gmo_api.get_margin_positions(gmo_symbol)
+            margin_response = self._get_margin_positions_safe(gmo_symbol)
             # ステータスコードを確認
             status = margin_response.get("status")
             
@@ -1563,7 +1594,7 @@ class CryptoTradingBot:
             gmo_symbol = self.symbol_mapping.get(symbol, symbol.upper().replace('_', ''))
             
             # 建玉情報を取得
-            margin_response = self.gmo_api.get_margin_positions(gmo_symbol)
+            margin_response = self._get_margin_positions_safe(gmo_symbol)
             
             if margin_response.get("status") == 0:
                 # データ形式を確認
@@ -1734,11 +1765,101 @@ class CryptoTradingBot:
             return False
         
     def place_order(self, symbol, order_type, size, margin=True):
-        """GMOコインでの信用取引注文を実行する"""
-        if not self.exchange_settings_gmo['live_trade']:
-            self.logger.info(f"模擬注文（信用取引）: {symbol} {order_type} {size}")
-            return {'success': True, 'order_id': 'simulation_order_id', 'executed_size': size}
-        
+        """GMOコインでの信用取引注文を実行する（paper時はAPIを呼ばず即約定＆DB upsert）。"""
+        import uuid, time
+
+        # ---- 共通：サイズ正規化（GMOの最小単位に揃える） -----------------------
+        def _normalize_size(sym: str, sz: float) -> float:
+            # ※必要に応じて調整。未指定は四捨五入なしで返す
+            if sym == "xrp_jpy":
+                # 10通貨刻み、最小10
+                v = round(sz / 10) * 10
+                return max(v, 10)
+            elif sym == "eth_jpy":
+                return round(sz, 2)
+            elif sym == "ltc_jpy":
+                return int(sz)
+            elif sym == "doge_jpy":
+                v = round(sz / 10) * 10
+                return max(v, 10)
+            elif sym == "sol_jpy":
+                return round(sz, 1)
+            elif sym == "bcc_jpy":
+                return round(sz, 1)  # BCH(BCC)は小数1桁
+            else:
+                return float(sz)
+
+        is_live = bool(self.exchange_settings_gmo.get("live_trade"))
+        norm_size = _normalize_size(symbol, float(size))
+        side = "BUY" if order_type == "buy" else "SELL"
+        gmo_symbol = self.symbol_mapping.get(symbol, symbol.upper().replace("_", ""))
+
+        # ---- PAPER（live_trade=False）：APIを呼ばず即約定 ----------------------
+        if not is_live:
+            try:
+                sim_order_id = f"SIM-{uuid.uuid4().hex[:12]}"
+                sim_position_id = f"SIMPOS-{uuid.uuid4().hex[:12]}"
+
+                # 平均約定価格は現在価格で近似（必要ならslippage/feeロジックを後付け）
+                try:
+                    avg_entry = float(self.get_current_price(symbol))
+                except Exception:
+                    avg_entry = float(self.entry_prices.get(symbol) or 0.0)
+
+                executed_size_pos = float(norm_size)
+                self.logger.info(f"[SIM ORDER] {symbol} {side} {executed_size_pos} -> oid={sim_order_id}")
+
+                # 位置情報を内部状態に反映
+                self.position_ids[symbol] = sim_position_id
+                if avg_entry > 0:
+                    self.entry_prices[symbol] = avg_entry
+                self.entry_sizes[symbol] = executed_size_pos
+
+                # DB upsert（source は sim を強制）
+                default_source = "sim"
+
+                def _to_uuid_or_none(v):
+                    if not v:
+                        return None
+                    try:
+                        import uuid as _u
+                        return str(_u.UUID(str(v)))
+                    except Exception:
+                        return None
+
+                strategy_uuid = _to_uuid_or_none(getattr(self, "strategy_id", None))
+
+                self.logger.info(
+                    "[DBHOOK][SIM] upsert_position: pos_id=%s size=%s avg=%s side=%s src=%s",
+                    sim_position_id, executed_size_pos, avg_entry, ("long" if side == "BUY" else "short"), default_source
+                )
+                try:
+                    upsert_position(
+                        position_id=str(sim_position_id),
+                        symbol=symbol,
+                        side=("long" if side == "BUY" else "short"),
+                        size=float(executed_size_pos),
+                        avg_entry_price=float(avg_entry) if avg_entry else 0.0,
+                        opened_at=utcnow(),
+                        updated_at=utcnow(),
+                        raw={"order_response": {"sim": True, "order_id": sim_order_id}},
+                        strategy_id=strategy_uuid,
+                        source=default_source,
+                        user_id=getattr(self, "user_id", None),
+                    )
+                except Exception as e:
+                    # SIMは止めたくないのでログだけ
+                    self.logger.error(f"[DBHOOK][SIM] upsert_position失敗: {e}", exc_info=True)
+
+                return {
+                    "success": True,
+                    "order_id": sim_order_id,
+                    "executed_size": executed_size_pos,
+                    "position_id": sim_position_id,
+                }
+            except Exception as e:
+                self.logger.error(f"[SIM ORDER] 例外: {e}", exc_info=True)
+                return {"success": False, "error": str(e), "executed_size": 0}  
         try:
             # GMO API が利用可能か確認
             if not self.gmo_api:
@@ -1746,32 +1867,15 @@ class CryptoTradingBot:
                 return {'success': False, 'error': "GMO API not initialized", 'executed_size': 0}
             
             # 通貨ペアをGMO形式に変換
-            gmo_symbol = self.symbol_mapping.get(symbol, symbol.upper().replace('_', ''))
+            gmo_symbol = gmo_symbol
             
-            # 最小注文量の調整と適切なフォーマット
-            if symbol == "xrp_jpy":
-                size = round(size / 10) * 10
-                if size < 10:
-                    size = 10
-            elif symbol == "eth_jpy":
-                size = round(size, 2)
-            elif symbol == "ltc_jpy":
-                size = int(size)
-            elif symbol == "doge_jpy":
-                size = round(size / 10) * 10
-                if size < 10:
-                    size = 10
-            elif symbol == "sol_jpy":
-                size = round(size, 1)
-            elif symbol == "bcc_jpy":  # 追加
-                size = round(size, 1)  # BCHは小数点以下1桁
-            else:
-                size_str = str(size)
+            # 最小注文量の調整（正規化値を使用）
+            size = norm_size            
             
             # 注文前の既存ポジションを記録（後で新規ポジションを判別するため）
             existing_positions = set()
             try:
-                positions_response = self.gmo_api.get_margin_positions(gmo_symbol)
+                positions_response = self._get_margin_positions_safe(gmo_symbol)
                 if positions_response.get("status") == 0:
                     positions_data = positions_response.get("data", {})
                     positions = positions_data.get("list", []) if isinstance(positions_data, dict) else positions_data
@@ -1786,7 +1890,6 @@ class CryptoTradingBot:
                 self.logger.warning(f"既存ポジション取得エラー: {e}")
 
             # 新規注文のみを扱う
-            side = "BUY" if order_type == "buy" else "SELL"
             self.logger.info(f"GMOコイン信用取引新規注文: {gmo_symbol} {side} {size}")
 
             # 新規注文データ
@@ -1822,7 +1925,7 @@ class CryptoTradingBot:
                 for retry in range(max_retries):
                     time.sleep(retry_interval)
                     try:
-                        positions_response = self.gmo_api.get_margin_positions(gmo_symbol)
+                        positions_response = self._get_margin_positions_safe(gmo_symbol)
                         if positions_response.get("status") == 0:
                             positions_data = positions_response.get("data", {})
                             positions = positions_data.get("list", []) if isinstance(positions_data, dict) else positions_data
@@ -1871,10 +1974,8 @@ class CryptoTradingBot:
 
                 # --- DB: ポジションを upsert ---
                 if position_id and executed_size_pos > 0:
-                    # source は NOT NULL 想定：live なら "real"、模擬なら "sim" をデフォルトに
-                    default_source = getattr(self, "source", None) or (
-                        "real" if self.exchange_settings_gmo.get("live_trade") else "sim"
-                    )
+                    # source は NOT NULL 想定：live は "real"
+                    default_source = "real"
                     # --- UUID検証（不正ならNoneに落とす or 必要ならuuid4()を発行） ---
                     def _to_uuid_or_none(v):
                         if not v:
@@ -1903,8 +2004,8 @@ class CryptoTradingBot:
                         opened_at=utcnow(),                          # DB: timestamptz
                         updated_at=utcnow(),                          # DB: timestamptz
                         raw={"order_response": response},
-                        strategy_id=strategy_uuid,          # None 可ならこのまま
-                        source=default_source,              # ← ここを必ず非NULLに
+                        strategy_id=strategy_uuid,
+                        source=default_source,              # ← real を明示
                         user_id=getattr(self, "user_id", None)        # DB: int8
                     )
 
@@ -2009,8 +2110,12 @@ class CryptoTradingBot:
     def verify_position_id(self, symbol):
         """特定の通貨ペアのポジションIDを検証・再取得する"""
         try:
+            # paper(sim) モードでは取引所に問い合わせない
+            if not self.exchange_settings_gmo.get("live_trade", False):
+                self.logger.info(f"Paper mode: verify_position_id({symbol}) はスキップします")
+                return True
             if not self.gmo_api:
-                self.logger.error("GMOコインAPIが初期化されていません")
+                self.logger.warning("GMOコインAPIが初期化されていません（live想定）。verify_position_id をスキップ")
                 return False
             
             # 通貨ペアをGMO形式に変換
@@ -2025,7 +2130,7 @@ class CryptoTradingBot:
                 return True  # ポジションがなければ正常
             
             # GMOから最新のポジション情報を取得
-            positions_response = self.gmo_api.get_margin_positions(gmo_symbol)
+            positions_response = self._get_margin_positions_safe(gmo_symbol)
             
             if positions_response.get("status") == 0:
                 positions_data = positions_response.get("data", {})
@@ -2098,97 +2203,114 @@ class CryptoTradingBot:
             return False
 
     def check_order_execution(self, order_id, symbol, margin=False):
-        """GMOコインでの注文の約定状況を確認する"""
+        """GMOコインでの注文の約定状況を確認する。
+        - SIM注文（order_idが 'SIM-' 始まり）は即時に内部状態から約定量を返す
+        - REAL注文は /v1/orders → （必要なら）/v1/closedOrders → （最後に）建玉照会の順で確認
+        """
+        from datetime import datetime
         try:
-            # GMOコインAPIが利用可能か確認
+            # ---- 1) SIM（paper）なら即返す ----------------------------------
+            if isinstance(order_id, str) and order_id.startswith("SIM-"):
+                executed = float(self.entry_sizes.get(symbol) or 0.0)
+                if executed <= 0:
+                    # 念のため positions 由来サイズを優先
+                    try:
+                        pos_id = self.position_ids.get(symbol)
+                        if pos_id:
+                            executed = float(self.entry_sizes.get(symbol) or 0.0)
+                    except Exception:
+                        pass
+                self.logger.info(f"[SIM EXEC-CHECK] {symbol} -> executed_size={executed}")
+                return executed
+
+            # ---- 2) REAL: GMO API 必須 ---------------------------------------
             if not self.gmo_api:
                 self.logger.error("GMOコインAPIが初期化されていません")
-                return 0
-            
-            # 通貨ペアをGMO形式に変換
+                return 0.0
+
+            # 通貨ペアをGMO形式に変換（place_orderと同一仕様）
             gmo_symbol = self.symbol_mapping.get(symbol, symbol.upper().replace('_', ''))
-            
-            # 注文情報を取得するエンドポイント設定
+
+            # 2-1) 注文情報（現行日の生注文）を確認
             path = "/v1/orders"
-            params = {"orderId": str(order_id)}  # 文字列として渡す
-            
-            # GMOコインのAPIリクエスト
+            params = {"orderId": str(order_id)}
             response = self.gmo_api._request("GET", path, params=params)
-            
-            # デバッグログ
             self.logger.info(f"GMOコイン注文確認API応答: {response}")
-            
-            if response.get('status') == 0:
-                data = response.get('data', {})
-                
-                # dataの中のlistを取得
-                order_list = data.get('list', [])
-                
+
+            if response.get("status") == 0:
+                data = response.get("data", {})
+                order_list = data.get("list", [])
                 if not order_list:
-                    self.logger.warning("注文リストが空です")
-                    return 0
-                
-                # 最初の注文情報を取得（通常は1つだけ）
-                order_info = order_list[0]
-                
-                # 注文情報から必要な値を取得
-                status = order_info.get('status')
-                executed_size = float(order_info.get('executedSize', '0'))
-                
-                self.logger.info(f"注文詳細: 状態={status}, 約定サイズ={executed_size}")
-                
-                # GMOコインのステータス: WAITING, ORDERED, EXECUTED, CANCELED, EXPIRED
-                if status == 'EXECUTED':
-                    self.logger.info(f"注文完全約定: {executed_size}")
-                    return executed_size
-                elif status == 'ORDERED' and executed_size > 0:
-                    self.logger.info(f"注文部分約定: {executed_size}")
-                    return executed_size
-                elif status == 'WAITING':
-                    self.logger.info(f"注文待機中: {status}")
-                    return 0
+                    self.logger.warning("注文リストが空です（/v1/orders）")
                 else:
-                    self.logger.info(f"注文状態: {status}")
-                    return 0
-                    
-            else:
-                # エラーメッセージの取得
-                error_messages = response.get('messages', [])
-                if error_messages:
-                    error_msg = error_messages[0].get('message_string', '不明なエラー')
-                    self.logger.error(f"GMOコイン注文確認エラー: {error_msg}")
-                    
-                    # エラーコードが10002（注文が存在しない）の場合
-                    # 成行注文は即座に約定して履歴に移動することがあるため、取引履歴を確認
-                    if response.get('messages') and any(msg.get('message_code') == '10002' for msg in response.get('messages', [])):
-                        self.logger.info("注文が履歴に移動した可能性があります。取引履歴を確認します。")
-                        
-                        # 最新の取引履歴を確認
-                        history_path = "/v1/closedOrders"
-                        current_date = datetime.now().strftime("%Y%m%d")
-                        history_params = {
-                            "symbol": gmo_symbol,
-                            "date": current_date
-                        }
-                        
-                        history_response = self.gmo_api._request("GET", history_path, params=history_params)
-                        
-                        if history_response.get('status') == 0:
-                            history_data = history_response.get('data', {})
-                            orders = history_data.get('list', [])
-                            
-                            for order in orders:
-                                if str(order.get('orderId')) == str(order_id):
-                                    executed_size = float(order.get('executedSize', '0'))
-                                    if executed_size > 0:
-                                        self.logger.info(f"取引履歴から注文を確認: 約定量 {executed_size}")
-                                        return executed_size
-                    
-                    return 0
-            
+                    od0 = order_list[0]
+                    status = str(od0.get("status") or "").upper()
+                    # executedSize は文字列/数値両対応
+                    try:
+                        executed_size = float(od0.get("executedSize") or 0)
+                    except Exception:
+                        executed_size = 0.0
+
+                    self.logger.info(f"注文詳細: 状態={status}, 約定サイズ={executed_size}")
+
+                    if status == "EXECUTED":
+                        return executed_size
+                    if status == "ORDERED" and executed_size > 0:
+                        # 部分約定
+                        return executed_size
+                    if status in ("WAITING", "ORDERED"):
+                        # 未約定 or 進行中
+                        return 0.0
+                    # CANCELED/EXPIREDなどは fallthrough（0で返す）
+
+            # 2-2) /v1/orders で見つからない・または10002等のとき → 当日クローズドを確認
+            messages = response.get("messages", []) if isinstance(response, dict) else []
+            is_10002 = any(m.get("message_code") == "10002" for m in messages) if messages else False
+            if (response.get("status") != 0 and is_10002) or (response.get("status") == 0 and not response.get("data", {}).get("list")):
+                self.logger.info("注文が履歴に移動した可能性。/v1/closedOrders を確認します。")
+                history_path = "/v1/closedOrders"
+                current_date = datetime.now().strftime("%Y%m%d")
+                history_params = {"symbol": gmo_symbol, "date": current_date}
+                history_response = self.gmo_api._request("GET", history_path, params=history_params)
+
+                if history_response.get("status") == 0:
+                    orders = history_response.get("data", {}).get("list", [])
+                    for od in orders:
+                        if str(od.get("orderId")) == str(order_id):
+                            try:
+                                ex_sz = float(od.get("executedSize") or 0)
+                            except Exception:
+                                ex_sz = 0.0
+                            if ex_sz > 0:
+                                self.logger.info(f"取引履歴から注文を確認: 約定量 {ex_sz}")
+                                return ex_sz
+
+            # 2-3) それでも不明なとき → 建玉照会で推定（新規OPENのはずなのでside一致の最新を拾う）
+            try:
+                positions_response = self._get_margin_positions_safe(gmo_symbol)
+                if positions_response.get("status") == 0:
+                    # ここでは単純に合計サイズで近似
+                    pos_data = positions_response.get("data", {})
+                    pos_list = pos_data.get("list", []) if isinstance(pos_data, dict) else pos_data
+                    total_sz = 0.0
+                    for p in pos_list:
+                        if p.get("symbol") == gmo_symbol:
+                            try:
+                                total_sz += float(p.get("size") or 0)
+                            except Exception:
+                                pass
+                    if total_sz > 0:
+                        self.logger.info(f"建玉照会ベースの約定量推定: {total_sz}")
+                        return total_sz
+            except Exception as e:
+                self.logger.warning(f"建玉照会のフォールバックで例外: {e}")
+
+            # ここまでで確定できなければ 0.0
+            return 0.0
+
         except Exception as e:
-            self.logger.error(f"GMOコイン注文確認エラー: {e}", exc_info=True)
-            return 0
+            self.logger.error(f"check_order_execution 例外: {e}", exc_info=True)
+            return 0.0
             
     def execute_order_with_confirmation(
         self, symbol, order_type, size, max_retries=1,
@@ -4902,7 +5024,12 @@ class CryptoTradingBot:
             self._generate_final_report(start_date, start_balance, stats, trade_logs)
             
             # 取引ログをファイルに保存
-            self.save_trade_logs_to_excel(trade_logs)
+            # Excel出力は本番（live）のみ実行。SIM時はスキップして落ちないようにする
+            if self.exchange_settings_gmo.get('live_trade'):
+                try:
+                    self.save_trade_logs_to_excel(trade_logs)
+                except Exception as e:
+                    self.logger.warning(f"Excel出力に失敗しました（処理を継続します）: {e}")
             
             # 進行中のポジション情報を保存
             self.save_positions()
@@ -4911,8 +5038,13 @@ class CryptoTradingBot:
 
     def _verify_api_connection(self):
         """APIへの接続を検証する"""
-        self.logger.info("API接続検証を実行中...")
-        
+        self.logger.info("API接続検証を実行中...")    # paper(=sim) モードでは API 接続テストをスキップ
+        if not self.exchange_settings_gmo.get("live_trade", False):
+            self.logger.warning("Paper mode: API接続テストをスキップします（APIキー未設定でも続行）")
+            return True
+
+        self.logger.info("API接続検証を実行中...")     
+
         try:
             # API認証情報の確認
             if not self.exchange_settings_gmo.get('api_key') or not self.exchange_settings_gmo.get('api_secret'):
@@ -5265,7 +5397,7 @@ class CryptoTradingBot:
             # GMOコインの場合、position_idを取得して保存
             time.sleep(3)  # 注文が約定するまで待機
             gmo_symbol = self.symbol_mapping.get(symbol, symbol.upper().replace('_', ''))
-            positions_response = self.gmo_api.get_margin_positions(gmo_symbol)
+            positions_response = self._get_margin_positions_safe(gmo_symbol)
             
             if positions_response.get("status") == 0:
                 positions_data = positions_response.get("data", {})
@@ -6466,74 +6598,136 @@ class CryptoTradingBot:
                 }
 
 
-# メイン実行部分
+# ================================
+# メイン実行部分（統一版・重複禁止）
+# ================================
 if __name__ == "__main__":
     # DB起動確認（失敗しても落とさない）
     try:
-        from db import ping_db_once
+        from db import ping_db_once  # あれば
         ping_db_once()
     except Exception as e:
         logging.getLogger(__name__).warning("DB ping skipped due to error: %s", e)
 
-    # コマンドラインからのモード選択
-    parser = argparse.ArgumentParser(description='仮想通貨トレーディングボット（ショート対応・改良版）')
-    parser.add_argument('mode', choices=['backtest', 'live'], help='実行モード (backtest または live)')
-    parser.add_argument('--days', type=int, default=60, help='バックテスト日数 (デフォルト: 60)')
-    parser.add_argument('--capital', type=int, default=200000, help='初期資金 (デフォルト: 200000円)')
-    parser.add_argument('--test', action='store_true', help='テストモード（取引額を半分にする）')
-    parser.add_argument('--notify', action='store_true', help='通知を有効にする')
-    parser.add_argument('--debug', action='store_true', help='デバッグログを有効にする')
-    parser.add_argument('--api-key', type=str, help='bitbank API キー')
-    parser.add_argument('--api-secret', type=str, help='bitbank API シークレット')
-    parser.add_argument('--reset', action='store_true', help='起動時にポジション情報をリセットする')
-    parser.add_argument('--clear-cache', action='store_true', help='キャッシュをクリアしてから実行する')
-    parser.add_argument('--user-id', type=int, help='通知/DB設定をひもづけるユーザーID')
-    
+    # コマンドライン引数
+    parser = argparse.ArgumentParser(description="仮想通貨トレーディングボット（live / paper / backtest）")
+    parser.add_argument("mode", choices=["backtest", "live", "paper"], help="実行モード (backtest / live / paper)")
+    parser.add_argument("--days", type=int, default=60, help="バックテスト日数 (デフォルト: 60)")
+    parser.add_argument("--capital", type=int, default=200000, help="初期資金 (円)")
+    parser.add_argument("--test", action="store_true", help="テストモード（取引額を半分にする等）")
+    parser.add_argument("--notify", action="store_true", help="通知を有効にする")
+    parser.add_argument("--debug", action="store_true", help="デバッグログを有効にする")
+    parser.add_argument("--api-key", type=str, help="GMO API キー（任意。liveで未設定なら環境変数を使用）")
+    parser.add_argument("--api-secret", type=str, help="GMO API シークレット（任意。liveで未設定なら環境変数を使用）")
+    parser.add_argument("--reset", action="store_true", help="起動時にポジション情報をリセットする")
+    parser.add_argument("--clear-cache", action="store_true", help="キャッシュをクリアしてから実行する")
+    parser.add_argument("--user-id", type=int, help="通知/DB設定をひもづけるユーザーID")
     args = parser.parse_args()
-    
-    # ボットのインスタンス作成
+
+    # ボット生成
     bot = CryptoTradingBot(initial_capital=args.capital, test_mode=args.test, user_id=args.user_id)
-    
-    # デバッグモード設定
+
+    # ログレベル
     if args.debug:
         bot.logger.setLevel(logging.DEBUG)
-        for handler in bot.logger.handlers:
-            handler.setLevel(logging.DEBUG)
+        for h in bot.logger.handlers:
+            h.setLevel(logging.DEBUG)
         bot.logger.info("デバッグモードが有効になりました")
-    
-    # 通知設定
+
+    # 通知
     if args.notify:
-        bot.notification_settings['enabled'] = True
+        bot.notification_settings["enabled"] = True
         bot.logger.info("通知機能が有効になりました")
-    
-    # API認証情報を設定
-    if args.api_key and args.api_secret:
-        bot.exchange_settings_gmo['api_key'] = args.api_key
-        bot.exchange_settings_gmo['api_secret'] = args.api_secret
-        bot.logger.info("API認証情報を設定しました")
-    
-    # 実行モード
-    if args.mode == "backtest":
-        print(f"{args.days}日間のバックテストを開始します...")
-        bot.backtest(days_to_test=args.days)
-    elif args.mode == "live":
-        print("リアルタイムトレードモードを開始します...")
+    else:
+        bot.notification_settings["enabled"] = False
 
-        from threading import Thread
-        refresher = PriceCacheRefresher(
-            bot.symbols,
-            bot.get_current_price,
-            interval_sec=30,
-            logger=bot.logger
-        )
-        Thread(target=refresher.run_forever, daemon=True).start()
-        bot.run_live()  
+    # APIキー（CLI優先で上書き）
+    if args.api_key:
+        bot.exchange_settings_gmo["api_key"] = args.api_key
+    if args.api_secret:
+        bot.exchange_settings_gmo["api_secret"] = args.api_secret
 
-    if args.mode == "live":
-        from threading import Thread
-        refresher = PriceCacheRefresher(bot.symbols, bot.get_current_price, interval_sec=30, logger=bot.logger)
-        Thread(target=refresher.run_forever, daemon=True).start()
+    # 事前メンテ（任意フラグ）
+    if args.clear_cache:
+        try:
+            import shutil, os
+            if os.path.isdir(bot.cache_dir):
+                shutil.rmtree(bot.cache_dir)
+                os.makedirs(bot.cache_dir, exist_ok=True)
+            bot.logger.info("キャッシュをクリアしました")
+        except Exception as e:
+            bot.logger.warning("キャッシュクリアに失敗: %s", e)
+    if args.reset:
+        try:
+            # 必要であれば、既存の reset ロジックを呼ぶ
+            if hasattr(bot, "reset_positions"):
+                bot.reset_positions()
+            else:
+                # 既存の保存ファイル削除やDBリセットなど
+                pass
+            bot.logger.info("ポジション情報をリセットしました")
+        except Exception as e:
+            bot.logger.warning("ポジションリセットに失敗: %s", e)
+
+    # モード実行（単一分岐）
+    if args.mode in ("live", "paper"):
+        is_live = (args.mode == "live")
+        bot.exchange_settings_gmo["live_trade"] = is_live
+        bot.source = "real" if is_live else "sim"
+        bot.setup_logging()
+
+        msg = "リアルタイムトレード（LIVE）を開始します..." if is_live else "ペーパートレード（SIM）を開始します..."
+        print(msg)
+        bot.logger.info(msg)
+
+        # live時のみ API を遅延初期化（paperは不要）
+        if is_live:
+            if hasattr(bot, "_init_gmo_api_if_needed"):
+                bot._init_gmo_api_if_needed()
+            else:
+                # フォールバック初期化
+                ak = bot.exchange_settings_gmo.get("api_key") or os.getenv("GMO_API_KEY", "")
+                sk = bot.exchange_settings_gmo.get("api_secret") or os.getenv("GMO_API_SECRET", "")
+                if not ak or not sk:
+                    raise RuntimeError("GMO APIキー/シークレットが未設定です（liveモード）。")
+                try:
+                    bot.gmo_api = GMOPrivateAPI(ak, sk)  # 片方の実装名
+                except NameError:
+                    bot.gmo_api = GMOCoinAPI(ak, sk)    # もう片方の実装名
+
+        # 価格キャッシュ Refresher（live/paper 共通）
+        try:
+            from threading import Thread
+            refresher = PriceCacheRefresher(
+                bot.symbols,
+                bot.get_current_price,
+                interval_sec=30,
+                logger=bot.logger
+            )
+            Thread(target=refresher.run_forever, daemon=True).start()
+        except Exception as e:
+            bot.logger.warning("PriceCacheRefresher 起動に失敗: %s", e)
+
+        # 実行
         bot.run_live()
 
     elif args.mode == "backtest":
-        bot.run_backtest(days=args.days)
+        bot.is_backtest_mode = True
+        bot.source = "backtest"
+        print(f"{args.days}日間のバックテストを開始します...")
+        bot.logger.info("バックテスト開始 days=%s", args.days)
+
+        # backtest エントリの名前差を吸収
+        try:
+            if hasattr(bot, "backtest"):
+                try:
+                    bot.backtest(args.days)
+                except TypeError:
+                    bot.backtest(days_to_test=args.days)
+            elif hasattr(bot, "run_backtest"):
+                bot.run_backtest(days=args.days)
+            else:
+                raise RuntimeError("バックテストのエントリ関数が見つかりません（backtest / run_backtest）")
+        except Exception:
+            bot.logger.exception("バックテスト実行中に例外が発生しました")
+            raise
