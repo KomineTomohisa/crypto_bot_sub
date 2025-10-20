@@ -210,15 +210,15 @@ OPEN_WITH_PRICE_SQL = sa.text("""
       p.avg_entry_price AS entry_price,
       p.opened_at::timestamptz AS entry_time,
       CASE
-        WHEN pc.ts >= NOW() - INTERVAL '10 minutes' THEN pc.last
-        ELSE NULL
+      WHEN pc.ts >= NOW() - INTERVAL '10 minutes' THEN pc.price
+      ELSE NULL
       END AS current_price,
       CASE
-        WHEN pc.ts < NOW() - INTERVAL '10 minutes' THEN NULL
-        WHEN pc.last IS NULL OR p.avg_entry_price IS NULL OR p.size = 0 THEN NULL
-        WHEN lower(p.side) = 'long'  THEN (pc.last / NULLIF(p.avg_entry_price,0) - 1) * 100
-        WHEN lower(p.side) = 'short' THEN (NULLIF(p.avg_entry_price,0) / pc.last - 1) * 100
-        ELSE NULL
+      WHEN pc.ts < NOW() - INTERVAL '10 minutes' THEN NULL
+      WHEN pc.price IS NULL OR p.avg_entry_price IS NULL OR p.size = 0 THEN NULL
+      WHEN lower(p.side) = 'long'  THEN (pc.price / NULLIF(p.avg_entry_price,0) - 1) * 100
+      WHEN lower(p.side) = 'short' THEN (NULLIF(p.avg_entry_price,0) / pc.price - 1) * 100
+      ELSE NULL
       END AS unrealized_pnl_pct,
       pc.ts AS price_ts
     FROM positions p
