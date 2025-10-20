@@ -254,6 +254,32 @@ OPEN_KPI_SQL = sa.text("""
       AND (:symbol IS NULL OR lower(symbol) = lower(:symbol))
 """)
 
+# === 本日の確定トレード（JST基準 / opened_at は算出） ===
+TRADES_TODAY_SQL = sa.text("""
+SELECT
+  t.trade_id,
+  t.symbol,
+  t.side,
+  t.entry_position_id,
+  t.exit_order_id,
+  t.entry_price,
+  t.exit_price,
+  t.size,
+  t.pnl,
+  t.pnl_pct,
+  t.holding_hours,
+  t.closed_at,
+  t.strategy_id,
+  t.source,
+  t.user_id
+FROM trades t
+WHERE t.source = :source
+  AND t.closed_at IS NOT NULL
+  AND (t.closed_at AT TIME ZONE 'Asia/Tokyo')::date = :target_date
+  AND (:symbol IS NULL OR LOWER(t.symbol) = LOWER(:symbol))
+ORDER BY t.closed_at DESC
+""")
+
 # === real-only 日次（全体集計）: trades 由来 ===
 DAILY_SERIES_FROM_TRADES_REAL = sa.text("""
 WITH days AS (
@@ -685,3 +711,49 @@ def get_kpi_7days(symbol: str | None = Query(None)):
         "avg_pnl_pct": _f(row["avg_pnl_pct"]),
         "avg_holding_hours": _f(row["avg_holding_hours"]),
     }
+
+@app.get("/public/trades/today")
+def get_trades_today(
+    symbol: str | None = Query(None, description="例: btc_jpy"),
+    source: str = Query("real", pattern="^(real|virtual)$")
+):
+    today_jst = datetime.now(JST).date()
+
+    with engine.begin() as conn:
+        rows = conn.execute(TRADES_TODAY_SQL, {
+            "source": source,
+            "symbol": symbol,
+            "target_date": today_jst,
+        }).mappings().all()
+
+    def _f(v): return float(v) if v is not None else None
+    out = []
+    for r in rows:
+        closed_at = r.get("closed_at")
+        # opened_at は holding_hours から逆算（存在時のみ）
+        opened_iso = None
+        if closed_at is not None and r.get("holding_hours") is not None:
+            try:
+                opened_dt = closed_at - timedelta(hours=float(r["holding_hours"]))
+                opened_iso = opened_dt.isoformat()
+            except Exception:
+                opened_iso = None
+        out.append({
+            "trade_id": r.get("trade_id"),
+            "symbol": r.get("symbol"),
+            "side": r.get("side"),
+            "entry_position_id": r.get("entry_position_id"),
+            "exit_order_id": r.get("exit_order_id"),
+            "size": _f(r.get("size")),
+            "entry_price": _f(r.get("entry_price")),
+            "exit_price": _f(r.get("exit_price")),
+            "pnl": _f(r.get("pnl")),
+            "pnl_pct": _f(r.get("pnl_pct")),
+            "opened_at": opened_iso,
+            "closed_at": closed_at.isoformat() if closed_at else None,
+            "holding_hours": _f(r.get("holding_hours")),
+            "strategy_id": r.get("strategy_id"),
+            "source": r.get("source"),
+            "user_id": r.get("user_id"),
+        })
+    return out
