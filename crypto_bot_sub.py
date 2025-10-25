@@ -8,6 +8,7 @@ import os
 import logging
 import smtplib
 import shutil
+import tempfile
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from sklearn.preprocessing import MinMaxScaler
@@ -26,7 +27,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import socket
 from db import (
-    begin,
+    begin, text,
     insert_order, upsert_fill,                 # ★ upsert_fill を追加
     upsert_position, insert_trade, insert_balance_snapshot, utcnow, insert_error
 )
@@ -420,6 +421,86 @@ class CryptoTradingBot:
             self.logger.error(f"Excel評価レポート生成エラー: {str(e)}", exc_info=True)
             return None
 
+    def _get_open_positions_from_db(self, gmo_symbol: str | None = None):
+        """
+        SIM/PAPER 用。positions テーブルから size>0 のオープンポジションを取得し、
+        GMOの openPositions 互換っぽいフォーマット {"status": 0, "data": {"list": [...]}} に整形して返す。
+        - strategy_id は DB 側が UUID 型を想定。UUID に変換できた場合のみ絞り込みに使う。
+        """
+        import os
+        from uuid import UUID
+
+        def _to_uuid_or_none(v):
+            try:
+                if v is None:
+                    return None
+                return str(UUID(str(v)))
+            except Exception:
+                return None
+
+        try:
+            # source は SIM 固定（live_trade=False の前提）
+            src = "real" if self.exchange_settings_gmo.get("live_trade", False) else "sim"
+            # strategy_id を UUID に正規化できた場合のみ使う
+            sid = _to_uuid_or_none(getattr(self, "strategy_id", None))
+            uid = getattr(self, "user_id", None)
+
+            from db import begin, text  # 既存の db.py のヘルパーを利用
+            rows = []
+            with begin() as conn:
+                params = {"src": src}
+                where_extra = ""
+
+                # ユーザーID
+                if uid is not None:
+                    where_extra += " AND user_id = :uid"
+                    params["uid"] = uid
+
+                # strategy_id（UUIDのみ許可。文字列IDなら条件を外す）
+                if sid is not None:
+                    where_extra += " AND strategy_id = :sid"
+                    params["sid"] = sid
+
+                # シンボル（"LTC_JPY" → "ltc_jpy" に合わせて保存されている想定）
+                if gmo_symbol:
+                    bot_symbol = gmo_symbol.lower()
+                    where_extra += " AND symbol = :sym"
+                    params["sym"] = bot_symbol
+
+                sql = f"""
+                    SELECT position_id, symbol, side, size, avg_entry_price
+                    FROM positions
+                    WHERE size > 0
+                    AND source = :src
+                    {where_extra}
+                """
+                res = conn.execute(text(sql), params)
+                rows = [dict(r._mapping) for r in res]
+
+            lst = []
+            for r in rows:
+                bot_symbol = r["symbol"]  # 例: "xrp_jpy"
+                lst.append({
+                    "positionId": r["position_id"],
+                    "symbol": self.symbol_mapping.get(bot_symbol, bot_symbol.upper().replace("_", "")),
+                    "side": "BUY" if r["side"] == "long" else "SELL",
+                    "size": float(r["size"]),
+                    "price": float(r.get("avg_entry_price") or 0.0),
+                })
+            return {"status": 0, "data": {"list": lst}}
+
+        except Exception as e:
+            self.logger.error(f"[SIM] DBからポジション取得に失敗: {e}", exc_info=True)
+            return {"status": -1, "messages": [{"message_string": str(e)}]}
+            
+    def _positions_filepath(self, source: str | None = None) -> str:
+        """モードに応じた positions ファイルパスを返す"""
+        src = source or getattr(self, "source", None) or "real"
+        base = getattr(self, "data_dir", ".")
+        # real は従来名を維持、sim/backtest はサフィックスで分離
+        name = "positions.json" if src == "real" else f"positions_{src}.json"
+        return os.path.join(base, name)
+
     def _get_margin_positions_safe(self, gmo_symbol: str):
         """
         liveモードかつ self.gmo_api がある場合のみ実APIを呼び、
@@ -429,8 +510,8 @@ class CryptoTradingBot:
         is_live = bool(self.exchange_settings_gmo.get("live_trade", False))
         if is_live and self.gmo_api is not None:
             return self.gmo_api.get_margin_positions(gmo_symbol)
-        # paper/sim の場合は「オープンポジションなし」として扱う
-        return {"data": []}
+        # ← SIM/PAPER はDBから取得
+        return self._get_open_positions_from_db(gmo_symbol)
 
     def _record_signal(self, *, symbol: str, timeframe: str, side: str, price: float,
                    strength_score: float | None,
@@ -708,8 +789,8 @@ class CryptoTradingBot:
 
         self.reentry_block_until = {symbol: None for symbol in self.symbols}
         
-        # 保存されたポジション情報を読み込む
-        self.load_positions()
+        # まずは暫定のファイルパス（source 未確定でも呼べる）
+        self.positions_path = self._positions_filepath()
 
         self.logger.info(f"=== ボット初期化完了 （初期資金: {initial_capital:,}円, テストモード: {test_mode}) ===")
 
@@ -1188,51 +1269,116 @@ class CryptoTradingBot:
             self.send_notification("月間増資", f"{increase_amount:,}円を運用資金に追加しました。\n現在の運用資金: {self.initial_capital:,}円", "info")
     
     def save_positions(self):
-        """現在のポジション情報をファイルに保存（ポジションID含む）"""
-        positions_file = os.path.join(self.base_dir, 'positions.json')
-        
+        """現在のポジション情報をファイルに保存（ポジションID含む・アトミック書き込み・モード別ファイル対応）"""
+        import os, json, tempfile
+
+        src = getattr(self, "source", "real")
+        filename = "positions.json" if src == "real" else f"positions_{src}.json"
+        positions_file = os.path.join(self.base_dir, filename)
+
+        # 保存用データを組み立て（ポジションがあるシンボルのみ）
         positions_data = {}
         for symbol in self.symbols:
-            if self.positions[symbol] is not None:
-                positions_data[symbol] = {
-                    'position': self.positions[symbol],
-                    'entry_price': self.entry_prices[symbol],
-                    'entry_time': self.entry_times[symbol].isoformat() if self.entry_times[symbol] else None,
-                    'entry_size': self.entry_sizes[symbol],
-                    'position_id': self.position_ids.get(symbol)  # ポジションIDを追加
-                }
-        
+            pos = self.positions.get(symbol)
+            if pos is None:
+                continue
+            positions_data[symbol] = {
+                "position": pos,
+                "entry_price": self.entry_prices.get(symbol),
+                "entry_time": self.entry_times[symbol].isoformat() if self.entry_times.get(symbol) else None,
+                "entry_size": self.entry_sizes.get(symbol, 0.0),
+                "position_id": self.position_ids.get(symbol),
+            }
+
+        # ディレクトリ確保
+        os.makedirs(self.base_dir, exist_ok=True)
+
+        # アトミック書き込み
+        fd, tmp_path = tempfile.mkstemp(prefix=".positions_", suffix=".tmp", dir=self.base_dir)
         try:
-            with open(positions_file, 'w') as f:
-                json.dump(positions_data, f)
-            self.logger.info("ポジション情報を保存しました")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(positions_data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, positions_file)
+            self.logger.info("ポジション情報を保存しました: %s", positions_file)
         except Exception as e:
-            self.logger.error(f"ポジション情報の保存エラー: {e}")
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+            self.logger.error("ポジション情報の保存エラー（%s）: %s", positions_file, e)
 
     def load_positions(self):
-        """保存されたポジション情報を読み込む（ポジションID含む）"""
-        positions_file = os.path.join(self.base_dir, 'positions.json')
-        
+        """保存されたポジション情報を読み込む（ポジションID含む・モード別ファイル対応）"""
+        import os, json
+        from datetime import datetime
+
+        # モードに応じたパス（data_dir/base_dir の揺れを避ける）
+        src = getattr(self, "source", "real")
+        positions_file = self._positions_filepath(src)
+        self.logger.info("[positions] source=%s file=%s", src, positions_file)
+
+        # 初期化（存在しないキーへの備え）
+        for sym in self.symbols:
+            self.positions.setdefault(sym, None)
+            self.entry_prices.setdefault(sym, None)
+            self.entry_sizes.setdefault(sym, 0.0)
+            self.position_ids.setdefault(sym, None)
+            self.entry_times.setdefault(sym, None)
+
+        # 1) モード別ファイルがあればそのまま読む
         if os.path.exists(positions_file):
             try:
-                with open(positions_file, 'r') as f:
+                with open(positions_file, "r", encoding="utf-8") as f:
                     positions_data = json.load(f)
-                
+
                 for symbol, data in positions_data.items():
-                    if symbol in self.symbols:
-                        self.positions[symbol] = data['position']
-                        self.entry_prices[symbol] = data['entry_price']
-                        self.entry_sizes[symbol] = data.get('entry_size', 0)
-                        self.position_ids[symbol] = data.get('position_id')  # ポジションIDを読み込む
-                        if data['entry_time']:
-                            self.entry_times[symbol] = datetime.fromisoformat(data['entry_time'])
-                        else:
-                            self.entry_times[symbol] = None
-                
-                self.logger.info("保存されたポジション情報を読み込みました")
+                    if symbol not in self.symbols:
+                        continue
+                    self.positions[symbol] = data.get("position")
+                    self.entry_prices[symbol] = data.get("entry_price")
+                    self.entry_sizes[symbol] = data.get("entry_size", 0.0)
+                    self.position_ids[symbol] = data.get("position_id")
+                    ts = data.get("entry_time")
+                    self.entry_times[symbol] = datetime.fromisoformat(ts) if ts else None
+
+                self.logger.info("保存されたポジション情報を読み込みました: %s", positions_file)
                 self.print_positions_info()
+                return
             except Exception as e:
-                self.logger.error(f"ポジション情報の読み込みエラー: {e}")
+                self.logger.error("ポジション情報の読み込みエラー（%s）: %s", positions_file, e)
+
+        # 2) なければ real の positions.json を初回コピー元にする（SIM/BTの分岐スタート）
+        if src != "real":
+            real_file = self._positions_filepath("real")
+            if os.path.exists(real_file):
+                try:
+                    with open(real_file, "r", encoding="utf-8") as rf:
+                        positions_data = json.load(rf)
+
+                    for symbol, data in positions_data.items():
+                        if symbol not in self.symbols:
+                            continue
+                        self.positions[symbol] = data.get("position")
+                        self.entry_prices[symbol] = data.get("entry_price")
+                        self.entry_sizes[symbol] = data.get("entry_size", 0.0)
+                        self.position_ids[symbol] = data.get("position_id")
+                        ts = data.get("entry_time")
+                        self.entry_times[symbol] = datetime.fromisoformat(ts) if ts else None
+
+                    # 自分のモードファイル名で保存して以後は分離運用
+                    self.save_positions()  # save_positions 内も _positions_filepath を使うことを推奨
+                    self.logger.info("初回作成: %s（ソース: %s）", positions_file, real_file)
+                    self.print_positions_info()
+                    return
+                except Exception as e:
+                    self.logger.warning("初回コピー元（%s）読み込みに失敗: %s", real_file, e)
+
+        # 3) どちらも無ければ空で作成
+        try:
+            self.save_positions()
+            self.logger.info("positions ファイルが無かったため新規作成: %s", positions_file)
+        except Exception as e:
+            self.logger.error("ポジション情報の初期保存エラー（%s）: %s", positions_file, e)
     
     def print_positions_info(self):
         """現在のポジション情報を表示"""
@@ -1392,11 +1538,61 @@ class CryptoTradingBot:
         
     def verify_positions(self):
         """GMOコインの信用取引建玉を使用してポジションを検証する"""
-        # paper(sim) モードでは取引所との突き合わせは行わない
+        # SIM（paper）では取引所照合はしないが、DBのオープンポジションを反映して JSON を更新する
         if not self.exchange_settings_gmo.get("live_trade", False):
-            self.logger.info("Paper mode: 取引所ポジション照合をスキップ（ローカル状態のみ保持）")
+            self.logger.info("Paper mode: positions_* をロードし、DBのオープンポジションで上書きします")
+            try:
+                # 1) まず現在の positions_sim.json を読み込み（存在すれば）
+                self.load_positions()
+            except Exception:
+                self.logger.exception("Paper mode での positions ロードに失敗")
+
+            try:
+                # 2) DBから source='sim' のオープンポジションを取得（内部で live/paper を見て src を切替）
+                resp = self._get_open_positions_from_db(None)  # 全シンボル対象
+                if resp.get("status") == 0:
+                    lst = resp.get("data", {}).get("list", [])
+                    # いったん全通貨をクリア
+                    for sym in self.symbols:
+                        self.positions[sym] = None
+                        self.entry_prices[sym] = 0.0
+                        self.entry_sizes[sym] = 0.0
+                        self.position_ids[sym] = None
+                        self.entry_times[sym] = None
+
+                    # GMO表記 → bot表記へ逆引きして反映（逆引きマップを用意）
+                    reverse_map = {v: k for k, v in self.symbol_mapping.items()}
+                    # _get_open_positions_from_db は "symbol" に GMO表記（例: "XRPJPY"）を返す実装
+                    # なので symbol_mapping を逆引きして bot表記（例: "xrp_jpy"）に戻す
+                    for p in lst:
+                        gmo_symbol = p.get("symbol")
+                        bot_symbol = reverse_map.get(gmo_symbol)
+                        if not bot_symbol or bot_symbol not in self.symbols:
+                            # フォールバック（"XRPJPY" → "xrp_jpy" 的に近似復元）
+                            try:
+                                s = (gmo_symbol or "").upper()
+                                if s.endswith("JPY"):
+                                    bot_symbol = s[:-3].lower() + "_jpy"
+                                else:
+                                    bot_symbol = s.lower()
+                            except Exception:
+                                continue
+                            if bot_symbol not in self.symbols:
+                                continue
+
+                        side = "long" if p.get("side") == "BUY" else "short"
+                        self.positions[bot_symbol]     = side
+                        self.entry_prices[bot_symbol]  = float(p.get("price") or 0.0)
+                        self.entry_sizes[bot_symbol]   = float(p.get("size") or 0.0)
+                        self.position_ids[bot_symbol]  = p.get("positionId")
+                        # entry_time はDBに無ければ None のまま
+
+                    # 3) 反映済みのメモリ状態を SIM 用ファイルに保存
+                    self.save_positions()
+                    self.logger.info("Paper mode: DBのオープンポジションを positions_sim.json へ反映しました")
+            except Exception as e:
+                self.logger.warning(f"Paper mode: DB→JSON反映に失敗: {e}")
             return False
-        self.logger.info("取引所ポジション情報の検証を開始.")
 
         # ローカルポジション情報のバックアップ
         local_positions_backup = {
@@ -1889,15 +2085,33 @@ class CryptoTradingBot:
             except Exception as e:
                 self.logger.warning(f"既存ポジション取得エラー: {e}")
 
-            # 新規注文のみを扱う
-            self.logger.info(f"GMOコイン信用取引新規注文: {gmo_symbol} {side} {size}")
+            # --- 銘柄別サイズフォーマッタ（小数桁の制約に合わせる） ---
+            from decimal import Decimal, ROUND_DOWN
+            def _format_size(sym: str, sz: float) -> str:
+                sym_l = sym.lower()
+                # 受け付け小数桁のマップ（必要に応じて拡張）
+                precision = {
+                    "xrp_jpy": 0, "doge_jpy": 0, "ltc_jpy": 0, "ada_jpy": 0,
+                    "eth_jpy": 2, "sol_jpy": 1, "bcc_jpy": 1, "bch_jpy": 1,
+                }.get(sym_l, 3)
+                q = Decimal(1).scaleb(-precision)
+                val = Decimal(str(sz)).quantize(q, rounding=ROUND_DOWN)
+                s = format(val, "f")
+                if precision == 0 and "." in s:
+                    s = s.split(".")[0]
+                return s
 
-            # 新規注文データ
+            size_str = _format_size(symbol, size)
+
+            # 新規注文のみを扱う（ログも送信値もフォーマット後を表示）
+            self.logger.info(f"GMOコイン信用取引新規注文: {gmo_symbol} {side} {size_str}")
+
+            # 新規注文データ（サイズは必ず文字列）
             order_data = {
                 "symbol": gmo_symbol,
                 "side": side,
                 "executionType": "MARKET",
-                "size": str(size),
+                "size": size_str,
                 "settlePosition": "OPEN"  # 常に新規
             }
             
@@ -2406,6 +2620,15 @@ class CryptoTradingBot:
                         # 約定確認直後：DB書き込みを一体トランザクションで確定
                         try:
                             exec_price = float(self.get_current_price(symbol) or 0.0)
+                            # --- 新規エントリー時はローカル状態をここで確実に初期化 ---
+                            if current_position is None:
+                                _side = "long" if str(order_type).lower() == "buy" else "short"
+                                self.positions[symbol] = _side
+                                self.entry_prices[symbol] = float(exec_price or 0.0)
+                                from datetime import datetime  # 局所 import 可（既存の import があれば不要）
+                                self.entry_times[symbol] = datetime.now()
+                                self.entry_sizes[symbol] = float(executed_size)
+
                             self.logger.info(
                                 "[DBTX] committing order+fill(+signal) atomically: order_id=%s exec_size=%s price=%s symbol=%s",
                                 order_id, executed_size, exec_price, symbol
@@ -5631,9 +5854,20 @@ class CryptoTradingBot:
         stats (dict): 統計情報の辞書
         trade_logs (list): 取引ログのリスト
         """
-        position = self.positions[symbol]
-        entry_price = self.entry_prices[symbol]
-        entry_time = self.entry_times[symbol]
+        position = self.positions.get(symbol)
+        # ポジションが無ければ何もしない（SIMのループでNoneが混ざるケース対策）
+        if not position:
+            return
+
+        entry_price = self.entry_prices.get(symbol) or 0.0
+        entry_time = self.entry_times.get(symbol)
+        # エントリー時刻が未設定の場合のセーフティ（SIMでの復元/初期化漏れ対策）
+        if entry_time is None:
+            from datetime import datetime
+            self.logger.warning(f"{symbol}: entry_time が未設定のため現在時刻を代入します（SIM safety）")
+            entry_time = datetime.now()
+            self.entry_times[symbol] = entry_time
+            
         entry_size = self.entry_sizes[symbol]
         
         # 保有時間の計算
@@ -6674,6 +6908,11 @@ if __name__ == "__main__":
         is_live = (args.mode == "live")
         bot.exchange_settings_gmo["live_trade"] = is_live
         bot.source = "real" if is_live else "sim"
+        # ← モードに応じた positions ファイルへ切り替え
+        bot.positions_path = bot._positions_filepath()
+        # ★ SIM（paper）時のみ、ファイルからポジションを復元
+        if not is_live:
+            bot.load_positions()
         bot.setup_logging()
 
         msg = "リアルタイムトレード（LIVE）を開始します..." if is_live else "ペーパートレード（SIM）を開始します..."
