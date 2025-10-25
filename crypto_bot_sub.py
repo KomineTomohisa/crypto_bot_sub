@@ -62,6 +62,10 @@ from typing import Optional, List, Dict, Tuple, Any
 import datetime as dt
 JST = timezone(timedelta(hours=9))
 
+def now_jst() -> dt.datetime:
+    """常にJSTのaware datetimeを返す"""
+    return dt.datetime.now(JST)
+
 # 既存のimport文の後に追加
 try:
     from excel_report_generator import ExcelReportGenerator
@@ -78,6 +82,12 @@ def _num(x):
         return xf if math.isfinite(xf) else None
     except Exception:
         return None
+
+def _is_sim_run(self) -> bool:
+    try:
+        return not self.exchange_settings_gmo.get("live_trade", False)
+    except Exception:
+        return True
 
 def _make_session():
     s = requests.Session()
@@ -173,7 +183,7 @@ class PriceCacheRefresher:
                 try:
                     px = self.get_price(sym)
                     if px and px > 0:
-                        upsert_price_cache(sym.lower(), px, datetime.now(timezone.utc))
+                        upsert_price_cache(sym.lower(), px, dt.datetime.now(timezone.utc))
                         if self.logger:
                             self.logger.debug(f"[price_cache] {sym} = {px}")
                 except Exception as e:
@@ -376,7 +386,7 @@ class CryptoTradingBot:
 
     def _current_strategy_version(self):
         base = {
-            "date": dt.datetime.now().strftime("%Y-%m-%d"),
+            "date": now_jst().strftime("%Y-%m-%d"),
             "thresholds": self.entry_thresholds,
         }
         h = hashlib.sha1(json.dumps(base, sort_keys=True).encode()).hexdigest()[:7]
@@ -408,7 +418,7 @@ class CryptoTradingBot:
             report_generator.add_symbol_sheets()
             
             # ファイル保存
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            timestamp = now_jst().strftime('%Y%m%d_%H%M%S')
             report_filename = f"excel_evaluation_report_{timestamp}.xlsx"
             report_path = os.path.join(self.log_dir, report_filename)
             
@@ -468,7 +478,7 @@ class CryptoTradingBot:
                     params["sym"] = bot_symbol
 
                 sql = f"""
-                    SELECT position_id, symbol, side, size, avg_entry_price
+                    SELECT position_id, symbol, side, size, avg_entry_price, opened_at
                     FROM positions
                     WHERE size > 0
                     AND source = :src
@@ -486,6 +496,7 @@ class CryptoTradingBot:
                     "side": "BUY" if r["side"] == "long" else "SELL",
                     "size": float(r["size"]),
                     "price": float(r.get("avg_entry_price") or 0.0),
+                    "openedAt": r.get("opened_at"),
                 })
             return {"status": 0, "data": {"list": lst}}
 
@@ -912,7 +923,7 @@ class CryptoTradingBot:
             if force_start:
                 start = force_start
             else:
-                jst_now = datetime.now(JST)
+                jst_now = dt.datetime.now(JST)
                 start = jst_now.replace(hour=0, minute=0, second=0, microsecond=0)
             end = start + timedelta(days=1)
 
@@ -1162,7 +1173,7 @@ class CryptoTradingBot:
                 profit_pct = (entry_price / exit_price - 1.0) * 100.0
 
             # 保有時間（時間）
-            holding_hours = (datetime.now() - entry_time).total_seconds() / 3600.0
+            holding_hours = (now_jst() - entry_time).total_seconds() / 3600.0
 
             # 本文生成（利益最上段）
             perf = ExitPerf(
@@ -1214,7 +1225,7 @@ class CryptoTradingBot:
         
         try:
             with open(profit_file, 'w') as f:
-                json.dump({'total_profit': self.total_profit, 'updated_at': datetime.now().isoformat()}, f)
+                json.dump({'total_profit': self.total_profit, 'updated_at': now_jst().isoformat()}, f)
         except Exception as e:
             self.logger.error(f"利益データ保存エラー: {e}")
     
@@ -1226,14 +1237,14 @@ class CryptoTradingBot:
             try:
                 with open(increase_file, 'r') as f:
                     data = json.load(f)
-                    return datetime.fromisoformat(data.get('last_increase_date', datetime.now().isoformat()))
+                    return datetime.fromisoformat(data.get('last_increase_date', now_jst().isoformat()))
             except Exception as e:
                 self.logger.error(f"増資日データ読み込みエラー: {e}")
-                return datetime.now()
+                return now_jst()
         else:
             # ファイルが存在しない場合は現在の日付を設定
-            self._save_last_increase_date(datetime.now())
-            return datetime.now()
+            self._save_last_increase_date(now_jst())
+            return now_jst()
 
     def _save_last_increase_date(self, date):
         """増資日を保存"""
@@ -1247,7 +1258,7 @@ class CryptoTradingBot:
 
     def check_monthly_increase(self):
         """月間の運用資金増加をチェック"""
-        current_date = datetime.now()
+        current_date = now_jst()
         last_date = self.last_increase_date
         
         # 年月が変わったかをチェック
@@ -1339,7 +1350,16 @@ class CryptoTradingBot:
                     self.entry_sizes[symbol] = data.get("entry_size", 0.0)
                     self.position_ids[symbol] = data.get("position_id")
                     ts = data.get("entry_time")
-                    self.entry_times[symbol] = datetime.fromisoformat(ts) if ts else None
+                    if ts:
+                        t = datetime.fromisoformat(ts)
+                        # tzなし→JST付与、別TZ→JSTへ変換
+                        if t.tzinfo is None:
+                            t = t.replace(tzinfo=JST)
+                        else:
+                            t = t.astimezone(JST)
+                        self.entry_times[symbol] = t
+                    else:
+                        self.entry_times[symbol] = None
 
                 self.logger.info("保存されたポジション情報を読み込みました: %s", positions_file)
                 self.print_positions_info()
@@ -1363,7 +1383,16 @@ class CryptoTradingBot:
                         self.entry_sizes[symbol] = data.get("entry_size", 0.0)
                         self.position_ids[symbol] = data.get("position_id")
                         ts = data.get("entry_time")
-                        self.entry_times[symbol] = datetime.fromisoformat(ts) if ts else None
+                        if ts:
+                            t = datetime.fromisoformat(ts)
+                            # tzなし→JST付与、別TZ→JSTへ変換
+                            if t.tzinfo is None:
+                                t = t.replace(tzinfo=JST)
+                            else:
+                                t = t.astimezone(JST)
+                            self.entry_times[symbol] = t
+                        else:
+                            self.entry_times[symbol] = None
 
                     # 自分のモードファイル名で保存して以後は分離運用
                     self.save_positions()  # save_positions 内も _positions_filepath を使うことを推奨
@@ -1397,7 +1426,7 @@ class CryptoTradingBot:
                 
                 # 保有時間を計算
                 if self.entry_times[symbol]:
-                    holding_time = datetime.now() - self.entry_times[symbol]
+                    holding_time = now_jst() - self.entry_times[symbol]
                     hours = holding_time.total_seconds() / 3600
                     self.logger.info(f"  保有時間: {hours:.1f}時間")
                     
@@ -1485,7 +1514,7 @@ class CryptoTradingBot:
             self.last_backup_time = time.time()
             
             # バックアップディレクトリ名
-            backup_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_time = now_jst().strftime("%Y%m%d_%H%M%S")
             backup_dir = os.path.join(self.backup_dir, f"backup_{backup_time}")
             os.makedirs(backup_dir, exist_ok=True)
             
@@ -1553,12 +1582,13 @@ class CryptoTradingBot:
                 if resp.get("status") == 0:
                     lst = resp.get("data", {}).get("list", [])
                     # いったん全通貨をクリア
+                    prev_entry_times = dict(self.entry_times)
                     for sym in self.symbols:
                         self.positions[sym] = None
                         self.entry_prices[sym] = 0.0
                         self.entry_sizes[sym] = 0.0
                         self.position_ids[sym] = None
-                        self.entry_times[sym] = None
+                        # entry_times はここでクリアしない（openedAt で上書き or 既存温存）
 
                     # GMO表記 → bot表記へ逆引きして反映（逆引きマップを用意）
                     reverse_map = {v: k for k, v in self.symbol_mapping.items()}
@@ -1585,7 +1615,19 @@ class CryptoTradingBot:
                         self.entry_prices[bot_symbol]  = float(p.get("price") or 0.0)
                         self.entry_sizes[bot_symbol]   = float(p.get("size") or 0.0)
                         self.position_ids[bot_symbol]  = p.get("positionId")
-                        # entry_time はDBに無ければ None のまま
+                        # entry_time を openedAt から復元。無ければ既存値を温存。
+                        opened_at = p.get("openedAt")
+                        if opened_at:
+                            import pandas as pd
+                            ts = pd.to_datetime(opened_at, utc=False)
+                            # pandas.Timestamp → JST aware に正規化
+                            if getattr(ts, "tz", None) is None:
+                                ts = ts.tz_localize("Asia/Tokyo")
+                            else:
+                                ts = ts.tz_convert("Asia/Tokyo")
+                            self.entry_times[bot_symbol] = ts.to_pydatetime()
+                        else:
+                            self.entry_times[bot_symbol] = prev_entry_times.get(bot_symbol)
 
                     # 3) 反映済みのメモリ状態を SIM 用ファイルに保存
                     self.save_positions()
@@ -1691,7 +1733,7 @@ class CryptoTradingBot:
 
                     self.positions[symbol] = actual_side
                     self.entry_prices[symbol] = avg_price
-                    self.entry_times[symbol] = datetime.now() - timedelta(hours=1)  # 1時間前からの保有と仮定
+                    self.entry_times[symbol] = now_jst() - timedelta(hours=1)  # 1時間前からの保有と仮定
                     self.entry_sizes[symbol] = actual_size
 
                     inconsistencies += 1
@@ -2254,10 +2296,9 @@ class CryptoTradingBot:
 
                         # 2) まだ price が無ければ約定履歴から VWAP を算出
                         if avg_entry <= 0:
-                            from datetime import datetime
                             hist = self.gmo_api._request(
                                 "GET", "/v1/closedOrders",
-                                params={"symbol": gmo_symbol, "date": datetime.now().strftime("%Y%m%d")}
+                                params={"symbol": gmo_symbol, "date": now_jst().strftime("%Y%m%d")}
                             )
                             if hist.get("status") == 0:
                                 for odr in hist.get("data", {}).get("list", []):
@@ -2421,7 +2462,6 @@ class CryptoTradingBot:
         - SIM注文（order_idが 'SIM-' 始まり）は即時に内部状態から約定量を返す
         - REAL注文は /v1/orders → （必要なら）/v1/closedOrders → （最後に）建玉照会の順で確認
         """
-        from datetime import datetime
         try:
             # ---- 1) SIM（paper）なら即返す ----------------------------------
             if isinstance(order_id, str) and order_id.startswith("SIM-"):
@@ -2483,7 +2523,7 @@ class CryptoTradingBot:
             if (response.get("status") != 0 and is_10002) or (response.get("status") == 0 and not response.get("data", {}).get("list")):
                 self.logger.info("注文が履歴に移動した可能性。/v1/closedOrders を確認します。")
                 history_path = "/v1/closedOrders"
-                current_date = datetime.now().strftime("%Y%m%d")
+                current_date = now_jst().strftime("%Y%m%d")
                 history_params = {"symbol": gmo_symbol, "date": current_date}
                 history_response = self.gmo_api._request("GET", history_path, params=history_params)
 
@@ -2628,15 +2668,14 @@ class CryptoTradingBot:
                                 _side = "long" if str(order_type).lower() == "buy" else "short"
                                 self.positions[symbol] = _side
                                 self.entry_prices[symbol] = float(exec_price or 0.0)
-                                from datetime import datetime  # 局所 import 可（既存の import があれば不要）
-                                self.entry_times[symbol] = datetime.now()
+                                self.entry_times[symbol] = now_jst()
                                 self.entry_sizes[symbol] = float(executed_size)
 
                             self.logger.info(
                                 "[DBTX] committing order+fill(+signal) atomically: order_id=%s exec_size=%s price=%s symbol=%s",
                                 order_id, executed_size, exec_price, symbol
                             )
-                            from datetime import datetime, timezone
+                            from datetime import timezone
                             with begin() as conn:
                                 # 1) 注文（冪等）
                                 insert_order(
@@ -2741,7 +2780,7 @@ class CryptoTradingBot:
                                 # フォールバック成立 = エントリー成功とみなす
                                 self.positions[symbol] = ("long" if str(order_type).lower()=="buy" else "short")
                                 self.entry_prices[symbol] = float(exec_price or 0.0)
-                                self.entry_times[symbol] = datetime.now()
+                                self.entry_times[symbol] = now_jst()
                                 self.entry_sizes[symbol] = float(abs(net_size))
                             else:
                                 # フォールバック成立 = 決済成功とみなす
@@ -2795,7 +2834,7 @@ class CryptoTradingBot:
         # date_strがNoneの場合、有効な日付を検索
         if date_str is None:
             # 直接今日の日付を使用してみる
-            date_str = datetime.now().strftime('%Y%m%d')
+            date_str = now_jst().strftime('%Y%m%d')
             self.logger.info(f"15分足データの日付として本日の日付 {date_str} を試行")
                 
         cache_file = os.path.join(self.cache_dir, f"{symbol}_{timeframe}_{date_str}.json")
@@ -3341,7 +3380,7 @@ class CryptoTradingBot:
             'eth_jpy':  {'adx': 0.25, 'cci': 0.30, 'rsi': 0.15, 'bb': 0.20, 'mfi': 0.05, 'volume': 0.05, 'ma': 0.00, 'atr': 0.0, 'macd': 0.0},
             'bcc_jpy':  {'adx': 0.25, 'cci': 0.30, 'rsi': 0.15, 'bb': 0.20, 'mfi': 0.05, 'volume': 0.05, 'ma': 0.00, 'atr': 0.0, 'macd': 0.0},
         }
-        
+
         signal_thresholds = {
             'doge_jpy': {'buy': 0.0, 'sell': 0.0},
             'sol_jpy':  {'buy': 0.0, 'sell': 0.0},
@@ -3533,8 +3572,8 @@ class CryptoTradingBot:
         q20_last50 = atr_last50.quantile(0.2, interpolation='linear')
 
         # 元の書き方に倣ってcalc_scoreでスコア化（reverse=True）
-        atr_score_long  = calc_score(df_5min['ATR'], q80_last50, q20_last50, reverse=True)
-        atr_score_short = calc_score(df_5min['ATR'], q80_last50, q20_last50, reverse=True)
+        atr_score_long  = calc_score(df_5min['ATR'], q20_last50, q80_last50, reverse=True)
+        atr_score_short = calc_score(df_5min['ATR'], q20_last50, q80_last50, reverse=True)
         
         # +DIと-DIの差から方向性の強さを判断
         # +DIが-DIよりも大きい場合、上昇トレンドの可能性が高い
@@ -3633,153 +3672,161 @@ class CryptoTradingBot:
         df_5min['buy_signal'] = df_5min['buy_score_scaled'] >= buy_signal_threshold
         df_5min['sell_signal'] = df_5min['sell_score_scaled'] >= sell_signal_threshold
 
-        if symbol == 'bcc_jpy':
-            df_5min.loc[df_5min['atr_score_long'].between(0.675, 0.95),'buy_signal'] = False
-            df_5min.loc[df_5min['adx_score_short'] < 0.0594, 'sell_signal'] = False
-            df_5min.loc[df_5min['cci_score_long'] > 0.788, 'buy_signal'] = False
-            df_5min.loc[df_5min['ma_score_long'].between(0.0367, 0.0546),'buy_signal'] = False
-            df_5min.loc[df_5min['ma_score_long'].between(0.155, 0.173),'buy_signal'] = False
-            df_5min.loc[df_5min['ma_score_long'].between(0.186, 0.222),'buy_signal'] = False
-            df_5min.loc[df_5min['ma_score_short'].between(0.129, 0.152),'sell_signal'] = False
-            df_5min.loc[df_5min['bb_score_long'] > 0.75, 'buy_signal'] = False
-            df_5min.loc[df_5min['bb_score_long'].between(0.4, 0.48),'buy_signal'] = False
-            df_5min.loc[df_5min['bb_score_short'] > 0.74, 'sell_signal'] = False
-            df_5min.loc[df_5min['mfi_score_long'].between(0.1, 0.154),'buy_signal'] = False
-            df_5min.loc[df_5min['mfi_score_long'].between(0.456, 0.536),'buy_signal'] = False
-            df_5min.loc[df_5min['mfi_score_long'].between(0.565, 0.64),'buy_signal'] = False
-            df_5min.loc[df_5min['mfi_score_long'] > 0.79, 'buy_signal'] = False
-            df_5min.loc[df_5min['mfi_score_short'].between(0.657, 0.751),'sell_signal'] = False
-            df_5min.loc[df_5min['rsi_score_long'].between(0.475, 0.57),'buy_signal'] = False
-            df_5min.loc[df_5min['rsi_score_short'].between(0.205, 0.237),'sell_signal'] = False
-            df_5min.loc[df_5min['rsi_score_short'].between(0.33, 0.42),'sell_signal'] = False
-            df_5min.loc[df_5min['rsi_score_short'].between(0.556, 0.645),'sell_signal'] = False
-            df_5min.loc[df_5min['cci_score_long'].between(0.14, 0.175),'buy_signal'] = False
-            df_5min.loc[df_5min['cci_score_short'].between(0.28, 0.336),'sell_signal'] = False
+        if self.exchange_settings_gmo.get("live_trade", False) or getattr(self, "is_backtest", False):
+            if symbol == 'bcc_jpy':
+                df_5min.loc[df_5min['atr_score_long'].between(0.675, 0.95),'buy_signal'] = False
+                df_5min.loc[df_5min['adx_score_short'] < 0.0594, 'sell_signal'] = False
+                df_5min.loc[df_5min['cci_score_long'] > 0.788, 'buy_signal'] = False
+                df_5min.loc[df_5min['ma_score_long'].between(0.0367, 0.0546),'buy_signal'] = False
+                df_5min.loc[df_5min['ma_score_long'].between(0.155, 0.173),'buy_signal'] = False
+                df_5min.loc[df_5min['ma_score_long'].between(0.186, 0.222),'buy_signal'] = False
+                df_5min.loc[df_5min['ma_score_short'].between(0.129, 0.152),'sell_signal'] = False
+                df_5min.loc[df_5min['bb_score_long'] > 0.75, 'buy_signal'] = False
+                df_5min.loc[df_5min['bb_score_long'].between(0.4, 0.48),'buy_signal'] = False
+                df_5min.loc[df_5min['bb_score_short'] > 0.74, 'sell_signal'] = False
+                df_5min.loc[df_5min['mfi_score_long'].between(0.1, 0.154),'buy_signal'] = False
+                df_5min.loc[df_5min['mfi_score_long'].between(0.456, 0.536),'buy_signal'] = False
+                df_5min.loc[df_5min['mfi_score_long'].between(0.565, 0.64),'buy_signal'] = False
+                df_5min.loc[df_5min['mfi_score_long'] > 0.79, 'buy_signal'] = False
+                df_5min.loc[df_5min['mfi_score_short'].between(0.657, 0.751),'sell_signal'] = False
+                df_5min.loc[df_5min['rsi_score_long'].between(0.475, 0.57),'buy_signal'] = False
+                df_5min.loc[df_5min['rsi_score_short'].between(0.205, 0.237),'sell_signal'] = False
+                df_5min.loc[df_5min['rsi_score_short'].between(0.33, 0.42),'sell_signal'] = False
+                df_5min.loc[df_5min['rsi_score_short'].between(0.556, 0.645),'sell_signal'] = False
+                df_5min.loc[df_5min['cci_score_long'].between(0.14, 0.175),'buy_signal'] = False
+                df_5min.loc[df_5min['cci_score_short'].between(0.28, 0.336),'sell_signal'] = False
 
-        if symbol == 'doge_jpy':
-            df_5min.loc[df_5min['atr_score_short'].between(0.0385, 0.15),'sell_signal'] = False
-            df_5min.loc[df_5min['adx_score_long'].between(0.625, 0.662),'buy_signal'] = False
-            df_5min.loc[df_5min['adx_score_short'] < 0.03741, 'sell_signal'] = False
-            df_5min.loc[df_5min['adx_score_short'].between(0.1, 0.18),'sell_signal'] = False
-            df_5min.loc[df_5min['adx_score_short'].between(0.228, 0.297),'sell_signal'] = False
-            df_5min.loc[df_5min['adx_score_short'].between(0.33, 0.382),'sell_signal'] = False
-            df_5min.loc[df_5min['adx_score_short'].between(0.437, 0.582),'sell_signal'] = False
-            df_5min.loc[df_5min['ma_score_long'].between(0.151, 0.165),'buy_signal'] = False
-            df_5min.loc[df_5min['ma_score_short'].between(0.191, 0.225),'sell_signal'] = False
-            df_5min.loc[df_5min['cci_score_short'] > 0.933, 'sell_signal'] = False
-            df_5min.loc[df_5min['cci_score_short'].between(0.34, 0.35),'sell_signal'] = False
-            df_5min.loc[df_5min['adx_score_long'] > 0.997, 'buy_signal'] = False
-            df_5min.loc[df_5min['bb_score_long'].between(0.143, 0.21),'buy_signal'] = False
-            df_5min.loc[df_5min['bb_score_long'].between(0.413, 0.444),'buy_signal'] = False
-            df_5min.loc[df_5min['bb_score_long'].between(0.468, 0.51),'buy_signal'] = False
-            df_5min.loc[df_5min['bb_score_long'].between(0.565, 0.605),'buy_signal'] = False
-            df_5min.loc[df_5min['rsi_score_long'].between(0.13, 0.222),'buy_signal'] = False
-            df_5min.loc[df_5min['rsi_score_long'].between(0.625, 0.66),'buy_signal'] = False
-            df_5min.loc[df_5min['rsi_score_short'] < 0.15, 'sell_signal'] = False
-            df_5min.loc[df_5min['mfi_score_short'] > 0.6, 'sell_signal'] = False
+            if symbol == 'doge_jpy':
+                df_5min.loc[df_5min['atr_score_short'].between(0.0385, 0.15),'sell_signal'] = False
+                df_5min.loc[df_5min['adx_score_long'].between(0.625, 0.662),'buy_signal'] = False
+                df_5min.loc[df_5min['adx_score_short'] < 0.03741, 'sell_signal'] = False
+                df_5min.loc[df_5min['adx_score_short'].between(0.1, 0.18),'sell_signal'] = False
+                df_5min.loc[df_5min['adx_score_short'].between(0.228, 0.297),'sell_signal'] = False
+                df_5min.loc[df_5min['adx_score_short'].between(0.33, 0.382),'sell_signal'] = False
+                df_5min.loc[df_5min['adx_score_short'].between(0.437, 0.582),'sell_signal'] = False
+                df_5min.loc[df_5min['ma_score_long'].between(0.151, 0.165),'buy_signal'] = False
+                df_5min.loc[df_5min['ma_score_short'].between(0.191, 0.225),'sell_signal'] = False
+                df_5min.loc[df_5min['cci_score_short'] > 0.933, 'sell_signal'] = False
+                df_5min.loc[df_5min['cci_score_short'].between(0.34, 0.35),'sell_signal'] = False
+                df_5min.loc[df_5min['adx_score_long'] > 0.997, 'buy_signal'] = False
+                df_5min.loc[df_5min['bb_score_long'].between(0.143, 0.21),'buy_signal'] = False
+                df_5min.loc[df_5min['bb_score_long'].between(0.413, 0.444),'buy_signal'] = False
+                df_5min.loc[df_5min['bb_score_long'].between(0.468, 0.51),'buy_signal'] = False
+                df_5min.loc[df_5min['bb_score_long'].between(0.565, 0.605),'buy_signal'] = False
+                df_5min.loc[df_5min['rsi_score_long'].between(0.13, 0.222),'buy_signal'] = False
+                df_5min.loc[df_5min['rsi_score_long'].between(0.625, 0.66),'buy_signal'] = False
+                df_5min.loc[df_5min['rsi_score_short'] < 0.15, 'sell_signal'] = False
+                df_5min.loc[df_5min['mfi_score_short'] > 0.6, 'sell_signal'] = False
 
-        if symbol == 'sol_jpy':
-            df_5min.loc[df_5min['atr_score_long'].between(0.0067, 0.0366),'buy_signal'] = False
-            df_5min.loc[df_5min['atr_score_short'].between(0.41, 0.69),'sell_signal'] = False
-            df_5min.loc[df_5min['atr_score_short'].between(0.045, 0.11),'sell_signal'] = False
-            df_5min.loc[df_5min['rsi_score_long'].between(0.573, 0.61),'buy_signal'] = False
-            df_5min.loc[df_5min['rsi_score_long'] > 0.757, 'buy_signal'] = False
-            df_5min.loc[df_5min['cci_score_long'].between(0.114, 0.149),'buy_signal'] = False
-            df_5min.loc[df_5min['cci_score_long'].between(0.17, 0.264),'buy_signal'] = False
-            df_5min.loc[df_5min['adx_score_long'].between(0.444, 0.56),'buy_signal'] = False
-            df_5min.loc[df_5min['adx_score_short'] < 0.15, 'sell_signal'] = False
-            df_5min.loc[df_5min['cci_score_short'].between(0.3, 0.355),'sell_signal'] = False
-            df_5min.loc[df_5min['cci_score_short'].between(0.428, 0.496),'sell_signal'] = False
-            df_5min.loc[df_5min['bb_score_long'].between(0.2, 0.235),'buy_signal'] = False
-            df_5min.loc[df_5min['bb_score_long'].between(0.425, 0.49),'buy_signal'] = False
-            df_5min.loc[df_5min['bb_score_short'].between(0.457, 0.552),'sell_signal'] = False
-            df_5min.loc[df_5min['bb_score_short'] > 0.571, 'sell_signal'] = False
-            df_5min.loc[df_5min['ma_score_long'].between(0.2, 0.223),'buy_signal'] = False
-            df_5min.loc[df_5min['mfi_score_long'].between(0.466, 0.529),'buy_signal'] = False
+            if symbol == 'sol_jpy':
+                df_5min.loc[df_5min['atr_score_long'].between(0.0067, 0.0366),'buy_signal'] = False
+                df_5min.loc[df_5min['atr_score_short'].between(0.41, 0.69),'sell_signal'] = False
+                df_5min.loc[df_5min['atr_score_short'].between(0.045, 0.11),'sell_signal'] = False
+                df_5min.loc[df_5min['rsi_score_long'].between(0.573, 0.61),'buy_signal'] = False
+                df_5min.loc[df_5min['rsi_score_long'] > 0.757, 'buy_signal'] = False
+                df_5min.loc[df_5min['cci_score_long'].between(0.114, 0.149),'buy_signal'] = False
+                df_5min.loc[df_5min['cci_score_long'].between(0.17, 0.264),'buy_signal'] = False
+                df_5min.loc[df_5min['adx_score_long'].between(0.444, 0.56),'buy_signal'] = False
+                df_5min.loc[df_5min['adx_score_short'] < 0.15, 'sell_signal'] = False
+                df_5min.loc[df_5min['cci_score_short'].between(0.3, 0.355),'sell_signal'] = False
+                df_5min.loc[df_5min['cci_score_short'].between(0.428, 0.496),'sell_signal'] = False
+                df_5min.loc[df_5min['bb_score_long'].between(0.2, 0.235),'buy_signal'] = False
+                df_5min.loc[df_5min['bb_score_long'].between(0.425, 0.49),'buy_signal'] = False
+                df_5min.loc[df_5min['bb_score_short'].between(0.457, 0.552),'sell_signal'] = False
+                df_5min.loc[df_5min['bb_score_short'] > 0.571, 'sell_signal'] = False
+                df_5min.loc[df_5min['ma_score_long'].between(0.2, 0.223),'buy_signal'] = False
+                df_5min.loc[df_5min['mfi_score_long'].between(0.466, 0.529),'buy_signal'] = False
 
-        if symbol == 'ada_jpy':
-            df_5min.loc[df_5min['atr_score_long'].between(0.475, 0.59),'buy_signal'] = False
-            df_5min.loc[df_5min['atr_score_short'].between(0.235, 0.296),'sell_signal'] = False
-            df_5min.loc[df_5min['adx_score_long'].between(0.35, 0.63),'buy_signal'] = False
-            df_5min.loc[df_5min['adx_score_long'].between(0.8, 0.95),'buy_signal'] = False
-            df_5min.loc[df_5min['adx_score_short'] < 0.0011, 'sell_signal'] = False
-            df_5min.loc[df_5min['adx_score_short'].between(0.108, 0.188),'sell_signal'] = False
-            df_5min.loc[df_5min['adx_score_short'].between(0.51, 0.645),'sell_signal'] = False
-            df_5min.loc[df_5min['rsi_score_long'].between(0.105, 0.138),'buy_signal'] = False
-            df_5min.loc[df_5min['rsi_score_long'].between(0.233, 0.286),'buy_signal'] = False
-            df_5min.loc[df_5min['rsi_score_long'].between(0.57, 0.61),'buy_signal'] = False
-            df_5min.loc[df_5min['rsi_score_long'].between(0.691, 0.743),'buy_signal'] = False
-            df_5min.loc[df_5min['rsi_score_long'] > 0.768, 'buy_signal'] = False
-            df_5min.loc[df_5min['rsi_score_short'].between(0.247, 0.372),'sell_signal'] = False
-            df_5min.loc[df_5min['bb_score_long'].between(0.315, 0.37),'buy_signal'] = False
-            df_5min.loc[df_5min['bb_score_short'] > 0.534, 'sell_signal'] = False
-            df_5min.loc[df_5min['mfi_score_short'] > 0.62, 'sell_signal'] = False
-            df_5min.loc[df_5min['cci_score_long'] > 0.786, 'buy_signal'] = False
-            df_5min.loc[df_5min['cci_score_long'].between(0.25, 0.296),'buy_signal'] = False
-            df_5min.loc[df_5min['cci_score_long'].between(0.33, 0.36),'buy_signal'] = False
-            df_5min.loc[df_5min['cci_score_long'].between(0.493, 0.547),'buy_signal'] = False            
-            df_5min.loc[df_5min['cci_score_long'].between(0.57, 0.616),'buy_signal'] = False
-            df_5min.loc[df_5min['cci_score_short'].between(0.446, 0.482),'sell_signal'] = False
-            df_5min.loc[df_5min['cci_score_short'].between(0.6, 0.685),'sell_signal'] = False
-            df_5min.loc[df_5min['ma_score_long'].between(0.13, 0.145),'buy_signal'] = False
-            df_5min.loc[df_5min['ma_score_long'].between(0.173, 0.2),'buy_signal'] = False
-            df_5min.loc[df_5min['ma_score_short'].between(0.2, 0.25),'sell_signal'] = False
+            if symbol == 'ada_jpy':
+                df_5min.loc[df_5min['atr_score_long'].between(0.475, 0.59),'buy_signal'] = False
+                df_5min.loc[df_5min['atr_score_short'].between(0.235, 0.296),'sell_signal'] = False
+                df_5min.loc[df_5min['adx_score_long'].between(0.35, 0.63),'buy_signal'] = False
+                df_5min.loc[df_5min['adx_score_long'].between(0.8, 0.95),'buy_signal'] = False
+                df_5min.loc[df_5min['adx_score_short'] < 0.0011, 'sell_signal'] = False
+                df_5min.loc[df_5min['adx_score_short'].between(0.108, 0.188),'sell_signal'] = False
+                df_5min.loc[df_5min['adx_score_short'].between(0.51, 0.645),'sell_signal'] = False
+                df_5min.loc[df_5min['rsi_score_long'].between(0.105, 0.138),'buy_signal'] = False
+                df_5min.loc[df_5min['rsi_score_long'].between(0.233, 0.286),'buy_signal'] = False
+                df_5min.loc[df_5min['rsi_score_long'].between(0.57, 0.61),'buy_signal'] = False
+                df_5min.loc[df_5min['rsi_score_long'].between(0.691, 0.743),'buy_signal'] = False
+                df_5min.loc[df_5min['rsi_score_long'] > 0.768, 'buy_signal'] = False
+                df_5min.loc[df_5min['rsi_score_short'].between(0.247, 0.372),'sell_signal'] = False
+                df_5min.loc[df_5min['bb_score_long'].between(0.315, 0.37),'buy_signal'] = False
+                df_5min.loc[df_5min['bb_score_short'] > 0.534, 'sell_signal'] = False
+                df_5min.loc[df_5min['mfi_score_short'] > 0.62, 'sell_signal'] = False
+                df_5min.loc[df_5min['cci_score_long'] > 0.786, 'buy_signal'] = False
+                df_5min.loc[df_5min['cci_score_long'].between(0.25, 0.296),'buy_signal'] = False
+                df_5min.loc[df_5min['cci_score_long'].between(0.33, 0.36),'buy_signal'] = False
+                df_5min.loc[df_5min['cci_score_long'].between(0.493, 0.547),'buy_signal'] = False            
+                df_5min.loc[df_5min['cci_score_long'].between(0.57, 0.616),'buy_signal'] = False
+                df_5min.loc[df_5min['cci_score_short'].between(0.446, 0.482),'sell_signal'] = False
+                df_5min.loc[df_5min['cci_score_short'].between(0.6, 0.685),'sell_signal'] = False
+                df_5min.loc[df_5min['ma_score_long'].between(0.13, 0.145),'buy_signal'] = False
+                df_5min.loc[df_5min['ma_score_long'].between(0.173, 0.2),'buy_signal'] = False
+                df_5min.loc[df_5min['ma_score_short'].between(0.2, 0.25),'sell_signal'] = False
 
-        if symbol == 'ltc_jpy':
-            df_5min.loc[df_5min['atr_score_long'].between(0.61, 0.727),'buy_signal'] = False
-            df_5min.loc[df_5min['cci_score_long'].between(0.20, 0.30),'buy_signal'] = False
-            df_5min.loc[df_5min['cci_score_long'].between(0.494, 0.535),'buy_signal'] = False
-            df_5min.loc[df_5min['cci_score_long'].between(0.58, 0.663),'buy_signal'] = False
-            df_5min.loc[df_5min['cci_score_short'] < 0.12, 'sell_signal'] = False
-            df_5min.loc[df_5min['atr_score_short'].between(0.11, 0.225),'sell_signal'] = False
-            df_5min.loc[df_5min['atr_score_short'].between(0.239, 0.408),'sell_signal'] = False
-            df_5min.loc[df_5min['bb_score_long'].between(0.143, 0.305),'buy_signal'] = False
-            df_5min.loc[df_5min['bb_score_long'].between(0.4, 0.409),'buy_signal'] = False
-            df_5min.loc[df_5min['bb_score_long'] > 0.686, 'buy_signal'] = False
-            df_5min.loc[df_5min['bb_score_short'].between(0.566, 0.72),'sell_signal'] = False
-            df_5min.loc[df_5min['ma_score_long'].between(0.165, 0.184),'buy_signal'] = False
-            df_5min.loc[df_5min['ma_score_short'].between(0.0369, 0.0806),'sell_signal'] = False
-            df_5min.loc[df_5min['ma_score_short'].between(0.13, 0.162),'sell_signal'] = False
-            df_5min.loc[df_5min['ma_score_short'] > 0.25, 'sell_signal'] = False
-            df_5min.loc[df_5min['adx_score_long'].between(0.321, 0.395),'buy_signal'] = False
-            df_5min.loc[df_5min['rsi_score_long'].between(0.3, 0.42),'buy_signal'] = False
-            df_5min.loc[df_5min['rsi_score_long'].between(0.446, 0.485),'buy_signal'] = False
-            df_5min.loc[df_5min['rsi_score_short'].between(0.12, 0.21),'sell_signal'] = False
-            df_5min.loc[df_5min['mfi_score_long'].between(0.15, 0.23),'buy_signal'] = False
-            df_5min.loc[df_5min['mfi_score_short'] > 0.71, 'sell_signal'] = False
+            if symbol == 'ltc_jpy':
+                df_5min.loc[df_5min['atr_score_long'].between(0.61, 0.727),'buy_signal'] = False
+                df_5min.loc[df_5min['cci_score_long'].between(0.20, 0.30),'buy_signal'] = False
+                df_5min.loc[df_5min['cci_score_long'].between(0.494, 0.535),'buy_signal'] = False
+                df_5min.loc[df_5min['cci_score_long'].between(0.58, 0.663),'buy_signal'] = False
+                df_5min.loc[df_5min['cci_score_short'] < 0.12, 'sell_signal'] = False
+                df_5min.loc[df_5min['atr_score_short'].between(0.11, 0.225),'sell_signal'] = False
+                df_5min.loc[df_5min['atr_score_short'].between(0.239, 0.408),'sell_signal'] = False
+                df_5min.loc[df_5min['bb_score_long'].between(0.143, 0.305),'buy_signal'] = False
+                df_5min.loc[df_5min['bb_score_long'].between(0.4, 0.409),'buy_signal'] = False
+                df_5min.loc[df_5min['bb_score_long'] > 0.686, 'buy_signal'] = False
+                df_5min.loc[df_5min['bb_score_short'].between(0.566, 0.72),'sell_signal'] = False
+                df_5min.loc[df_5min['ma_score_long'].between(0.165, 0.184),'buy_signal'] = False
+                df_5min.loc[df_5min['ma_score_short'].between(0.0369, 0.0806),'sell_signal'] = False
+                df_5min.loc[df_5min['ma_score_short'].between(0.13, 0.162),'sell_signal'] = False
+                df_5min.loc[df_5min['ma_score_short'] > 0.25, 'sell_signal'] = False
+                df_5min.loc[df_5min['adx_score_long'].between(0.321, 0.395),'buy_signal'] = False
+                df_5min.loc[df_5min['rsi_score_long'].between(0.3, 0.42),'buy_signal'] = False
+                df_5min.loc[df_5min['rsi_score_long'].between(0.446, 0.485),'buy_signal'] = False
+                df_5min.loc[df_5min['rsi_score_short'].between(0.12, 0.21),'sell_signal'] = False
+                df_5min.loc[df_5min['mfi_score_long'].between(0.15, 0.23),'buy_signal'] = False
+                df_5min.loc[df_5min['mfi_score_short'] > 0.71, 'sell_signal'] = False
 
-        if symbol == 'eth_jpy':
-            df_5min.loc[df_5min['bb_score_short'] > 0.551, 'sell_signal'] = False
-            df_5min.loc[df_5min['mfi_score_long'].between(0.27, 0.29),'buy_signal'] = False
-            df_5min.loc[df_5min['mfi_score_short'].between(0.285, 0.31),'sell_signal'] = False
-            df_5min.loc[df_5min['ma_score_long'].between(0.0758, 0.09),'buy_signal'] = False
-            df_5min.loc[df_5min['ma_score_short'].between(0.15, 0.17),'sell_signal'] = False
-            df_5min.loc[df_5min['atr_score_long'].between(0.0515, 0.139),'buy_signal'] = False
-            df_5min.loc[df_5min['adx_score_long'].between(0.4, 0.5),'buy_signal'] = False
-            df_5min.loc[df_5min['rsi_score_long'].between(0.55, 0.575),'buy_signal'] = False
-            df_5min.loc[df_5min['mfi_score_short'] > 0.54, 'sell_signal'] = False
+            if symbol == 'eth_jpy':
+                df_5min.loc[df_5min['bb_score_short'] > 0.551, 'sell_signal'] = False
+                df_5min.loc[df_5min['mfi_score_long'].between(0.27, 0.29),'buy_signal'] = False
+                df_5min.loc[df_5min['mfi_score_short'].between(0.285, 0.31),'sell_signal'] = False
+                df_5min.loc[df_5min['ma_score_long'].between(0.0758, 0.09),'buy_signal'] = False
+                df_5min.loc[df_5min['ma_score_short'].between(0.15, 0.17),'sell_signal'] = False
+                df_5min.loc[df_5min['atr_score_long'].between(0.0515, 0.139),'buy_signal'] = False
+                df_5min.loc[df_5min['adx_score_long'].between(0.4, 0.5),'buy_signal'] = False
+                df_5min.loc[df_5min['rsi_score_long'].between(0.55, 0.575),'buy_signal'] = False
+                df_5min.loc[df_5min['mfi_score_short'] > 0.54, 'sell_signal'] = False
 
-        if symbol == 'xrp_jpy':
-            df_5min.loc[df_5min['atr_score_long'].between(0.15, 0.228),'buy_signal'] = False
-            df_5min.loc[df_5min['atr_score_short'].between(0.013, 0.124),'sell_signal'] = False
-            df_5min.loc[df_5min['rsi_score_long'].between(0.31, 0.42),'buy_signal'] = False
-            df_5min.loc[df_5min['rsi_score_long'].between(0.575, 0.612),'buy_signal'] = False
-            df_5min.loc[df_5min['rsi_score_short'].between(0.228, 0.5),'sell_signal'] = False
-            df_5min.loc[df_5min['rsi_score_short'].between(0.572, 0.593),'sell_signal'] = False
-            df_5min.loc[df_5min['rsi_score_short'].between(0.702, 0.724),'sell_signal'] = False
-            df_5min.loc[df_5min['cci_score_short'] < 0.084, 'sell_signal'] = False
-            df_5min.loc[df_5min['cci_score_short'].between(0.61, 0.69),'sell_signal'] = False
-            df_5min.loc[df_5min['adx_score_long'].between(0.0348, 0.1),'buy_signal'] = False
-            df_5min.loc[df_5min['adx_score_long'].between(0.382, 0.481),'buy_signal'] = False
-            df_5min.loc[df_5min['adx_score_long'].between(0.66, 0.78),'buy_signal'] = False
-            df_5min.loc[df_5min['adx_score_short'] < 0.155, 'sell_signal'] = False
-            df_5min.loc[df_5min['adx_score_short'].between(0.7, 0.763),'sell_signal'] = False
-            df_5min.loc[df_5min['ma_score_long'] > 0.293, 'buy_signal'] = False
-            df_5min.loc[df_5min['ma_score_short'].between(0.032, 0.077),'sell_signal'] = False
-            df_5min.loc[df_5min['bb_score_long'].between(0.478, 0.573),'buy_signal'] = False
-            df_5min.loc[df_5min['bb_score_long'].between(0.67, 0.896),'buy_signal'] = False
-            df_5min.loc[df_5min['bb_score_short'] > 0.78, 'sell_signal'] = False
+            if symbol == 'xrp_jpy':
+                df_5min.loc[df_5min['atr_score_long'].between(0.15, 0.228),'buy_signal'] = False
+                df_5min.loc[df_5min['atr_score_short'].between(0.013, 0.124),'sell_signal'] = False
+                df_5min.loc[df_5min['rsi_score_long'].between(0.31, 0.42),'buy_signal'] = False
+                df_5min.loc[df_5min['rsi_score_long'].between(0.575, 0.612),'buy_signal'] = False
+                df_5min.loc[df_5min['rsi_score_short'].between(0.228, 0.5),'sell_signal'] = False
+                df_5min.loc[df_5min['rsi_score_short'].between(0.572, 0.593),'sell_signal'] = False
+                df_5min.loc[df_5min['rsi_score_short'].between(0.702, 0.724),'sell_signal'] = False
+                df_5min.loc[df_5min['cci_score_short'] < 0.084, 'sell_signal'] = False
+                df_5min.loc[df_5min['cci_score_short'].between(0.61, 0.69),'sell_signal'] = False
+                df_5min.loc[df_5min['adx_score_long'].between(0.0348, 0.1),'buy_signal'] = False
+                df_5min.loc[df_5min['adx_score_long'].between(0.382, 0.481),'buy_signal'] = False
+                df_5min.loc[df_5min['adx_score_long'].between(0.66, 0.78),'buy_signal'] = False
+                df_5min.loc[df_5min['adx_score_short'] < 0.155, 'sell_signal'] = False
+                df_5min.loc[df_5min['adx_score_short'].between(0.7, 0.763),'sell_signal'] = False
+                df_5min.loc[df_5min['ma_score_long'] > 0.293, 'buy_signal'] = False
+                df_5min.loc[df_5min['ma_score_short'].between(0.032, 0.077),'sell_signal'] = False
+                df_5min.loc[df_5min['bb_score_long'].between(0.478, 0.573),'buy_signal'] = False
+                df_5min.loc[df_5min['bb_score_long'].between(0.67, 0.896),'buy_signal'] = False
+                df_5min.loc[df_5min['bb_score_short'] > 0.78, 'sell_signal'] = False
 
+        else:
+            self._apply_rule_thresholds(
+                df_5min,
+                symbol,
+                timeframe="5m",
+                version=getattr(self, "rules_version", None)  # 未定義なら None でOK
+            )
 
         if 'EMA_long' in df_5min.columns and len(df_5min) > 1:
             prev_price = df_5min['close'].shift(1)
@@ -3796,6 +3843,80 @@ class CryptoTradingBot:
             df_5min.loc[sell_mask, 'sell_signal'] = False
 
         return df_5min
+
+    def _apply_rule_thresholds(self, df: pd.DataFrame, symbol: str, timeframe: str = "5m", version: str | None = None):
+        """SIM限定：DBのしきい値ルールを適用し、ヒット件数をログ出力"""
+        # SIMのみ適用（LIVEでは何もしない）
+        try:
+            if self.exchange_settings_gmo.get("live_trade", False):
+                return
+        except Exception:
+            pass
+
+        if df is None or df.empty:
+            return
+
+        from db import fetch_signal_rules
+        rules = fetch_signal_rules(symbol, timeframe, version=version)
+        if not rules:
+            self.logger.info(f"[rules][{symbol}] no active rules (timeframe={timeframe}, version={version})")
+            return
+
+        total = len(df)
+        union_mask = pd.Series(False, index=df.index)   # すべてのルールのOR（論理和）
+
+        def _build_mask(s: pd.Series, op: str, v1, v2):
+            """各ルールの条件をmaskに変換（NaNは不一致扱い）"""
+            if op == "between" and v1 is not None and v2 is not None:
+                return s.between(float(v1), float(v2), inclusive="both")
+            elif op == "<":
+                return s < float(v1)
+            elif op == "<=":
+                return s <= float(v1)
+            elif op == ">":
+                return s > float(v1)
+            elif op == ">=":
+                return s >= float(v1)
+            elif op == "==":
+                return s == float(v1)
+            elif op == "!=":
+                return s != float(v1)
+            elif op == "is_null":
+                return s.isna()
+            elif op == "is_not_null":
+                return s.notna()
+            else:
+                return pd.Series(False, index=s.index)
+
+        # 各ルールのヒット数をinfoログ出力しながら適用
+        for r in rules:
+            col = r["score_col"]; op = r["op"]; trg = r["target_side"]; act = r.get("action", "disable")
+            if act != "disable":
+                continue
+            if col not in df.columns:
+                self.logger.info(f"[rules][{symbol}] skip: missing column '{col}' for rule {r}")
+                continue
+
+            s = df[col]
+            mask = _build_mask(s, op, r.get("v1"), r.get("v2"))
+            hits = int(mask.sum())
+
+            # ルールごとのヒット数を出力
+            # 例: [rules][xrp_jpy] sell cci_score_short between 0.10~0.20 hits=12/480
+            rng = f"{r.get('v1')}~{r.get('v2')}" if op == "between" else f"{r.get('v1')}"
+            self.logger.info(f"[rules][{symbol}] {trg} {col} {op} {rng} hits={hits}/{total}")
+
+            # 実際の適用（buy/sell_signal を Falseに）
+            if hits > 0:
+                union_mask |= mask
+                if trg == "buy" and "buy_signal" in df.columns:
+                    df.loc[mask, "buy_signal"] = False
+                if trg == "sell" and "sell_signal" in df.columns:
+                    df.loc[mask, "sell_signal"] = False
+
+        # ORユニオンのユニーク件数を出力
+        union_hits = int(union_mask.sum())
+        self.logger.info(f"[rules][{symbol}] OR-union unique hits={union_hits}/{total}")
 
     def generate_signals_with_sentiment(self, symbol, df_5min, df_hourly):
         """市場センチメントを考慮したシグナル生成関数（改良版）
@@ -4014,6 +4135,8 @@ class CryptoTradingBot:
                     continue
 
                 expected_records = 96  # 24時間分の15分足（4本/時 × 24）
+
+                self.is_backtest = True
 
                 try:
                     df_hourly = pd.concat(hourly_candles).sort_values('timestamp')
@@ -4572,7 +4695,7 @@ class CryptoTradingBot:
         # 出力ファイル名を作成
         trade_log_file = os.path.join(
             self.log_dir,
-            f'backtest_trades_{datetime.now().strftime("%Y%m%d_%H%M%S")}.xlsx'
+            f'backtest_trades_{now_jst().strftime("%Y%m%d_%H%M%S")}.xlsx'
         )
 
         # DataFrame化
@@ -4930,12 +5053,12 @@ class CryptoTradingBot:
     def save_backtest_result(self, results, days_to_test, start_profit):
         """バックテスト結果をJSONファイルに保存"""
         backtest_profit = self.total_profit - start_profit
-        backtest_result_file = os.path.join(self.log_dir, f'backtest_result_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json')
+        backtest_result_file = os.path.join(self.log_dir, f'backtest_result_{now_jst().strftime("%Y%m%d_%H%M%S")}.json')
         try:
             with open(backtest_result_file, 'w') as f:
                 json.dump({
-                    'start_date': (datetime.now() - timedelta(days=days_to_test)).strftime("%Y-%m-%d"),
-                    'end_date': datetime.now().strftime("%Y-%m-%d"),
+                    'start_date': (now_jst() - timedelta(days=days_to_test)).strftime("%Y-%m-%d"),
+                    'end_date': now_jst().strftime("%Y-%m-%d"),
                     'days_tested': days_to_test,
                     'total_profit': backtest_profit,
                     'results': {k: {kk: float(vv) if isinstance(vv, (int, float)) else vv 
@@ -4957,7 +5080,7 @@ class CryptoTradingBot:
         self.logger.info("=== 本番環境最適化版リアルタイムトレーディング開始 ===")
     
         # 初期化
-        start_date = datetime.now()
+        start_date = now_jst()
         start_balance = 0
         trade_logs = []
         stats = {
@@ -4971,7 +5094,7 @@ class CryptoTradingBot:
             'daily_losses': 0,
             'daily_profit': 0,
             'daily_loss': 0,
-            'last_report_time': datetime.now(JST)
+            'last_report_time': dt.datetime.now(JST)
         }
         
         # 起動メッセージ送信
@@ -5014,7 +5137,7 @@ class CryptoTradingBot:
             error_states = {
                 'consecutive_api_errors': 0,
                 'consecutive_data_errors': 0,
-                'last_successful_cycle': datetime.now(),
+                'last_successful_cycle': now_jst(),
                 'error_log': []
             }
 
@@ -5023,11 +5146,11 @@ class CryptoTradingBot:
 
             # メインループ - より堅牢なエラーハンドリングを追加
             while True:
-                loop_start_time = datetime.now()
+                loop_start_time = now_jst()
                 
                 try:
                     # 現在の日本時間を取得
-                    jst_now = datetime.now(JST)
+                    jst_now = dt.datetime.now(JST)
                     
                     # システム健全性チェック
                     health_check_counter += 1
@@ -5108,8 +5231,8 @@ class CryptoTradingBot:
                             if position is None:
                                 # ★ ここから追加: 再エントリー解禁時刻のチェック
                                 unlock_time = self.reentry_block_until.get(symbol)
-                                if unlock_time is not None and datetime.now() < unlock_time:
-                                    remain = (unlock_time - datetime.now()).total_seconds()
+                                if unlock_time is not None and now_jst() < unlock_time:
+                                    remain = (unlock_time - now_jst()).total_seconds()
                                     self.logger.info(
                                         f"{symbol}: 決済直後のクールダウン中（次の15分足待ち）。残り {remain:.0f} 秒は新規エントリー判定をスキップ"
                                     )
@@ -5137,18 +5260,18 @@ class CryptoTradingBot:
                             
                         except Exception as e:
                             self.logger.error(f"{symbol}の処理中にエラーが発生: {str(e)}", exc_info=True)
-                            error_states['error_log'].append(f"{datetime.now()}: {symbol}処理エラー - {str(e)}")
+                            error_states['error_log'].append(f"{now_jst()}: {symbol}処理エラー - {str(e)}")
                             continue
                     
                     # メインループサイクル間のスリープ（5分間隔）
-                    elapsed_time = (datetime.now() - loop_start_time).total_seconds()
+                    elapsed_time = (now_jst() - loop_start_time).total_seconds()
                     sleep_time = max(28 - elapsed_time, 1)  # 少なくとも1秒は待機
                     self.logger.info(f"次のサイクルまで{sleep_time:.1f}秒待機します")
                     
                     # 成功したのでエラーカウンターをリセット
                     error_states['consecutive_api_errors'] = 0
                     error_states['consecutive_data_errors'] = 0
-                    error_states['last_successful_cycle'] = datetime.now()
+                    error_states['last_successful_cycle'] = now_jst()
                     
                     # スリープ中に1分ごとにキーボード割り込みをチェック
                     sleep_interval = min(60, sleep_time)
@@ -5167,7 +5290,7 @@ class CryptoTradingBot:
                     error_states['consecutive_api_errors'] += 1
                     error_message = f"APIリクエストエラー: {str(e)}"
                     self.logger.error(error_message)
-                    error_states['error_log'].append(f"{datetime.now()}: {error_message}")
+                    error_states['error_log'].append(f"{now_jst()}: {error_message}")
                     
                     # APIエラーが連続して発生した場合の対応
                     if error_states['consecutive_api_errors'] >= 3:
@@ -5192,7 +5315,7 @@ class CryptoTradingBot:
                     error_states['consecutive_data_errors'] += 1
                     error_message = f"実行中にエラーが発生: {str(e)}"
                     self.logger.error(error_message, exc_info=True)
-                    error_states['error_log'].append(f"{datetime.now()}: {error_message}")
+                    error_states['error_log'].append(f"{now_jst()}: {error_message}")
                     
                     # エラーが連続して発生した場合の対応
                     if error_states['consecutive_data_errors'] >= 5:
@@ -5228,7 +5351,7 @@ class CryptoTradingBot:
                         time.sleep(60)
                         
                     # 最後の成功から3時間以上経過している場合は通知
-                    time_since_last_success = (datetime.now() - error_states['last_successful_cycle']).total_seconds() / 3600
+                    time_since_last_success = (now_jst() - error_states['last_successful_cycle']).total_seconds() / 3600
                     if time_since_last_success >= 3:
                         self.logger.warning(f"最後の成功から{time_since_last_success:.1f}時間経過しています")
                         self.send_notification(
@@ -5243,6 +5366,7 @@ class CryptoTradingBot:
             self.logger.info("キーボード割り込みを受け取りました。プログラムを安全に終了します。")
         
         finally:
+            self.is_backtest = False
             # 稼働状況のレポートを出力
             self._generate_final_report(start_date, start_balance, stats, trade_logs)
             
@@ -5310,7 +5434,7 @@ class CryptoTradingBot:
                     
                     # 保有時間の計算
                     if self.entry_times[symbol]:
-                        holding_time = datetime.now() - self.entry_times[symbol]
+                        holding_time = dt.datetime.now(JST) - self.entry_times[symbol]
                         hours = holding_time.total_seconds() / 3600
                         
                         # 利益状態に応じて表示を変える
@@ -5341,7 +5465,7 @@ class CryptoTradingBot:
             取得不能時は (None, None)
         """
         try:
-            current_date = datetime.now()
+            current_date = now_jst()
 
             # ========= 15分足（直近最大3日分を結合 → ソート → 重複排除。ここではトリムしない） =========
             self.logger.info(f"{symbol}の15分足データ取得を開始します（前日＋当日＋必要に応じて前々日を結合）")
@@ -5614,7 +5738,7 @@ class CryptoTradingBot:
             # ポジション情報を更新
             self.positions[symbol] = position_type
             self.entry_prices[symbol] = current_price
-            self.entry_times[symbol] = datetime.now()
+            self.entry_times[symbol] = now_jst()
             self.entry_sizes[symbol] = executed_size
 
             # GMOコインの場合、position_idを取得して保存
@@ -5639,7 +5763,7 @@ class CryptoTradingBot:
             entry_sentiment = self.sentiment.copy() if hasattr(self, 'sentiment') else {}
             
             # backtest関数と同様のログ出力
-            self.log_entry(symbol, position_type, current_price, datetime.now(), entry_rsi, entry_cci, entry_atr, entry_adx, entry_sentiment)
+            self.log_entry(symbol, position_type, current_price, now_jst(), entry_rsi, entry_cci, entry_atr, entry_adx, entry_sentiment)
             
             # 通知送信（修正箇所）
             if self.notification_settings.get('send_on_entry', True):
@@ -5800,7 +5924,7 @@ class CryptoTradingBot:
                 'price': current_price,
                 'size': executed_size,
                 'amount': final_order_amount,
-                'time': datetime.now(),
+                'time': now_jst(),
                 'rsi': entry_rsi,
                 'cci': entry_cci,
                 'entry_atr': entry_atr,
@@ -5863,15 +5987,14 @@ class CryptoTradingBot:
         entry_time = self.entry_times.get(symbol)
         # エントリー時刻が未設定の場合のセーフティ（SIMでの復元/初期化漏れ対策）
         if entry_time is None:
-            from datetime import datetime
             self.logger.warning(f"{symbol}: entry_time が未設定のため現在時刻を代入します（SIM safety）")
-            entry_time = datetime.now()
+            entry_time = now_jst()
             self.entry_times[symbol] = entry_time
 
         entry_size = self.entry_sizes[symbol]
         
         # 保有時間の計算
-        holding_time = datetime.now() - entry_time
+        holding_time = now_jst() - entry_time
         hours = holding_time.total_seconds() / 3600
         
         # イグジット条件の計算
@@ -6278,7 +6401,7 @@ class CryptoTradingBot:
                 
                 # ログ出力
                 entry_sentiment = getattr(self, 'sentiment', {}).copy() if hasattr(self, 'sentiment') else {}
-                self.log_exit(symbol, position, current_price, entry_price, datetime.now(), profit, profit_pct, exit_reason, hours, entry_sentiment)
+                self.log_exit(symbol, position, current_price, entry_price, now_jst(), profit, profit_pct, exit_reason, hours, entry_sentiment)
                 
                 # 通知送信
                 if self.notification_settings.get('send_on_exit', True):
@@ -6312,7 +6435,7 @@ class CryptoTradingBot:
                 self.position_ids[symbol] = None  # ポジションIDもクリア
                 self.entry_scores[symbol] = {}
 
-                now = datetime.now()
+                now = now_jst()
                 unlock_time = self._ceil_to_next_15min(now)
                 self.reentry_block_until[symbol] = unlock_time
                 self.logger.info(
@@ -6414,7 +6537,7 @@ class CryptoTradingBot:
 
 
     def _day_bounds_jst(self, day=None):
-        day = (day or datetime.now(JST)).astimezone(JST)
+        day = (day or dt.datetime.now(JST)).astimezone(JST)
         start = day.replace(hour=0, minute=0, second=0, microsecond=0)
         end = start + timedelta(days=1)
         return start, end
@@ -6429,7 +6552,7 @@ class CryptoTradingBot:
         trade_logs (list): 取引ログのリスト
         """
         end_balance = self.get_total_balance()
-        running_time = datetime.now() - start_date
+        running_time = now_jst() - start_date
         days = running_time.days
         hours = running_time.seconds // 3600
         minutes = (running_time.seconds % 3600) // 60
@@ -6475,7 +6598,7 @@ class CryptoTradingBot:
         
         # レポート表示
         self.logger.info("\n=== 最終取引レポート ===")
-        self.logger.info(f"期間: {start_date.strftime('%Y-%m-%d %H:%M')} ~ {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        self.logger.info(f"期間: {start_date.strftime('%Y-%m-%d %H:%M')} ~ {now_jst().strftime('%Y-%m-%d %H:%M')}")
         self.logger.info(f"稼働時間: {days}日 {hours}時間 {minutes}分")
         self.logger.info(f"取引回数: {stats['total_trades']}回 (勝ち: {stats['total_wins']}回, 負け: {stats['total_losses']}回)")
         self.logger.info(f"勝率: {win_rate:.2f}%")
@@ -6526,10 +6649,10 @@ class CryptoTradingBot:
         error_logs (list): エラーログのリスト
         """
         try:
-            error_log_file = os.path.join(self.log_dir, f'error_log_{datetime.now().strftime("%Y%m%d_%H%M%S")}.txt')
+            error_log_file = os.path.join(self.log_dir, f'error_log_{now_jst().strftime("%Y%m%d_%H%M%S")}.txt')
             with open(error_log_file, 'w') as f:
                 f.write("===== トレーディングボットエラーログ =====\n")
-                f.write(f"生成時刻: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                f.write(f"生成時刻: {now_jst().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
                 
                 for log in error_logs:
                     f.write(f"{log}\n")

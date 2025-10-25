@@ -315,6 +315,30 @@ def get_public_metrics_daily(start, end) -> List[Dict[str, Any]]:
         rows = conn.execute(sql, {"start": start, "end": end}).mappings().all()
     return [dict(r) for r in rows]
 
+def fetch_signal_rules(symbol: str, timeframe: str = "5m", *, version: str | None = None):
+    """
+    SIM限定のbuy/sellフィルタ用ルールを取得する（フェーズP0専用）
+    """
+    sql = sa.text("""
+        SELECT symbol, timeframe, score_col, op, v1, v2,
+               target_side, action, priority
+          FROM signal_rule_thresholds
+         WHERE active = TRUE
+           AND symbol = :symbol
+           AND timeframe = :timeframe
+           AND (valid_from IS NULL OR valid_from <= NOW())
+           AND (valid_to   IS NULL OR valid_to   >= NOW())
+           AND (:version IS NULL OR version = :version)
+         ORDER BY priority ASC, id ASC
+    """)
+    with begin() as conn:
+        rows = conn.execute(sql, {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "version": version,
+        }).mappings().all()
+    return [dict(r) for r in rows]
+
 # -----------------------------------------------------------------------------
 # 書き込み系（すべて conn オプションを受け取り、_exec(..., conn=conn) で統一）
 # -----------------------------------------------------------------------------
