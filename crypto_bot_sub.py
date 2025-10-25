@@ -544,7 +544,7 @@ class CryptoTradingBot:
                 status=status,
                 raw=raw,
                 signal_id=signal_id,
-                source=("backtest" if is_backtest_mode else "real"),  # ★追加
+                source=default_source_from_env(self),  # ★追加
             )
             self.logger.info(f"✅ シグナル記録: signal_id={sid} {symbol} {timeframe} {side} price={price}")
             return sid
@@ -2549,7 +2549,10 @@ class CryptoTradingBot:
         signal_id = ""
         try:
             current_position_preview = self.positions.get(symbol)
-            # if current_position_preview is None:
+            # エントリー時のみ記録（決済では記録しない）
+            if current_position_preview is not None:
+                raise RuntimeError("skip_recording_signal_for_exit")
+
             side_for_signal = "long" if str(order_type).lower() == "buy" else "short"
             try:
                 current_price_preview = float(self.get_current_price(symbol) or 0.0)
@@ -3338,15 +3341,7 @@ class CryptoTradingBot:
             'eth_jpy':  {'adx': 0.25, 'cci': 0.30, 'rsi': 0.15, 'bb': 0.20, 'mfi': 0.05, 'volume': 0.05, 'ma': 0.00, 'atr': 0.0, 'macd': 0.0},
             'bcc_jpy':  {'adx': 0.25, 'cci': 0.30, 'rsi': 0.15, 'bb': 0.20, 'mfi': 0.05, 'volume': 0.05, 'ma': 0.00, 'atr': 0.0, 'macd': 0.0},
         }
-        # signal_thresholds = {
-        #     'doge_jpy': {'buy': 0.51, 'sell': 0.51},
-        #     'sol_jpy':  {'buy': 0.20, 'sell': 0.30},
-        #     'xrp_jpy':  {'buy': 0.40, 'sell': 0.40},
-        #     'ltc_jpy':  {'buy': 0.60, 'sell': 0.60},
-        #     'ada_jpy':  {'buy': 0.45, 'sell': 0.45},
-        #     'eth_jpy':  {'buy': 0.51, 'sell': 0.51},
-        #     'bcc_jpy':  {'buy': 0.60, 'sell': 0.55},
-        # }
+        
         signal_thresholds = {
             'doge_jpy': {'buy': 0.0, 'sell': 0.0},
             'sol_jpy':  {'buy': 0.0, 'sell': 0.0},
@@ -3686,7 +3681,9 @@ class CryptoTradingBot:
         if symbol == 'sol_jpy':
             df_5min.loc[df_5min['atr_score_long'].between(0.0067, 0.0366),'buy_signal'] = False
             df_5min.loc[df_5min['atr_score_short'].between(0.41, 0.69),'sell_signal'] = False
+            df_5min.loc[df_5min['atr_score_short'].between(0.045, 0.11),'sell_signal'] = False
             df_5min.loc[df_5min['rsi_score_long'].between(0.573, 0.61),'buy_signal'] = False
+            df_5min.loc[df_5min['rsi_score_long'] > 0.757, 'buy_signal'] = False
             df_5min.loc[df_5min['cci_score_long'].between(0.114, 0.149),'buy_signal'] = False
             df_5min.loc[df_5min['cci_score_long'].between(0.17, 0.264),'buy_signal'] = False
             df_5min.loc[df_5min['adx_score_long'].between(0.444, 0.56),'buy_signal'] = False
@@ -3703,10 +3700,11 @@ class CryptoTradingBot:
         if symbol == 'ada_jpy':
             df_5min.loc[df_5min['atr_score_long'].between(0.475, 0.59),'buy_signal'] = False
             df_5min.loc[df_5min['atr_score_short'].between(0.235, 0.296),'sell_signal'] = False
-            df_5min.loc[df_5min['adx_score_long'].between(0.53, 0.63),'buy_signal'] = False
+            df_5min.loc[df_5min['adx_score_long'].between(0.35, 0.63),'buy_signal'] = False
             df_5min.loc[df_5min['adx_score_long'].between(0.8, 0.95),'buy_signal'] = False
             df_5min.loc[df_5min['adx_score_short'] < 0.0011, 'sell_signal'] = False
             df_5min.loc[df_5min['adx_score_short'].between(0.108, 0.188),'sell_signal'] = False
+            df_5min.loc[df_5min['adx_score_short'].between(0.51, 0.645),'sell_signal'] = False
             df_5min.loc[df_5min['rsi_score_long'].between(0.105, 0.138),'buy_signal'] = False
             df_5min.loc[df_5min['rsi_score_long'].between(0.233, 0.286),'buy_signal'] = False
             df_5min.loc[df_5min['rsi_score_long'].between(0.57, 0.61),'buy_signal'] = False
@@ -3718,6 +3716,8 @@ class CryptoTradingBot:
             df_5min.loc[df_5min['mfi_score_short'] > 0.62, 'sell_signal'] = False
             df_5min.loc[df_5min['cci_score_long'] > 0.786, 'buy_signal'] = False
             df_5min.loc[df_5min['cci_score_long'].between(0.25, 0.296),'buy_signal'] = False
+            df_5min.loc[df_5min['cci_score_long'].between(0.33, 0.36),'buy_signal'] = False
+            df_5min.loc[df_5min['cci_score_long'].between(0.493, 0.547),'buy_signal'] = False            
             df_5min.loc[df_5min['cci_score_long'].between(0.57, 0.616),'buy_signal'] = False
             df_5min.loc[df_5min['cci_score_short'].between(0.446, 0.482),'sell_signal'] = False
             df_5min.loc[df_5min['cci_score_short'].between(0.6, 0.685),'sell_signal'] = False
@@ -5867,7 +5867,7 @@ class CryptoTradingBot:
             self.logger.warning(f"{symbol}: entry_time が未設定のため現在時刻を代入します（SIM safety）")
             entry_time = datetime.now()
             self.entry_times[symbol] = entry_time
-            
+
         entry_size = self.entry_sizes[symbol]
         
         # 保有時間の計算
