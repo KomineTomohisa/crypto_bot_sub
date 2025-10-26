@@ -19,6 +19,7 @@ import argparse
 import hmac
 import hashlib
 import random  # ランダムな待機時間のために追加
+import uuid    # SIM注文ID発行用（SIM-...）
 import concurrent.futures
 import math
 import threading
@@ -518,6 +519,9 @@ class CryptoTradingBot:
         それ以外（paperモードや未初期化）は空リストでフォールバックする。
         戻り値フォーマットは既存利用箇所に合わせて data: [] を基本形とする。
         """
+        if not self.exchange_settings_gmo.get("live_trade", False):
+            return self._get_open_positions_from_db(gmo_symbol)
+
         is_live = bool(self.exchange_settings_gmo.get("live_trade", False))
         if is_live and self.gmo_api is not None:
             return self.gmo_api.get_margin_positions(gmo_symbol)
@@ -1822,6 +1826,29 @@ class CryptoTradingBot:
         Returns:
         dict: 建玉情報の詳細、またはNone
         """
+        if not self.exchange_settings_gmo.get("live_trade", False):
+            symbol = f"{coin.lower()}_jpy"
+            side = self.positions.get(symbol)
+            size = float(self.entry_sizes.get(symbol) or 0.0)
+            gmo_symbol = self.symbol_mapping.get(symbol, coin.upper() + "JPY")
+
+            if not side or size <= 0:
+                return {"positions": [], "net_size": 0.0}
+
+            pos = {
+                "symbol": gmo_symbol,
+                "side": ("BUY" if side == "long" else "SELL"),
+                "positionId": self.position_ids.get(symbol),
+                "size": size,
+                "price": float(self.entry_prices.get(symbol) or 0.0),
+                "openedAt": (self.entry_times.get(symbol).isoformat()
+                            if self.entry_times.get(symbol) else None),
+            }
+            return {
+                "positions": [pos],
+                "net_size": (size if side == "long" else -size),
+            }
+
         try:
             if not self.gmo_api:
                 self.logger.error("GMOコインAPIが初期化されていません")
@@ -3824,7 +3851,7 @@ class CryptoTradingBot:
             self._apply_rule_thresholds(
                 df_5min,
                 symbol,
-                timeframe="5m",
+                timeframe="15m",
                 version=getattr(self, "rules_version", None)  # 未定義なら None でOK
             )
 
@@ -4053,7 +4080,7 @@ class CryptoTradingBot:
         from concurrent.futures import ThreadPoolExecutor, as_completed
         import threading
         import pandas as pd
-        from datetime import datetime, timedelta
+        from datetime import timedelta
 
         self.logger.info(f"=== バックテスト開始 ({days_to_test}日間) ===")
 
@@ -4095,7 +4122,7 @@ class CryptoTradingBot:
             day_range = range(days_to_test, 0, -1)
 
             for day_offset in day_range:
-                current_date = datetime.now() - timedelta(days=day_offset)
+                current_date = now_jst() - timedelta(days=day_offset)
                 date_str = current_date.strftime('%Y%m%d')
 
                 # 前日
@@ -6099,6 +6126,10 @@ class CryptoTradingBot:
 
             # ポジションの反対売買方向を決定
             side = "BUY" if position == 'short' else "SELL"
+            # live / sim の分岐フラグ（以降で使う）
+            is_live = bool(self.exchange_settings_gmo.get("live_trade", False))
+            # SIM時の総約定サイズを自前集計
+            sim_total_executed_size = 0.0
 
             # 各ポジションを順番に決済
             for pos in position_details["positions"]:
@@ -6145,6 +6176,21 @@ class CryptoTradingBot:
 
 
                 # 決済注文実行
+                # --- SIM(Paper) モード：APIは呼ばず、擬似注文を発行して成功扱いにする ---
+                if not is_live:
+                    order_id = f"SIM-CLOSE-{uuid.uuid4().hex[:12]}"
+                    self.logger.info(f"[SIM CLOSE] {gmo_symbol} {side} size={pos_size} -> order_id={order_id}")
+                    success_count += 1
+                    total_order_ids.append(order_id)
+                    sim_total_executed_size += float(pos_size or 0.0)
+                    close_results.append({
+                        'position_id': position_id,
+                        'success': True,
+                        'order_id': order_id,
+                        'size': pos_size
+                    })
+                    continue  # API呼び出しは行わない
+
                 try:
                     response = self.gmo_api.close_position(
                         symbol=gmo_symbol,
@@ -6189,18 +6235,20 @@ class CryptoTradingBot:
                         'size': pos_size
                     })
             
-            # 決済結果の集計
+            # 決済結果の集計（SIM/LIVE 分岐）
             if success_count > 0:
-                # 約定確認（少し待ってから確認）
-                time.sleep(3)
-                
-                # 全約定サイズを取得
-                for result in close_results:
-                    if result.get('success'):
-                        order_id = result.get('order_id')
-                        executed_size = self.check_order_execution(order_id, symbol)
-                        if executed_size > 0:
-                            total_executed_size += float(executed_size)
+                if is_live:
+                    # LIVE：少し待ってから各注文の約定サイズを照会
+                    time.sleep(3)
+                    for result in close_results:
+                        if result.get('success'):
+                            order_id = result.get('order_id')
+                            executed_size = self.check_order_execution(order_id, symbol)
+                            if executed_size > 0:
+                                total_executed_size += float(executed_size)
+                else:
+                    # SIM：API照会せず、自前で集計したサイズをそのまま採用
+                    total_executed_size = float(sim_total_executed_size)
                             
                 # Tx前で確定しておく（クリアされる前に掴む）
                 entry_pos_id_for_trade = self.position_ids.get(symbol)
@@ -6208,8 +6256,8 @@ class CryptoTradingBot:
                 # 成功した決済がある場合：ここで注文+フィルを原子的に確定
                 self.logger.info(f"{symbol}のポジション決済結果: 成功={success_count}, 失敗={failed_count}, 総約定サイズ={total_executed_size}")
 
-                # 代表注文ID（成功したものの先頭）
-                repr_order_id = next((r.get('order_id') for r in close_results if r.get('success')), None)
+                # 代表注文ID（成功したものの先頭を採用：SIM/LIVE 共通）
+                repr_order_id = total_order_ids[0] if total_order_ids else None
 
                 # 事前ガード：IDなし or 約定サイズ0 なら、DB書込/トレード作成はしない
                 if not repr_order_id or float(total_executed_size) <= 0.0:
