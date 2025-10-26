@@ -3701,6 +3701,7 @@ class CryptoTradingBot:
 
         if self.exchange_settings_gmo.get("live_trade", False) or getattr(self, "is_backtest", False):
             if symbol == 'bcc_jpy':
+                df_5min.loc[df_5min['adx_score_long'] < 0.00435, 'buy_signal'] = False
                 df_5min.loc[df_5min['atr_score_long'].between(0.675, 0.95),'buy_signal'] = False
                 df_5min.loc[df_5min['adx_score_short'] < 0.0594, 'sell_signal'] = False
                 df_5min.loc[df_5min['cci_score_long'] > 0.788, 'buy_signal'] = False
@@ -3716,12 +3717,16 @@ class CryptoTradingBot:
                 df_5min.loc[df_5min['mfi_score_long'].between(0.565, 0.64),'buy_signal'] = False
                 df_5min.loc[df_5min['mfi_score_long'] > 0.79, 'buy_signal'] = False
                 df_5min.loc[df_5min['mfi_score_short'].between(0.657, 0.751),'sell_signal'] = False
+                df_5min.loc[df_5min['rsi_score_long'].between(0.408, 0.454),'buy_signal'] = False
                 df_5min.loc[df_5min['rsi_score_long'].between(0.475, 0.57),'buy_signal'] = False
                 df_5min.loc[df_5min['rsi_score_short'].between(0.205, 0.237),'sell_signal'] = False
                 df_5min.loc[df_5min['rsi_score_short'].between(0.33, 0.42),'sell_signal'] = False
                 df_5min.loc[df_5min['rsi_score_short'].between(0.556, 0.645),'sell_signal'] = False
                 df_5min.loc[df_5min['cci_score_long'].between(0.14, 0.175),'buy_signal'] = False
-                df_5min.loc[df_5min['cci_score_short'].between(0.28, 0.336),'sell_signal'] = False
+                df_5min.loc[df_5min['cci_score_long'].between(0.14, 0.175),'buy_signal'] = False
+                df_5min.loc[df_5min['cci_score_short'].between(0.079, 0.136),'sell_signal'] = False
+                df_5min.loc[df_5min['cci_score_short'].between(0.226, 0.254),'sell_signal'] = False
+                df_5min.loc[df_5min['cci_score_short'].between(0.278, 0.337),'sell_signal'] = False
 
             if symbol == 'doge_jpy':
                 df_5min.loc[df_5min['atr_score_short'].between(0.0385, 0.15),'sell_signal'] = False
@@ -3731,6 +3736,7 @@ class CryptoTradingBot:
                 df_5min.loc[df_5min['adx_score_short'].between(0.228, 0.297),'sell_signal'] = False
                 df_5min.loc[df_5min['adx_score_short'].between(0.33, 0.382),'sell_signal'] = False
                 df_5min.loc[df_5min['adx_score_short'].between(0.437, 0.582),'sell_signal'] = False
+                df_5min.loc[df_5min['adx_score_short'].between(0.822, 0.826),'sell_signal'] = False
                 df_5min.loc[df_5min['ma_score_long'].between(0.151, 0.165),'buy_signal'] = False
                 df_5min.loc[df_5min['ma_score_short'].between(0.191, 0.225),'sell_signal'] = False
                 df_5min.loc[df_5min['cci_score_short'] > 0.933, 'sell_signal'] = False
@@ -3751,9 +3757,11 @@ class CryptoTradingBot:
                 df_5min.loc[df_5min['atr_score_short'].between(0.045, 0.11),'sell_signal'] = False
                 df_5min.loc[df_5min['rsi_score_long'].between(0.573, 0.61),'buy_signal'] = False
                 df_5min.loc[df_5min['rsi_score_long'] > 0.757, 'buy_signal'] = False
+                df_5min.loc[df_5min['rsi_score_short'].between(0.12, 0.18),'sell_signal'] = False
                 df_5min.loc[df_5min['cci_score_long'].between(0.114, 0.149),'buy_signal'] = False
                 df_5min.loc[df_5min['cci_score_long'].between(0.17, 0.264),'buy_signal'] = False
                 df_5min.loc[df_5min['adx_score_long'].between(0.444, 0.56),'buy_signal'] = False
+                df_5min.loc[df_5min['adx_score_long'].between(0.2, 0.25),'buy_signal'] = False
                 df_5min.loc[df_5min['adx_score_short'] < 0.15, 'sell_signal'] = False
                 df_5min.loc[df_5min['cci_score_short'].between(0.3, 0.355),'sell_signal'] = False
                 df_5min.loc[df_5min['cci_score_short'].between(0.428, 0.496),'sell_signal'] = False
@@ -3763,10 +3771,12 @@ class CryptoTradingBot:
                 df_5min.loc[df_5min['bb_score_short'] > 0.571, 'sell_signal'] = False
                 df_5min.loc[df_5min['ma_score_long'].between(0.2, 0.223),'buy_signal'] = False
                 df_5min.loc[df_5min['mfi_score_long'].between(0.466, 0.529),'buy_signal'] = False
+                df_5min.loc[df_5min['mfi_score_short'].between(0.247, 0.273),'sell_signal'] = False
 
             if symbol == 'ada_jpy':
                 df_5min.loc[df_5min['atr_score_long'].between(0.475, 0.59),'buy_signal'] = False
                 df_5min.loc[df_5min['atr_score_short'].between(0.235, 0.296),'sell_signal'] = False
+                df_5min.loc[df_5min['atr_score_short'].between(0.38, 0.527),'sell_signal'] = False
                 df_5min.loc[df_5min['adx_score_long'].between(0.35, 0.63),'buy_signal'] = False
                 df_5min.loc[df_5min['adx_score_long'].between(0.8, 0.95),'buy_signal'] = False
                 df_5min.loc[df_5min['adx_score_short'] < 0.0011, 'sell_signal'] = False
@@ -3788,6 +3798,7 @@ class CryptoTradingBot:
                 df_5min.loc[df_5min['cci_score_long'].between(0.57, 0.616),'buy_signal'] = False
                 df_5min.loc[df_5min['cci_score_short'].between(0.446, 0.482),'sell_signal'] = False
                 df_5min.loc[df_5min['cci_score_short'].between(0.6, 0.685),'sell_signal'] = False
+                df_5min.loc[df_5min['cci_score_short'] > 0.786, 'sell_signal'] = False
                 df_5min.loc[df_5min['ma_score_long'].between(0.13, 0.145),'buy_signal'] = False
                 df_5min.loc[df_5min['ma_score_long'].between(0.173, 0.2),'buy_signal'] = False
                 df_5min.loc[df_5min['ma_score_short'].between(0.2, 0.25),'sell_signal'] = False
@@ -3809,10 +3820,12 @@ class CryptoTradingBot:
                 df_5min.loc[df_5min['ma_score_short'].between(0.13, 0.162),'sell_signal'] = False
                 df_5min.loc[df_5min['ma_score_short'] > 0.25, 'sell_signal'] = False
                 df_5min.loc[df_5min['adx_score_long'].between(0.321, 0.395),'buy_signal'] = False
+                df_5min.loc[df_5min['adx_score_short'].between(0.217, 0.305),'sell_signal'] = False
                 df_5min.loc[df_5min['rsi_score_long'].between(0.3, 0.42),'buy_signal'] = False
                 df_5min.loc[df_5min['rsi_score_long'].between(0.446, 0.485),'buy_signal'] = False
                 df_5min.loc[df_5min['rsi_score_short'].between(0.12, 0.21),'sell_signal'] = False
                 df_5min.loc[df_5min['mfi_score_long'].between(0.15, 0.23),'buy_signal'] = False
+                df_5min.loc[df_5min['mfi_score_short'].between(0.424, 0.484),'sell_signal'] = False
                 df_5min.loc[df_5min['mfi_score_short'] > 0.71, 'sell_signal'] = False
 
             if symbol == 'eth_jpy':
@@ -3829,6 +3842,7 @@ class CryptoTradingBot:
             if symbol == 'xrp_jpy':
                 df_5min.loc[df_5min['atr_score_long'].between(0.15, 0.228),'buy_signal'] = False
                 df_5min.loc[df_5min['atr_score_short'].between(0.013, 0.124),'sell_signal'] = False
+                df_5min.loc[df_5min['atr_score_short'].between(0.93, 0.989),'sell_signal'] = False
                 df_5min.loc[df_5min['rsi_score_long'].between(0.31, 0.42),'buy_signal'] = False
                 df_5min.loc[df_5min['rsi_score_long'].between(0.575, 0.612),'buy_signal'] = False
                 df_5min.loc[df_5min['rsi_score_short'].between(0.228, 0.5),'sell_signal'] = False
