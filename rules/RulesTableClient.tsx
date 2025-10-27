@@ -28,6 +28,15 @@ function parseDateFlexible(v: string | number | Date | null | undefined): Date |
   return null;
 }
 
+function apiBase() {
+  return "/api"; // これで Next が 127.0.0.1:8000 へ転送
+}
+async function logicalDeleteRuleViaApi(id: number): Promise<Rule> {
+  const res = await fetch(`${apiBase()}/admin/signal-rules/${id}`, { method: "DELETE" });
+  if (!res.ok) throw new Error("Delete failed");
+  return res.json();
+}
+
 function fmtJST(v: string | number | Date | null | undefined, withTime = true): string {
   const d = parseDateFlexible(v);
   if (!d) return "";
@@ -54,12 +63,21 @@ function Pill({ children, tone = "default" }: { children: React.ReactNode; tone?
   return <span className={`inline-flex items-center rounded px-2 py-0.5 text-[11px] font-medium ${map[tone]}`}>{children}</span>;
 }
 
-function RowMenuSkeleton() {
+function RowMenu({ onDeleted }: { onDeleted: () => Promise<void> }) {
+  const [loading, setLoading] = useState(false);
   return (
-    <div className="inline-flex items-center gap-1 text-xs text-gray-500">
-      <span className="px-2 py-1 rounded border border-gray-200 dark:border-gray-800">編集</span>
-      <span className="px-2 py-1 rounded border border-gray-200 dark:border-gray-800">複製</span>
-      <span className="px-2 py-1 rounded border border-gray-200 dark:border-gray-800">無効化</span>
+    <div className="inline-flex items-center gap-1 text-xs">
+      <button
+        className="px-2 py-1 rounded border border-rose-300 text-rose-600 hover:bg-rose-50 disabled:opacity-50"
+        disabled={loading}
+        onClick={async ()=>{
+          if (!window.confirm("このルールを削除（論理削除）します。よろしいですか？")) return;
+          try { setLoading(true); await onDeleted(); }
+          finally { setLoading(false); }
+        }}
+      >
+        削除
+      </button>
     </div>
   );
 }
@@ -120,23 +138,40 @@ export default function RulesTableClient({ initialData }: { initialData: Rule[] 
 
   const pageData = sorted.slice((page - 1) * pageSize, page * pageSize);
 
-  const header = (key: keyof Rule, label: string, align: "left" | "right" | "center" = "left") => (
-    <th
-      className={`px-3 py-2 text-${align} cursor-pointer select-none`}
-      onClick={() => {
-        if (sortKey === key) setSortAsc(!sortAsc);
-        else {
-          setSortKey(key);
-          setSortAsc(true);
-        }
-      }}
-    >
-      <span className="inline-flex items-center gap-1">
-        {label}
-        {sortKey === key && <span className="text-xs text-gray-400">{sortAsc ? "▲" : "▼"}</span>}
-      </span>
-    </th>
-  );
+  const header = (
+    key: keyof Rule,
+    label: string,
+    align: "left" | "right" | "center" = "left"
+  ) => {
+    const alignCls =
+      align === "left"
+        ? "text-left"
+        : align === "right"
+        ? "text-right"
+        : "text-center";
+
+    return (
+      <th
+        className={`px-3 py-2 ${alignCls} cursor-pointer select-none`}
+        onClick={() => {
+          if (sortKey === key) setSortAsc(!sortAsc);
+          else {
+            setSortKey(key);
+            setSortAsc(true);
+          }
+        }}
+      >
+        <span className="inline-flex items-center gap-1">
+          {label}
+          {sortKey === key && (
+            <span className="text-xs text-gray-400">
+              {sortAsc ? "▲" : "▼"}
+            </span>
+          )}
+        </span>
+      </th>
+    );
+  };
 
   return (
     <div className="overflow-x-auto">
@@ -188,7 +223,18 @@ export default function RulesTableClient({ initialData }: { initialData: Rule[] 
                 {r.notes ?? ""}
               </td>
               <td className="px-3 py-2 text-center">
-                <RowMenuSkeleton />
+                <RowMenu
+                  onDeleted={async () => {
+                    const after = await logicalDeleteRuleViaApi(r.id);
+                    // テーブル側でも valid_to が埋まった最新行に置換
+                    // （only_open_ended=true のときは自然に一覧から消えます）
+                    const next = initialData.map(x => x.id === after.id ? after : x);
+                    // ページ内状態は initialData ではなく pageData を持っていないので、
+                    // 実用的には上位から再フェッチ or 親にバブルアップがベター。
+                    // ここでは簡易に location.reload() で反映。
+                    location.reload();
+                  }}
+                />
               </td>
             </tr>
           ))}

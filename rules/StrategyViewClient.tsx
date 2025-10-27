@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useMemo, useState, useEffect } from "react";
 import type { Rule } from "./types";
 
 /* =========================
@@ -30,7 +30,7 @@ function clamp01(x: number){ return Math.max(0, Math.min(1, x)); }
 function toNum(v: string | number | null){ if(v==null) return null; const n=Number(v); return Number.isFinite(n)?n:null; }
 
 function buildSegmentsAndMarkers(rule: Rule){
-  const disabled = rule.action === "disable";
+  const disabled = rule.action === "disable" || !rule.active;
   const segs: Segment[] = []; const marks: Marker[] = []; const notes: string[] = [];
   const v1n = toNum(rule.v1); const v2n = toNum(rule.v2);
 
@@ -62,6 +62,90 @@ function sideColor(side: Side){ return side==="buy" ? "bg-emerald-500" : "bg-ros
 function pillToneForSide(side: Side){ return side==="buy" ? "green" : "red"; }
 
 /* =========================
+   API ユーティリティ（クライアント）
+   ========================= */
+
+function apiBase() {
+  return "/api"; // これで Next が 127.0.0.1:8000 へ転送
+}
+
+function errorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (typeof err === "string") return err;
+  try { return JSON.stringify(err); } catch { return "Unknown error"; }
+}
+
+async function createRuleViaApi(draft: Omit<Rule,"id">): Promise<Rule> {
+  try {
+    const res = await fetch(`${apiBase()}/admin/signal-rules`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(draft),
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`Create failed: ${res.status} ${text}`);
+    }
+    return res.json();
+  } catch (err: unknown) {
+    console.error(err);
+    alert(errorMessage(err));
+    throw err;
+  }
+}
+
+async function updateRuleViaApi(rule: Rule): Promise<Rule> {
+  try {
+    const res = await fetch(`${apiBase()}/admin/signal-rules/${rule.id}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        symbol: rule.symbol,
+        timeframe: rule.timeframe,
+        score_col: rule.score_col,
+        op: rule.op,
+        v1: rule.v1,
+        v2: rule.v2,
+        target_side: rule.target_side,
+        action: rule.action,
+        priority: rule.priority,
+        active: rule.active,
+        version: rule.version,
+        valid_from: rule.valid_from,
+        valid_to: rule.valid_to,
+        notes: rule.notes,
+      }),
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`Update failed: ${res.status} ${text}`);
+    }
+    return res.json();
+  } catch (err: unknown) {
+    console.error(err);
+    alert(errorMessage(err));
+    throw err;
+  }
+}
+
+async function logicalDeleteRuleViaApi(id: number): Promise<Rule> {
+  try {
+    const res = await fetch(`${apiBase()}/admin/signal-rules/${id}`, {
+      method: "DELETE",
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`Delete failed: ${res.status} ${text}`);
+    }
+    return res.json();
+  } catch (err: unknown) {
+    console.error(err);
+    alert(errorMessage(err));
+    throw err;
+  }
+}
+
+/* =========================
    UIパーツ
    ========================= */
 
@@ -82,7 +166,7 @@ function Legend(){
     <div className="flex flex-wrap items-center gap-2 text-xs">
       <span className="inline-flex items-center gap-1"><span className="inline-block h-2 w-6 rounded bg-emerald-500"/><span>buy 有効領域</span></span>
       <span className="inline-flex items-center gap-1"><span className="inline-block h-2 w-6 rounded bg-rose-500"/><span>sell 有効領域</span></span>
-      <span className="inline-flex items-center gap-1"><span className="inline-block h-2 w-6 rounded bg-gray-400"/><span>無効（disable）</span></span>
+      <span className="inline-flex items-center gap-1"><span className="inline-block h-2 w-6 rounded bg-gray-400"/><span>無効（disable/非active）</span></span>
       <span className="inline-flex items-center gap-1"><span className="inline-block h-2 w-0.5 rounded bg-gray-700"/><span>一致/不一致マーカー（= / ≠）</span></span>
       <span className="inline-flex items-center gap-1"><span className="inline-block h-2 w-10 rounded bg-gray-200 border border-gray-300"/><span>0–1 バー（下に 0 / 1 目盛）</span></span>
     </div>
@@ -102,7 +186,7 @@ function CenterRangeLabel({
   );
 }
 
-/* ============== 指標ごとの編集モーダル（モック） ============== */
+/* ============== 指標ごとの編集モーダル（実API連携） ============== */
 
 type IndicatorEditModalProps = {
   open: boolean;
@@ -111,32 +195,30 @@ type IndicatorEditModalProps = {
   side: Side;
   score_col: string;
   rules: Rule[];                 // この indicator に属するルールのみ
-  onCreate: (draft: Omit<Rule,"id">) => void;
-  onUpdate: (rule: Rule) => void;
-  onDelete: (id: number) => void;
+  onCreate: (draft: Omit<Rule,"id">) => Promise<void>;
+  onUpdate: (rule: Rule) => Promise<void>;
+  onDelete: (id: number) => Promise<void>;
 };
 
 function IndicatorEditModal({
   open, onClose, symbol, side, score_col, rules, onCreate, onUpdate, onDelete,
 }: IndicatorEditModalProps){
   const [editMap, setEditMap] = useState<Record<number, Rule>>({});
-  const [initKey, setInitKey] = useState<string>("");
+  const [baseline, setBaseline] = useState<Record<number, { v1: number|null; v2: number|null; active: boolean }>>({});
   const [confirm, setConfirm] = useState<null | {type:"apply"|"delete"; id:number}>(null);
 
-  // 🔸ベースライン（初期値）を保持：モーダルを開いた時点の値
-  const [baseline, setBaseline] = useState<Record<number, { v1: number|null; v2: number|null; active: boolean }>>({});
-
-  if (initKey !== `${symbol}|${side}|${score_col}`){
+  // 初期化は useEffect で
+  useEffect(() => {
+    if (!open) return;
     setEditMap({});
     setConfirm(null);
-    setInitKey(`${symbol}|${side}|${score_col}`);
-    // 初期スナップショット
     const b: Record<number, {v1:number|null; v2:number|null; active:boolean}> = {};
     for (const r of rules) {
       b[r.id] = { v1: (r.v1 ?? null) as number|null, v2: (r.v2 ?? null) as number|null, active: !!r.active };
     }
     setBaseline(b);
-  }
+  }, [open, symbol, side, score_col, rules]);
+
   if (!open) return null;
 
   // 片側条件のモード
@@ -144,7 +226,7 @@ function IndicatorEditModal({
     switch (r.op) {
       case "between": return "both";
       case ">": case ">=": return "leftOnly";   // v1 < score
-      case "<": case "<=": return "rightOnly";  // score < v1（UI右入力→内部は v1 に格納）
+      case "<": case "<=": return "rightOnly";  // score < v1
       case "==": case "!=": case "is_null": case "is_not_null": return "disabled";
       default: return "disabled";
     }
@@ -158,7 +240,6 @@ function IndicatorEditModal({
     const val = e.currentTarget.value === "" ? null : Number(e.currentTarget.value);
     setEditMap(prev=>{
       const base = prev[id] ?? raw;
-      // < / <= は右入力→内部 v1 に保存、> / >= は左入力→内部 v1
       if (mode==="rightOnly" || mode==="leftOnly"){
         return { ...prev, [id]: { ...base, v1: val } };
       }
@@ -176,48 +257,57 @@ function IndicatorEditModal({
     setEditMap(prev=>({ ...prev, [id]: { ...(prev[id] ?? raw), active: v }}));
   };
 
-  const applyRow = (id:number)=>{
+  const applyRow = async (id:number)=>{
     const draft = editMap[id] ?? rules.find(r=>r.id===id);
     if (!draft) return;
-    onUpdate(draft);
-    // ベースライン更新（適用後は未変更状態に戻す）
-    setBaseline((b)=>({
-      ...b,
-      [id]: { v1: (draft.v1 ?? null) as number|null, v2: (draft.v2 ?? null) as number|null, active: !!draft.active }
-    }));
-    setEditMap(prev=>{ const cp={...prev}; delete cp[id]; return cp; });
+    try {
+      await onUpdate(draft);
+      setBaseline((b)=>({
+        ...b,
+        [id]: { v1: (draft.v1 ?? null) as number|null, v2: (draft.v2 ?? null) as number|null, active: !!draft.active }
+      }));
+      setEditMap(prev=>{ const cp={...prev}; delete cp[id]; return cp; });
+    } catch (err: unknown) {
+      console.error(err);
+      alert(errorMessage(err));
+    }
   };
 
-  // 新規追加（この指標にひも付けて1行作る）→ 追加直後は「新規」扱い＝適用ボタン常時活性
-  const addRow = ()=>{
+  // 新規追加（固定値は要件どおり）
+  const addRow = async ()=>{
     const defaultTF = rules[0]?.timeframe ?? "15m";
-    onCreate({
-      symbol,
-      timeframe: defaultTF,
-      score_col,
-      op: "between",
-      v1: 0.2,
-      v2: 0.8,
-      target_side: side,
-      action: "",         // 空なら有効扱い（disable だけが無効）
-      priority: 100,
-      active: true,
-      version: null,
-      valid_from: null,
-      valid_to: null,
-      user_id: null,
-      strategy_id: null,
-      notes: "",
-    });
-    // baseline は更新しない → 新規レコードは baseline に存在しないため dirty 扱い
+    try {
+      await onCreate({
+        symbol,
+        timeframe: defaultTF,
+        score_col,
+        op: "between",
+        v1: 0.2,
+        v2: 0.8,
+        target_side: side,
+        action: "disable",
+        priority: 1,
+        active: true,
+        version: "v1",
+        valid_from: null,
+        valid_to: null,
+        user_id: "1",
+        strategy_id: "ST0001",
+        notes: "",
+      });
+      // baseline は更新しない → 新規は dirty 扱い（適用ボタン常時活性）
+    } catch (err: unknown) {
+      console.error(err);
+      alert(errorMessage(err));
+    }
   };
 
-  // 🔸dirty 判定：baseline に無いID = 新規 → true。ある場合は編集対象だけ比較
+  // dirty 判定
   const isDirty = (r: Rule): boolean => {
     const mode = rangeModeFor(r);
     const cur = editMap[r.id] ?? r;
-    const base = baseline[r.id]; // ない＝新規
-    if (!base) return true;
+    const base = baseline[r.id];
+    if (!base) return true; // baseline に無いID＝新規
     const v1c = (cur.v1 ?? null) as number|null;
     const v2c = (cur.v2 ?? null) as number|null;
     const act = !!cur.active;
@@ -228,7 +318,6 @@ function IndicatorEditModal({
     if (mode === "leftOnly" || mode === "rightOnly") {
       return v1c !== base.v1 || act !== base.active;
     }
-    // disabled（==/!=/null 系）は active のみ比較
     return act !== base.active;
   };
 
@@ -241,14 +330,13 @@ function IndicatorEditModal({
       <div className="absolute inset-x-0 top-10 mx-auto w-[min(100%,980px)] rounded-2xl bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-800 shadow-xl p-4">
         <div className="flex items-center justify-between mb-3">
           <div className="text-lg font-semibold">
-            戦略編集（{symbol} / <span className="capitalize">{side}</span> / <span className="font-mono">{score_col}</span>）※モック
+            戦略編集（{symbol} / <span className="capitalize">{side}</span> / <span className="font-mono">{score_col}</span>）
           </div>
           <div className="flex items-center gap-2">
-            {/* 新規追加ボタン（閉じるの左） */}
             <button
               className="px-3 py-1.5 text-sm rounded-lg border bg-emerald-50 text-emerald-700 hover:bg-emerald-100 dark:bg-emerald-900/20 dark:text-emerald-300"
               onClick={addRow}
-              title="この指標に新しいルールを追加（モック）"
+              title="この指標に新しいルールを追加"
             >
               新規追加
             </button>
@@ -263,10 +351,8 @@ function IndicatorEditModal({
             <thead className="bg-gray-50 dark:bg-gray-800 text-gray-600 dark:text-gray-300 sticky top-0">
               <tr>
                 <th className="px-2 py-2">ID</th>
-                {/* tf を中央＆少し大きめ */}
                 <th className="px-2 py-2 text-center">tf</th>
                 <th className="px-2 py-2">範囲編集</th>
-                {/* 操作列も中央寄せの見出し */}
                 <th className="px-2 py-2 text-center">active</th>
                 <th className="px-2 py-2 text-center">操作</th>
               </tr>
@@ -277,7 +363,6 @@ function IndicatorEditModal({
                 const leftDisabled  = mode==="rightOnly" || mode==="disabled";
                 const rightDisabled = mode==="leftOnly"  || mode==="disabled";
 
-                // 表示用の値（片側条件なら右/左に v1 を映す）
                 const leftVal  = mode==="leftOnly"||mode==="both" ? edValue(r.id,"v1") : null;
                 const rightVal = mode==="rightOnly"||mode==="both" ? (mode==="rightOnly" ? edValue(r.id,"v1") : edValue(r.id,"v2")) : null;
 
@@ -286,42 +371,30 @@ function IndicatorEditModal({
                 return (
                   <tr key={r.id} className="border-t border-gray-100 dark:border-gray-800">
                     <td className="px-2 py-2 text-right tabular-nums">{r.id}</td>
-
-                    {/* tf：中央＆少し太字 */}
                     <td className="px-2 py-2 text-center font-medium">
                       <span className="inline-block min-w-[48px]">{r.timeframe}</span>
                     </td>
 
                     <td className="px-2 py-1">
-                      {/* コンパクト幅に制限＋非活性は薄く */}
                       <div
                         className={`mx-auto max-w-[360px] grid grid-cols-[100px_1fr_100px] items-center gap-1 ${
                           mode === "disabled" ? "opacity-60" : ""
                         }`}
                       >
-                        {/* 左ボックス */}
                         <input
                           type="number" step="0.001"
-                          className={`border rounded px-2 py-1 w-[100px] bg-transparent
-                                      disabled:bg-gray-200 disabled:text-gray-500 disabled:border-gray-300 disabled:cursor-not-allowed
-                                      dark:disabled:bg-gray-800 dark:disabled:text-gray-400 dark:disabled:border-gray-700`}
+                          className="border rounded px-2 py-1 w-[100px] bg-transparent disabled:bg-gray-200 disabled:text-gray-500 disabled:border-gray-300 disabled:cursor-not-allowed dark:disabled:bg-gray-800 dark:disabled:text-gray-400 dark:disabled:border-gray-700"
                           value={leftVal ?? ""}
                           onChange={handleNumChange(r.id,"left")}
                           disabled={leftDisabled}
                           aria-label="v1-left"
                         />
-
-                        {/* 中央ラベル */}
                         <div className={`text-xs text-center ${mode==="disabled" ? "text-gray-400" : "text-gray-700 dark:text-gray-200"}`}>
                           <CenterRangeLabel mode={mode} score={r.score_col} />
                         </div>
-
-                        {/* 右ボックス */}
                         <input
                           type="number" step="0.001"
-                          className={`border rounded px-2 py-1 w-[100px] bg-transparent
-                                      disabled:bg-gray-200 disabled:text-gray-500 disabled:border-gray-300 disabled:cursor-not-allowed
-                                      dark:disabled:bg-gray-800 dark:disabled:text-gray-400 dark:disabled:border-gray-700`}
+                          className="border rounded px-2 py-1 w-[100px] bg-transparent disabled:bg-gray-200 disabled:text-gray-500 disabled:border-gray-300 disabled:cursor-not-allowed dark:disabled:bg-gray-800 dark:disabled:text-gray-400 dark:disabled:border-gray-700"
                           value={rightVal ?? ""}
                           onChange={handleNumChange(r.id,"right")}
                           disabled={rightDisabled}
@@ -336,7 +409,6 @@ function IndicatorEditModal({
                       )}
                     </td>
 
-                    {/* active */}
                     <td className="px-2 py-2 text-center">
                       <input
                         type="checkbox"
@@ -346,12 +418,15 @@ function IndicatorEditModal({
                       />
                     </td>
 
-                    {/* 操作：ボタンを少し大きく＆中央配置。dirtyで活性化 */}
                     <td className="px-2 py-2">
                       <div className="flex items-center justify-center gap-2">
                         <button
                           className="px-3 py-1 text-sm rounded-lg border hover:bg-gray-50 dark:hover:bg-gray-800 disabled:opacity-50 disabled:cursor-not-allowed"
-                          onClick={()=>setConfirm({type:"apply", id:r.id})}
+                          onClick={async ()=>{
+                            if (!dirty) return;
+                            if (!window.confirm(`ID=${r.id} の変更を適用します。よろしいですか？`)) return;
+                            await applyRow(r.id);
+                          }}
                           title={dirty ? "変更を適用" : "変更がありません"}
                           disabled={!dirty}
                         >
@@ -359,8 +434,11 @@ function IndicatorEditModal({
                         </button>
                         <button
                           className="px-3 py-1 text-sm rounded-lg border border-rose-300 text-rose-600 hover:bg-rose-50"
-                          onClick={()=>setConfirm({type:"delete", id:r.id})}
-                          title="この行を削除"
+                          onClick={async ()=>{
+                            if (!window.confirm(`ID=${r.id} を削除（論理削除）します。よろしいですか？`)) return;
+                            try { await onDelete(r.id); } catch (err) { console.error(err); }
+                          }}
+                          title="この行を削除（論理削除）"
                         >
                           削除
                         </button>
@@ -377,52 +455,19 @@ function IndicatorEditModal({
         </div>
       </div>
 
-      {/* 確認モーダル */}
-      {confirm && (
-        <div className="fixed inset-0 z-[70]">
-          <div className="absolute inset-0 bg-black/50" onClick={()=>setConfirm(null)} aria-hidden />
-          <div className="absolute inset-x-0 top-1/3 mx-auto w-[min(92%,480px)] rounded-2xl bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-800 shadow-xl p-5">
-            <div className="text-base font-semibold mb-2">
-              {confirm.type==="apply" ? "本当に確定してよいですか？" : "本当に削除してよいですか？"}
-            </div>
-            <p className="text-sm text-gray-600 dark:text-gray-300 mb-4">
-              この操作はモックですが、現在の画面内のデータは更新／削除されます。
-            </p>
-            <div className="flex justify-end gap-2">
-              <button className="px-3 py-1.5 text-sm rounded-lg border" onClick={()=>setConfirm(null)}>キャンセル</button>
-              {confirm.type==="apply" ? (
-                <button
-                  className="px-3 py-1.5 text-sm rounded-lg bg-emerald-600 text-white hover:bg-emerald-700"
-                  onClick={()=>{ applyRow(confirm.id); setConfirm(null); }}
-                >
-                  確定
-                </button>
-              ) : (
-                <button
-                  className="px-3 py-1.5 text-sm rounded-lg bg-rose-600 text-white hover:bg-rose-700"
-                  onClick={()=>{ onDelete(confirm.id); setConfirm(null); }}
-                >
-                  削除
-                </button>
-              )}
-            </div>
-          </div>
-        </div>
-      )}
+      {/* 確認モーダルは “即時実行＋アラート” に寄せたので省略（必要なら元の確認ダイアログを戻してください） */}
     </div>
   );
 }
 
 
 /* =========================
-   本体（表示＋ローカル編集モック）
+   本体（表示＋ローカル編集反映）
    ========================= */
 
 export default function StrategyViewClient({ data }: { data: Rule[] }) {
-  // ローカル編集用コピー（モック）
   const [localRules, setLocalRules] = useState<Rule[]>(() => data.map(r=>({...r})));
 
-  // symbol > side > indicator
   const groups = useMemo<SymbolGroup[]>(() => {
     const bySymbol = new Map<string, Rule[]>();
     for (const r of localRules){ const k=r.symbol ?? "(unknown)"; if(!bySymbol.has(k)) bySymbol.set(k,[]); bySymbol.get(k)!.push(r); }
@@ -439,6 +484,7 @@ export default function StrategyViewClient({ data }: { data: Rule[] }) {
         const indicators: IndicatorBucket[] = [];
         for (const [score_col, indRules] of byIndicator.entries()){
           const byTF = new Map<string, {segments:Segment[]; markers:Marker[]; extraNotes:string[];}>();
+
           for (const r of indRules){
             const tf=r.timeframe ?? "";
             if(!byTF.has(tf)) byTF.set(tf,{segments:[],markers:[],extraNotes:[]});
@@ -467,11 +513,9 @@ export default function StrategyViewClient({ data }: { data: Rule[] }) {
     return result;
   }, [localRules]);
 
-  /* 折りたたみ状態（通貨ごと） */
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
   const toggleSymbol = (symbol:string)=> setCollapsed(prev=>({...prev,[symbol]:!prev[symbol]}));
 
-  /* 指標モーダルの状態 */
   const [modal, setModal] = useState<null | {symbol:string; side:Side; score_col:string}>(null);
   const openIndicatorModal = (symbol:string, side:Side, score_col:string)=> setModal({symbol, side, score_col});
   const closeModal = ()=> setModal(null);
@@ -479,25 +523,28 @@ export default function StrategyViewClient({ data }: { data: Rule[] }) {
   const rulesOfIndicator = (symbol:string, side:Side, score_col:string) =>
     localRules.filter(r => r.symbol===symbol && (r.target_side??"").toLowerCase()===side && r.score_col===score_col);
 
-  // 追加・更新・削除（ローカルのみ）
-  const handleCreate = (draft: Omit<Rule,"id">) => {
-    const newId = (localRules.reduce((m, r) => Math.max(m, r.id), 0) || 0) + 1;
-    const row: Rule = { id: newId, ...draft };
-    setLocalRules(rows => [...rows, row]);
+  // 実APIに接続：作成/更新/削除
+  const handleCreate = async (draft: Omit<Rule,"id">) => {
+    const created = await createRuleViaApi(draft);
+    setLocalRules(rows => [...rows, created]);
   };
-  const handleUpdate = (rule: Rule)=> setLocalRules(rows=>rows.map(r=>r.id===rule.id?{...rule}:r));
-  const handleDelete = (id:number)=> setLocalRules(rows=>rows.filter(r=>r.id!==id));
+  const handleUpdate = async (rule: Rule) => {
+    const updated = await updateRuleViaApi(rule);
+    setLocalRules(rows => rows.map(r => r.id === updated.id ? updated : r));
+  };
+  const handleDelete = async (id:number) => {
+    const deleted = await logicalDeleteRuleViaApi(id);
+    setLocalRules(rows => rows.map(r => r.id === deleted.id ? deleted : r));
+  };
 
   return (
     <div className="space-y-6">
-      {/* 凡例 */}
       <div className="rounded-xl border border-gray-200 dark:border-gray-800 p-3 bg-white dark:bg-gray-900"><Legend/></div>
 
       {groups.map((g)=>{
         const isCollapsed = !!collapsed[g.symbol];
         return (
           <div key={g.symbol} className="rounded-2xl border border-gray-200 dark:border-gray-800 p-4 bg-white dark:bg-gray-900">
-            {/* 通貨ヘッダ */}
             <div className="flex items-center justify-between gap-3 flex-wrap">
               <div className="text-lg font-semibold">{g.symbol}</div>
               <div className="flex items-center gap-2 text-xs">
@@ -531,14 +578,13 @@ export default function StrategyViewClient({ data }: { data: Rule[] }) {
                               <button
                                 onClick={()=>openIndicatorModal(g.symbol, sg.side, ib.score_col)}
                                 className="ml-2 inline-flex items-center gap-1 rounded-lg border border-gray-200 dark:border-gray-700 px-2 py-1 text-xs hover:bg-gray-50 dark:hover:bg-gray-800"
-                                title="この指標の戦略を編集（モック）"
+                                title="この指標の戦略を編集"
                               >
                                 編集
                               </button>
                             </div>
                           </div>
 
-                          {/* timeframeごとのバー */}
                           <div className="mt-2 space-y-3">
                             {Object.entries(ib.byTimeframe).map(([tf,v])=>(
                               <div key={`${ib.score_col}__${tf}`}>
@@ -586,7 +632,6 @@ export default function StrategyViewClient({ data }: { data: Rule[] }) {
         </div>
       )}
 
-      {/* 指標ごとの編集モーダル（モック） */}
       {modal && (
         <IndicatorEditModal
           open={true}
