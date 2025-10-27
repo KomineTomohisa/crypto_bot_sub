@@ -315,11 +315,17 @@ def get_public_metrics_daily(start, end) -> List[Dict[str, Any]]:
         rows = conn.execute(sql, {"start": start, "end": end}).mappings().all()
     return [dict(r) for r in rows]
 
-def fetch_signal_rules(symbol: str, timeframe: str = "5m", *, version: str | None = None):
-    """
-    SIM限定のbuy/sellフィルタ用ルールを取得する（フェーズP0専用）
-    """
-    sql = sa.text("""
+def fetch_signal_rules(
+    symbol: str,
+    timeframe: str = "15m",
+    *,
+    version: str | None = None,
+    user_id: str | None = None,
+    strategy_id: str | None = None,
+    only_open_ended: bool = False,  # ← 追加
+):
+    cond_valid_to = "valid_to IS NULL" if only_open_ended else "(valid_to IS NULL OR valid_to >= NOW())"
+    sql = sa.text(f"""
         SELECT symbol, timeframe, score_col, op, v1, v2,
                target_side, action, priority
           FROM signal_rule_thresholds
@@ -327,8 +333,10 @@ def fetch_signal_rules(symbol: str, timeframe: str = "5m", *, version: str | Non
            AND symbol = :symbol
            AND timeframe = :timeframe
            AND (valid_from IS NULL OR valid_from <= NOW())
-           AND (valid_to   IS NULL OR valid_to   >= NOW())
+           AND {cond_valid_to}
            AND (:version IS NULL OR version = :version)
+           AND (:user_id IS NULL OR user_id = :user_id)
+           AND (:strategy_id IS NULL OR strategy_id = :strategy_id)
          ORDER BY priority ASC, id ASC
     """)
     with begin() as conn:
@@ -336,6 +344,8 @@ def fetch_signal_rules(symbol: str, timeframe: str = "5m", *, version: str | Non
             "symbol": symbol,
             "timeframe": timeframe,
             "version": version,
+            "user_id": user_id,
+            "strategy_id": strategy_id,
         }).mappings().all()
     return [dict(r) for r in rows]
 

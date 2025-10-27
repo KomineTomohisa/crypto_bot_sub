@@ -3897,7 +3897,14 @@ class CryptoTradingBot:
             return
 
         from db import fetch_signal_rules
-        rules = fetch_signal_rules(symbol, timeframe, version=version)
+        rules = fetch_signal_rules(
+            symbol,
+            timeframe,
+            version=version,
+            user_id=getattr(self, "user_id", None),
+            strategy_id=getattr(self, "strategy_id", None),
+            only_open_ended=True,  # ← 追加
+        )
         if not rules:
             self.logger.info(f"[rules][{symbol}] no active rules (timeframe={timeframe}, version={version})")
             return
