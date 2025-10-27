@@ -3861,13 +3861,12 @@ class CryptoTradingBot:
                 df_5min.loc[df_5min['bb_score_long'].between(0.67, 0.896),'buy_signal'] = False
                 df_5min.loc[df_5min['bb_score_short'] > 0.78, 'sell_signal'] = False
 
-        else:
-            self._apply_rule_thresholds(
-                df_5min,
-                symbol,
-                timeframe="15m",
-                version=getattr(self, "rules_version", None)  # 未定義なら None でOK
-            )
+        self._apply_rule_thresholds(
+            df_5min,
+            symbol,
+            timeframe="15m",
+            version=getattr(self, "rules_version", None)  # 未定義なら None でOK
+        )
 
         if 'EMA_long' in df_5min.columns and len(df_5min) > 1:
             prev_price = df_5min['close'].shift(1)
@@ -7041,6 +7040,7 @@ if __name__ == "__main__":
     parser.add_argument("--reset", action="store_true", help="起動時にポジション情報をリセットする")
     parser.add_argument("--clear-cache", action="store_true", help="キャッシュをクリアしてから実行する")
     parser.add_argument("--user-id", type=int, help="通知/DB設定をひもづけるユーザーID")
+    parser.add_argument("--rules-version", type=str, help="signal_rule_thresholds の version を明示指定（未指定なら None）")
     args = parser.parse_args()
 
     # ボット生成
