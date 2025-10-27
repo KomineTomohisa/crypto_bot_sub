@@ -353,7 +353,128 @@ ORDER BY days.metric_date ASC, daily_real.symbol NULLS LAST
     sa.bindparam("symbol", type_=sa.String),
 )
 
+RULES_LIST_SQL_BASE = """
+SELECT
+  id, symbol, timeframe, score_col, op, v1, v2,
+  target_side, action, priority, active, version,
+  valid_from, valid_to, user_id, strategy_id, notes
+FROM signal_rule_thresholds
+WHERE 1=1
+  AND (:symbol     IS NULL OR LOWER(symbol) = LOWER(:symbol))
+  AND (:timeframe  IS NULL OR timeframe = :timeframe)
+  AND (:active_txt IS NULL OR (active = CASE WHEN :active_txt='true' THEN TRUE WHEN :active_txt='false' THEN FALSE ELSE active END))
+  AND (:user_id    IS NULL OR user_id = :user_id)
+  AND (:strategy_id IS NULL OR strategy_id = :strategy_id)
+  AND (:version    IS NULL OR version = :version)
+"""
+
 # ------------------- エンドポイント -------------------
+
+# q（簡易全文）条件を動的に足す
+def _rules_q_clause():
+    # 数値列は::text化が分岐要るが、PostgreSQLなら to_char でもOK
+    return """ AND (
+      LOWER(COALESCE(symbol,'')) LIKE :q
+      OR LOWER(COALESCE(timeframe,'')) LIKE :q
+      OR LOWER(COALESCE(score_col,'')) LIKE :q
+      OR LOWER(COALESCE(op,'')) LIKE :q
+      OR LOWER(COALESCE(target_side,'')) LIKE :q
+      OR LOWER(COALESCE(action,'')) LIKE :q
+      OR LOWER(COALESCE(version,'')) LIKE :q
+      OR LOWER(COALESCE(user_id,'')) LIKE :q
+      OR LOWER(COALESCE(strategy_id,'')) LIKE :q
+      OR LOWER(COALESCE(notes,'')) LIKE :q
+    )"""
+
+# valid_to IS NULL のみ
+def _rules_only_open_ended_clause():
+    return " AND valid_to IS NULL "
+
+def _rules_order_clause(sort: str):
+    allowed = {
+        "id": "id",
+        "symbol": "symbol",
+        "timeframe": "timeframe",
+        "score_col": "score_col",
+        "op": "op",
+        "target_side": "target_side",
+        "action": "action",
+        "priority": "priority",
+        "active": "active",
+        "version": "version",
+        "valid_from": "valid_from",
+        "valid_to": "valid_to",
+        "user_id": "user_id",
+        "strategy_id": "strategy_id",
+    }
+    col = allowed.get(sort or "priority", "priority")
+    # 既定は priority ASC, id ASC
+    if col == "priority":
+        return " ORDER BY priority ASC, id ASC "
+    return f" ORDER BY {col} ASC, id ASC "
+
+from fastapi import Query
+
+@app.get("/admin/signal-rules")
+def list_signal_rules(
+    symbol: str | None = Query(None),
+    timeframe: str | None = Query(None),
+    active: str | None = Query(None, pattern="^(true|false)$"),
+    user_id: str | None = Query(None),
+    strategy_id: str | None = Query(None),
+    version: str | None = Query(None),
+    only_open_ended: bool = Query(False),
+    q: str | None = Query(None, description="簡易全文検索（部分一致・小文字化）"),
+    sort: str | None = Query("priority"),
+    page: int = Query(1, ge=1),
+    limit: int = Query(200, ge=1, le=1000),
+):
+    base = RULES_LIST_SQL_BASE
+    params = {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "active_txt": active,
+        "user_id": user_id,
+        "strategy_id": strategy_id,
+        "version": version,
+    }
+
+    if q:
+        base += _rules_q_clause()
+        params["q"] = f"%{q.lower()}%"
+    if only_open_ended:
+        base += _rules_only_open_ended_clause()
+
+    order = _rules_order_clause(sort)
+    offset = (page - 1) * limit
+
+    sql = sa.text(base + order + " LIMIT :limit OFFSET :offset ")
+    with engine.begin() as conn:
+        rows = conn.execute(sql, {**params, "limit": limit, "offset": offset}).mappings().all()
+
+    # JSON整形
+    out = []
+    for r in rows:
+        out.append({
+            "id": r["id"],
+            "symbol": r["symbol"],
+            "timeframe": r["timeframe"],
+            "score_col": r["score_col"],
+            "op": r["op"],
+            "v1": float(r["v1"]) if r["v1"] is not None else None,
+            "v2": float(r["v2"]) if r["v2"] is not None else None,
+            "target_side": r["target_side"],
+            "action": r["action"],
+            "priority": r["priority"],
+            "active": bool(r["active"]),
+            "version": r["version"],
+            "valid_from": r["valid_from"].isoformat() if r["valid_from"] else None,
+            "valid_to": r["valid_to"].isoformat() if r["valid_to"] else None,
+            "user_id": r.get("user_id"),
+            "strategy_id": r.get("strategy_id"),
+            "notes": r.get("notes"),
+        })
+    return out
 
 @app.get("/public/metrics", response_model=PublicMetricsOut)
 def get_public_metrics():
@@ -757,3 +878,53 @@ def get_trades_today(
             "user_id": r.get("user_id"),
         })
     return out
+
+@app.get("/admin/export/signal-rules.csv")
+def export_signal_rules_csv(
+    symbol: str | None = Query(None),
+    timeframe: str | None = Query(None),
+    active: str | None = Query(None, pattern="^(true|false)$"),
+    user_id: str | None = Query(None),
+    strategy_id: str | None = Query(None),
+    version: str | None = Query(None),
+    only_open_ended: bool = Query(False),
+    q: str | None = Query(None),
+    sort: str | None = Query("priority"),
+    limit: int = Query(5000, ge=1, le=20000),
+):
+    base = RULES_LIST_SQL_BASE
+    params = {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "active_txt": active,
+        "user_id": user_id,
+        "strategy_id": strategy_id,
+        "version": version,
+    }
+    if q:
+        base += _rules_q_clause()
+        params["q"] = f"%{q.lower()}%"
+    if only_open_ended:
+        base += _rules_only_open_ended_clause()
+
+    order = _rules_order_clause(sort)
+    sql = sa.text(base + order + " LIMIT :limit ")
+    with engine.begin() as conn:
+        rows = conn.execute(sql, {**params, "limit": limit}).mappings().all()
+
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    cols = ["id","symbol","timeframe","score_col","op","v1","v2","target_side","action","priority","active","version","valid_from","valid_to","user_id","strategy_id","notes"]
+    w.writerow(cols)
+    for r in rows:
+        w.writerow([
+            r["id"], r["symbol"], r["timeframe"], r["score_col"], r["op"],
+            r["v1"], r["v2"], r["target_side"], r["action"], r["priority"], r["active"], r["version"],
+            r["valid_from"].isoformat() if r["valid_from"] else "",
+            r["valid_to"].isoformat() if r["valid_to"] else "",
+            r.get("user_id") or "", r.get("strategy_id") or "", r.get("notes") or "",
+        ])
+    data = buf.getvalue().encode("utf-8")
+    return StreamingResponse(iter([data]), media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="signal_rule_thresholds.csv"'}
+    )

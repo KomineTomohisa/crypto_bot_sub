@@ -3901,9 +3901,9 @@ class CryptoTradingBot:
             symbol,
             timeframe,
             version=version,
-            user_id=getattr(self, "user_id", None),
-            strategy_id=getattr(self, "strategy_id", None),
-            only_open_ended=True,  # ← 追加
+            user_id=1,  # 固定
+            strategy_id='ST0001',  # 固定
+            only_open_ended=True,
         )
         if not rules:
             self.logger.info(f"[rules][{symbol}] no active rules (timeframe={timeframe}, version={version})")
@@ -6370,17 +6370,30 @@ class CryptoTradingBot:
                                             f"stmt={getattr(e,'statement',None)} params={getattr(e,'params',None)}")
                             raise
 
-                        # 2) positions
-                        if self.position_ids.get(symbol):
+                        # 2) positions（position_id フォールバック付き）
+                        # 優先順: キャッシュ -> Tx前に掴んだID -> close_resultsに含まれるID
+                        pos_id_for_update = (
+                            (self.position_ids.get(symbol) or None)
+                            or (entry_pos_id_for_trade or None)
+                            or (next((r.get("position_id") for r in close_results if r.get("success") and r.get("position_id")), None))
+                        )
+                        if pos_id_for_update:
                             sid = to_uuid_or_none(getattr(self, "strategy_id", None))
-                            _dbg_dump("before upsert_position",
-                                    position_id=str(self.position_ids[symbol]), symbol=symbol, side=side_trade,
-                                    size=0.0, avg_entry_price=float(self.entry_prices.get(symbol) or 0.0),
-                                    updated_at=exec_at, strategy_id=sid, user_id=getattr(self,"user_id",None),
-                                    source=default_source_from_env(self))
+                            _dbg_dump(
+                                "before upsert_position",
+                                position_id=str(pos_id_for_update),
+                                symbol=symbol,
+                                side=side_trade,
+                                size=0.0,
+                                avg_entry_price=float(self.entry_prices.get(symbol) or 0.0),
+                                updated_at=exec_at,
+                                strategy_id=sid,
+                                user_id=getattr(self, "user_id", None),
+                                source=default_source_from_env(self),
+                            )
                             try:
                                 upsert_position(
-                                    position_id=str(self.position_ids[symbol]),
+                                    position_id=str(pos_id_for_update),
                                     symbol=symbol,
                                     side=side_trade,
                                     size=0.0,
@@ -6394,9 +6407,16 @@ class CryptoTradingBot:
                                     conn=conn,
                                 )
                             except Exception as e:
-                                self.logger.error(f"[TXERR] upsert_position failed: {type(e).__name__} orig={getattr(e,'orig',None)} "
-                                                f"stmt={getattr(e,'statement',None)} params={getattr(e,'params',None)}")
+                                self.logger.error(
+                                    f"[TXERR] upsert_position failed: {type(e).__name__} orig={getattr(e,'orig',None)} "
+                                    f"stmt={getattr(e,'statement',None)} params={getattr(e,'params',None)}"
+                                )
                                 raise
+                        else:
+                            self.logger.warning(
+                                "[TXWARN] skip upsert_position: position_id not found "
+                                f"(symbol={symbol}, cache={self.position_ids.get(symbol)}, entry_pos_id_for_trade={entry_pos_id_for_trade})"
+                            )
 
                         # 3) trades
                         _dbg_dump("before insert_trade",
