@@ -53,7 +53,7 @@ export default async function RulesPage({
   const rules = await fetchRules(usp);
 
   return (
-    <main className="p-6 md:p-8 max-w-[1100px] mx-auto space-y-8">
+    <main className="p-6 md:p-8 max-w-4xl mx-auto space-y-8">
       <PageHeader
         title="Signal Rule Thresholds"
         description={
