@@ -714,9 +714,9 @@ class CryptoTradingBot:
         
         # 取引サイズ設定
         if self.test_mode:
-            self.TRADE_SIZE = 10000  # テストモード
+            self.TRADE_SIZE = 20000  # テストモード
         else:
-            self.TRADE_SIZE = 10000  # 通常取引額
+            self.TRADE_SIZE = 20000  # 通常取引額
             
         # API呼び出し制限管理
         self.last_api_call = time.time() - 1
