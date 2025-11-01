@@ -349,6 +349,35 @@ def fetch_signal_rules(
         }).mappings().all()
     return [dict(r) for r in rows]
 
+def get_user_email_and_pw(user_id: int) -> Dict[str, Optional[str]]:
+    """
+    SIM通知用：user.id から宛先メールと（必要なら）暗号化済みメールパスワードを返す。
+    password_hash はここでは使わず、別用途（ログイン等）。
+    """
+    with begin() as conn:
+        row = conn.execute(text("""
+            SELECT
+              COALESCE(email, '') AS email,
+              COALESCE(email_password_encrypted, '') AS email_password_encrypted,
+              COALESCE(email_enabled, TRUE) AS email_enabled
+            FROM "user"
+            WHERE id = :uid
+            LIMIT 1
+        """), {"uid": user_id}).fetchone()
+        if not row:
+            return {"email": None, "email_password_encrypted": None, "email_enabled": None}
+        return {
+            "email": row[0] or None,
+            "email_password_encrypted": row[1] or None,
+            "email_enabled": bool(row[2]),
+        }
+
+# （必要なら）
+def get_user_password_hash(user_id: int) -> Optional[str]:
+    with begin() as conn:
+        row = conn.execute(text('SELECT password_hash FROM "user" WHERE id = :uid'), {"uid": user_id}).fetchone()
+        return row[0] if row and row[0] else None
+
 # -----------------------------------------------------------------------------
 # 書き込み系（すべて conn オプションを受け取り、_exec(..., conn=conn) で統一）
 # -----------------------------------------------------------------------------
