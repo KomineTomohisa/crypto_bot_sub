@@ -580,21 +580,42 @@ def insert_signal(
     status: Optional[str] = "new",
     raw: Optional[Dict[str, Any]] = None,
     source: Optional[str] = None,
-    conn: Optional[Connection] = None,  # ← ここはそのままでOK
+    conn: Optional[Connection] = None,
+    **extra_cols,
 ) -> str:
     sid = signal_id or str(uuid4())
-    stmt = sa.text("""
-        INSERT INTO signals (
-            signal_id, user_id, symbol, timeframe, side, strength_score,
-            rsi, adx, atr, di_plus, di_minus, ema_fast, ema_slow, price,
-            generated_at, strategy_id, version, status, raw, source
-        ) VALUES (
-            :signal_id, :user_id, :symbol, :timeframe, :side, :strength_score,
-            :rsi, :adx, :atr, :di_plus, :di_minus, :ema_fast, :ema_slow, :price,
-            :generated_at, :strategy_id, :version, :status, :raw, :source
-        )
+    # 追加カラムのホワイトリスト（DDLに合わせて必要に応じ拡張）
+    allowed_extras = {
+        # 便利カラム（最小）
+        "buy_signal", "sell_signal", "reason_tags", "rule_hits",
+        # 指標系（既にDDLへ追加済み想定）
+        "cci","mfi","sma_fast","sma_slow","bb_upper","bb_middle","bb_lower",
+        "macd","macd_signal","macd_hist","stoch_k","stoch_d",
+        "volatility","trend_strength",
+        # スコア系
+        "rsi_score_long","rsi_score_short","adx_score_long","adx_score_short",
+        "atr_score_long","atr_score_short","cci_score_long","cci_score_short",
+        "ma_score_long","ma_score_short","bb_score_long","bb_score_short",
+        "score_breakdown",
+    }
+    # 許可されたキーだけ拾う（None はそのまま渡せる。型はDB側でNUMERIC/JSONB等）
+    extras = {k: v for k, v in (extra_cols or {}).items() if k in allowed_extras}
+
+    base_cols = [
+        "signal_id","user_id","symbol","timeframe","side","strength_score",
+        "rsi","adx","atr","di_plus","di_minus","ema_fast","ema_slow","price",
+        "generated_at","strategy_id","version","status","raw","source",
+    ]
+    all_cols = base_cols + list(extras.keys())
+    placeholders = [f":{c}" for c in all_cols]
+
+    sql = f"""
+        INSERT INTO signals ({", ".join(all_cols)})
+        VALUES ({", ".join(placeholders)})
         ON CONFLICT (signal_id) DO NOTHING
-    """)
+    """
+    stmt = sa.text(sql)
+
     params = dict(
         signal_id=sid,
         user_id=user_id,
@@ -612,6 +633,7 @@ def insert_signal(
         raw=_jsonable(raw),
         source=source,
     )
+    params.update(extras)
     _exec(stmt, params, conn)
     return sid
 

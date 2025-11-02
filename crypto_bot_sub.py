@@ -569,15 +569,84 @@ class CryptoTradingBot:
                    version: str | None = None,
                    status: str = "new",
                    raw: dict | None = None,
-                   signal_id: str | None = None) -> str:
+                   signal_id: str | None = None,
+                   df_row: "pd.Series | None" = None,
+                   scores: dict | None = None,
+                   reason_tags: "list[str] | None" = None,
+                   rule_hits: "list[dict] | None" = None,
+                   buy_signal: bool | None = None,
+                   sell_signal: bool | None = None) -> str:
         try:
-            rsi = indicators.get("RSI") if indicators else None
-            adx = indicators.get("ADX") if indicators else None
-            atr = indicators.get("ATR") if indicators else None
-            di_p = indicators.get("DI+") if indicators else None
-            di_m = indicators.get("DI-") if indicators else None
-            ema_fast = indicators.get("EMA_fast") if indicators else None
-            ema_slow = indicators.get("EMA_slow") if indicators else None
+            # 1) まず呼び出し側から渡ってきた指標をベースに
+            indicators = indicators or {}
+            rsi      = indicators.get("RSI")
+            adx      = indicators.get("ADX")
+            atr      = indicators.get("ATR")
+            di_p     = indicators.get("DI+")
+            di_m     = indicators.get("DI-")
+            ema_fast = indicators.get("EMA_fast")
+            ema_slow = indicators.get("EMA_slow")
+
+            # 2) DFの最新行があれば、signalsテーブルの残り指標を可能な限り補完
+            def _get(dfrow, *names):
+                if dfrow is None: return None
+                for n in names:
+                    if n in dfrow and dfrow[n] is not None:
+                        try: return float(dfrow[n])
+                        except Exception: pass
+                return None
+
+            cci        = _get(df_row, "CCI", "cci")
+            mfi        = _get(df_row, "MFI", "mfi")
+            sma_fast   = _get(df_row, "SMA_fast", "sma_fast")
+            sma_slow   = _get(df_row, "SMA_slow", "sma_slow")
+            bb_upper   = _get(df_row, "BB_upper", "bb_upper")
+            bb_middle  = _get(df_row, "BB_middle", "bb_middle")
+            bb_lower   = _get(df_row, "BB_lower", "bb_lower")
+            macd       = _get(df_row, "MACD", "macd")
+            macd_sig   = _get(df_row, "MACD_signal", "macd_signal")
+            macd_hist  = _get(df_row, "MACD_hist", "macd_hist")
+            stoch_k    = _get(df_row, "Stoch_K", "stoch_k", "%K", "stoch_k_fast")
+            stoch_d    = _get(df_row, "Stoch_D", "stoch_d", "%D", "stoch_d_fast")
+            volatility = _get(df_row, "volatility")
+            trend_str  = _get(df_row, "trend_strength")
+
+            # 3) スコア群（rsi_score_long など）を辞書から拾い、score_breakdown も自動生成
+            scores = scores or {}
+            # 既存のentry_scores/signal_data からも補完（本体に同様の保存がある実装）:
+            # 例: self.entry_scores[symbol] に多数の *_score_* が格納されている箇所があるため流用すると埋まりやすいです。:contentReference[oaicite:2]{index=2}
+            if not scores and isinstance(getattr(self, "entry_scores", {}).get(symbol, None), dict):
+                scores = dict(self.entry_scores[symbol])
+
+            def _s(key): 
+                v = scores.get(key)
+                try: return float(v) if v is not None else None
+                except Exception: return None
+
+            rsi_sl  = _s("rsi_score_long");   rsi_ss  = _s("rsi_score_short")
+            adx_sl  = _s("adx_score_long");   adx_ss  = _s("adx_score_short")
+            atr_sl  = _s("atr_score_long");   atr_ss  = _s("atr_score_short")
+            cci_sl  = _s("cci_score_long");   cci_ss  = _s("cci_score_short")
+            ma_sl   = _s("ma_score_long");    ma_ss   = _s("ma_score_short")
+            bb_sl   = _s("bb_score_long");    bb_ss   = _s("bb_score_short")
+
+            # JSONB 用の score_breakdown を自動生成（*_score_* を集約）
+            score_breakdown = {}
+            for k, v in (scores or {}).items():
+                if "score" in k and (isinstance(v, (int, float)) or (isinstance(v, str) and v.replace('.','',1).isdigit())):
+                    try: score_breakdown[k] = float(v)
+                    except Exception: pass
+            score_breakdown = score_breakdown or None
+
+            # 4) 原因タグ/ルールヒットは raw に入っていれば拾う（優先度: 引数 > raw）
+            if isinstance(raw, dict):
+                reason_tags = reason_tags or raw.get("reason_tags")
+                rule_hits   = rule_hits   or raw.get("rule_hits")
+
+            # 5) buy/sell フラグは side から自動導出（明示指定があればそれを優先）
+            if buy_signal is None and sell_signal is None:
+                buy_signal  = True  if side == "long"  else False
+                sell_signal = True  if side == "short" else False
 
             sid = insert_signal(
                 user_id=getattr(self, "user_id", None),
@@ -588,6 +657,23 @@ class CryptoTradingBot:
                 rsi=rsi, adx=adx, atr=atr,
                 di_plus=di_p, di_minus=di_m,
                 ema_fast=ema_fast, ema_slow=ema_slow,
+                # --- 指標スナップショットの補完値を渡す ---
+                cci=cci, mfi=mfi, sma_fast=sma_fast, sma_slow=sma_slow,
+                bb_upper=bb_upper, bb_middle=bb_middle, bb_lower=bb_lower,
+                macd=macd, macd_signal=macd_sig, macd_hist=macd_hist,
+                stoch_k=stoch_k, stoch_d=stoch_d,
+                volatility=volatility, trend_strength=trend_str,
+                # --- スコア群 & breakdown ---
+                rsi_score_long=rsi_sl, rsi_score_short=rsi_ss,
+                adx_score_long=adx_sl, adx_score_short=adx_ss,
+                atr_score_long=atr_sl, atr_score_short=atr_ss,
+                cci_score_long=cci_sl, cci_score_short=cci_ss,
+                ma_score_long=ma_sl,   ma_score_short=ma_ss,
+                bb_score_long=bb_sl,   bb_score_short=bb_ss,
+                score_breakdown=score_breakdown,
+                # --- シグナル確定情報 ---
+                buy_signal=buy_signal, sell_signal=sell_signal,
+                reason_tags=reason_tags, rule_hits=rule_hits,
                 price=price,
                 strategy_id=strategy_id, version=version,
                 status=status,
@@ -2778,6 +2864,28 @@ class CryptoTradingBot:
                 "EMA_fast": ema_fast, "EMA_slow": ema_slow,
             } if any(v is not None for v in [rsi, adx, atr, di_plus, di_minus, ema_fast, ema_slow]) else None
 
+            # 可能なら 5m の最新行を掴む（環境によっては self.df_5min 等のキャッシュ名が異なる想定。無ければ None のまま）
+            df_row_latest = None
+            try:
+                # 例: self.df_cache[("5m", symbol)] や self.df_5min[symbol] 等のキャッシュがある場合に対応
+                df_obj = None
+                if hasattr(self, "df_5min") and isinstance(self.df_5min, dict) and symbol in self.df_5min and len(self.df_5min[symbol]) > 0:
+                    df_obj = self.df_5min[symbol]
+                elif hasattr(self, "latest_df_5min") and isinstance(self.latest_df_5min, dict) and symbol in self.latest_df_5min and len(self.latest_df_5min[symbol]) > 0:
+                    df_obj = self.latest_df_5min[symbol]
+                if df_obj is not None:
+                    df_row_latest = df_obj.iloc[-1]
+            except Exception:
+                df_row_latest = None
+
+            # スコア辞書（あれば最大限渡す）。既存実装では entry_scores/signal_data にスコア群が格納される箇所あり。:contentReference[oaicite:4]{index=4}
+            scores_dict = None
+            try:
+                if isinstance(getattr(self, "entry_scores", {}).get(symbol, None), dict):
+                    scores_dict = dict(self.entry_scores[symbol])
+            except Exception:
+                scores_dict = None
+
             signal_id = self._record_signal(
                 symbol=symbol,
                 timeframe=timeframe or "15m",
@@ -2788,7 +2896,9 @@ class CryptoTradingBot:
                 strategy_id=strategy_id,
                 version=version,
                 status="new",
-                raw=(signal_raw or {}) | {"source": "execute_order_with_confirmation/pre_order"}
+                raw=(signal_raw or {}) | {"source": "execute_order_with_confirmation/pre_order"},
+                df_row=df_row_latest,
+                scores=scores_dict,
             )
         except Exception as e:
             self.logger.warning(f"シグナル事前記録スキップ: {e}")
