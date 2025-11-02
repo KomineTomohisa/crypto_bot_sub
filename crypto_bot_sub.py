@@ -60,6 +60,7 @@ try:
 except ImportError:
     from daily_report import build_daily_report_message
 from typing import Optional, List, Dict, Tuple, Any
+from email.header import Header
 import datetime as dt
 JST = timezone(timedelta(hours=9))
 
@@ -338,6 +339,39 @@ class GMOCoinAPI:
         return self._request("POST", path, data=data)
 
 class CryptoTradingBot:
+    def _is_live_mode(self) -> bool:
+        """
+        ランタイム状態から LIVE かどうかを堅牢に判定する。
+        優先順位:
+        1) self.mode が "live" / ("paper","sim","simulation","backtest")
+        2) self.exchange_settings_gmo.get("live_trade")
+        3) self.live_trade (bool フラグ)
+        """
+        # 1) 明示 mode 優先
+        mode = getattr(self, "mode", None)
+        if isinstance(mode, str):
+            m = mode.lower()
+            if m == "live":
+                return True
+            if m in ("paper", "sim", "simulation", "backtest"):
+                return False
+
+        # 2) 設定での明示フラグ
+        es = getattr(self, "exchange_settings_gmo", {}) or {}
+        if isinstance(es, dict) and "live_trade" in es:
+            # True/False が入っている前提。None などはスキップ
+            val = es.get("live_trade")
+            if isinstance(val, bool):
+                return val
+
+        # 3) 後方互換: 単独フラグ
+        return bool(getattr(self, "live_trade", False))
+
+
+    def _is_sim_mode(self) -> bool:
+        """LIVE でなければ SIM/PAPER/BACKTEST とみなす簡易判定"""
+        return not self._is_live_mode()
+
     def _prepare_trade_logs_for_excel_report(self, trade_logs):
         """Excel レポート用に取引ログを準備"""
         try:
@@ -1092,44 +1126,156 @@ class CryptoTradingBot:
                 self.logger.warning(f"LINEマルチキャスト失敗 count={len(ids)}")
         except Exception as e:
             self.logger.warning(f"LINEマルチキャスト エラー: {e}")
+
+    def _resolve_recipients_for_mode(self) -> list[str]:
+        """
+        live: 既存の notification_settings['email']['recipient']（ENV/Service由来）を使用
+        sim : DBの user.email を優先。なければ従来の recipient/ENV フォールバック
+        """
+        recipients: list[str] = []
+        is_live = self._is_live_mode()
+
+        if is_live:
+            # live は従来通り（service/ENV）だけを見る
+            try:
+                rcpt = (self.notification_settings or {}).get("email", {}).get("recipient")
+                if rcpt:
+                    recipients.append(rcpt)
+            except Exception:
+                pass
+        else:
+            # sim：DB優先
+            try:
+                if getattr(self, "user_id", None) is not None:
+                    from db import get_user_email_and_pw
+                    info = get_user_email_and_pw(self.user_id)
+                    if info.get("email_enabled", True):
+                        db_mail = info.get("email")
+                        if db_mail:
+                            recipients.append(db_mail)
+            except Exception as e:
+                self.logger.debug(f"SIM宛先DB取得エラー: {e}")
+
+            # 念のためのフォールバック（従来設定やENV）
+            try:
+                fallback = (self.notification_settings or {}).get("email", {}).get("recipient")
+                if fallback and fallback not in recipients:
+                    recipients.append(fallback)
+            except Exception:
+                pass
+            env_fallback = os.getenv("EMAIL_FALLBACK_RECIPIENT", "")
+            if env_fallback and env_fallback not in recipients:
+                recipients.append(env_fallback)
+
+        return recipients
+
+    def _resolve_smtp_password_for_mode(self, default_pw: str) -> str:
+        if self._is_live_mode():
+            return default_pw
+        try:
+            if getattr(self, "user_id", None) is not None:
+                from db import get_user_email_and_pw
+                info = get_user_email_and_pw(self.user_id, decrypt=True)  # ★復号オン
+                pw_plain = (info or {}).get("email_password_plain")
+                if pw_plain:
+                    return pw_plain
+                enc = (info or {}).get("email_password_encrypted")
+                if enc:
+                    # 復号鍵未設定などで平文が取れない場合の後方互換（従来の暫定）
+                    return enc
+        except Exception as e:
+            self.logger.debug(f"SMTPパスワード解決エラー: {e}")
+        return default_pw
+
+    def notify_users_by_email(self, user_ids: list[int], subject: str, body: str) -> int:
+        """
+        user_ids の email に一括送信（enabled=trueのみ）。戻り値は送信件数。
+        - LIVE/SIM問わず利用可能（SIMでは件名に [SIM] を付与すると安全）
+        """
+        try:
+            from db import get_emails_for_users
+            recipients = list(dict.fromkeys(get_emails_for_users(user_ids, only_enabled=True)))  # 重複除去
+            if not recipients:
+                self.logger.info("notify_users_by_email: 宛先なし")
+                return 0
+
+            email_settings = (self.notification_settings or {}).get('email', {}) or {}
+            required = ['smtp_server', 'smtp_port', 'sender', 'password']
+            if any(not email_settings.get(k) for k in required):
+                self.logger.warning(f"メール設定不足: {required}")
+                return 0
+
+            # SIM時は件名タグ & パスワード復号
+            _subject = f"[SIM] {subject}" if self._is_sim_mode() else subject
+            smtp_password = self._resolve_smtp_password_for_mode(email_settings['password'])
+
+            import smtplib
+            from email.mime.text import MIMEText
+            from email.mime.multipart import MIMEMultipart
+
+            sent = 0
+            with smtplib.SMTP(email_settings['smtp_server'], email_settings['smtp_port'], timeout=20) as server:
+                server.starttls()
+                server.login(email_settings['sender'], smtp_password)
+
+                for rcpt in recipients:
+                    msg = MIMEMultipart()
+                    msg['From'] = email_settings['sender']
+                    msg['To'] = rcpt
+                    msg['Subject'] = str(Header(_subject, 'utf-8'))
+                    msg.attach(MIMEText(body, 'plain', 'utf-8'))
+                    server.sendmail(email_settings['sender'], rcpt, msg.as_string())
+                    sent += 1
+
+            self.logger.info(f"notify_users_by_email: 送信成功 {sent}件")
+            return sent
+        except Exception as e:
+            self.logger.error(f"notify_users_by_email エラー: {e}")
+            return 0
     
     def _send_email(self, subject, body):
-        """メール送信
-        
-        Parameters:
-        subject (str): メールの件名
-        body (str): メールの本文
-        """
-        if not self.notification_settings['enabled']:
+        if not (self.notification_settings or {}).get('enabled', False):
             return
-
         try:
-            email_settings = self.notification_settings['email']
-
-            # 必要な設定がすべて揃っているか確認
-            required_settings = ['smtp_server', 'smtp_port', 'sender', 'password', 'recipient']
-            missing_settings = [s for s in required_settings if not email_settings.get(s)]
-            
-            if missing_settings:
-                self.logger.warning(f"メール設定が不完全です。不足: {missing_settings}")
+            email_settings = (self.notification_settings or {}).get('email', {}) or {}
+            required_settings = ['smtp_server', 'smtp_port', 'sender', 'password']
+            missing = [s for s in required_settings if not email_settings.get(s)]
+            if missing:
+                self.logger.warning(f"メール設定が不完全: {missing}")
                 return
-            
-            msg = MIMEMultipart()
-            msg['From'] = email_settings['sender']
-            msg['To'] = email_settings['recipient']
-            msg['Subject'] = subject
-            
-            msg.attach(MIMEText(body, 'plain'))
-            
-            server = smtplib.SMTP(email_settings['smtp_server'], email_settings['smtp_port'])
-            server.starttls()
-            server.login(email_settings['sender'], email_settings['password'])
-            text = msg.as_string()
-            server.sendmail(email_settings['sender'], email_settings['recipient'], text)
-            server.quit()
 
-            self.logger.info("メール送信成功")
-            
+            recipients = self._resolve_recipients_for_mode()
+            if not recipients:
+                self.logger.info("宛先なしのためスキップ")
+                return
+
+            # ★SIMタグ & 復号パスワード
+            _subject = f"[SIM] {subject}" if self._is_sim_mode() else subject
+            smtp_password = self._resolve_smtp_password_for_mode(email_settings['password'])
+
+            import smtplib, time
+            from email.mime.text import MIMEText
+            from email.mime.multipart import MIMEMultipart
+
+            for attempt in range(3):
+                try:
+                    with smtplib.SMTP(email_settings['smtp_server'], email_settings['smtp_port'], timeout=20) as server:
+                        server.starttls()
+                        server.login(email_settings['sender'], smtp_password)
+                        for rcpt in recipients:
+                            msg = MIMEMultipart()
+                            msg['From'] = email_settings['sender']
+                            msg['To'] = rcpt
+                            msg['Subject'] = str(Header(_subject, 'utf-8'))
+                            msg.attach(MIMEText(body, 'plain', 'utf-8'))
+                            server.sendmail(email_settings['sender'], rcpt, msg.as_string())
+                    self.logger.info(f"メール送信成功（{len(recipients)}件）")
+                    return
+                except Exception as e:
+                    self.logger.warning(f"SMTP送信失敗({attempt+1}/3): {e}")
+                    time.sleep(2 ** attempt)
+
+            self.logger.error("メール送信リトライ上限に到達し失敗")
         except Exception as e:
             self.logger.error(f"メール送信エラー: {e}")
 
@@ -3906,7 +4052,7 @@ class CryptoTradingBot:
             only_open_ended=True,
         )
         if not rules:
-            self.logger.info(f"[rules][{symbol}] no active rules (timeframe={timeframe}, version={version})")
+            #self.logger.info(f"[rules][{symbol}] no active rules (timeframe={timeframe}, version={version})")
             return
 
         total = len(df)
@@ -3941,7 +4087,7 @@ class CryptoTradingBot:
             if act != "disable":
                 continue
             if col not in df.columns:
-                self.logger.info(f"[rules][{symbol}] skip: missing column '{col}' for rule {r}")
+                #self.logger.info(f"[rules][{symbol}] skip: missing column '{col}' for rule {r}")
                 continue
 
             s = df[col]
@@ -3951,7 +4097,7 @@ class CryptoTradingBot:
             # ルールごとのヒット数を出力
             # 例: [rules][xrp_jpy] sell cci_score_short between 0.10~0.20 hits=12/480
             rng = f"{r.get('v1')}~{r.get('v2')}" if op == "between" else f"{r.get('v1')}"
-            self.logger.info(f"[rules][{symbol}] {trg} {col} {op} {rng} hits={hits}/{total}")
+            #self.logger.info(f"[rules][{symbol}] {trg} {col} {op} {rng} hits={hits}/{total}")
 
             # 実際の適用（buy/sell_signal を Falseに）
             if hits > 0:
@@ -3963,7 +4109,7 @@ class CryptoTradingBot:
 
         # ORユニオンのユニーク件数を出力
         union_hits = int(union_mask.sum())
-        self.logger.info(f"[rules][{symbol}] OR-union unique hits={union_hits}/{total}")
+        #self.logger.info(f"[rules][{symbol}] OR-union unique hits={union_hits}/{total}")
 
     def generate_signals_with_sentiment(self, symbol, df_5min, df_hourly):
         """市場センチメントを考慮したシグナル生成関数（改良版）
@@ -6991,7 +7137,7 @@ class CryptoTradingBot:
             self.opposite_narrow_state[symbol][position_type] = lock_on
 
             # ---- 適用 ----
-            opposite_streak_factor = 0.90  # 狭め係数（必要に応じて調整）
+            opposite_streak_factor = 0.9  # 狭め係数（必要に応じて調整）
             if lock_on:
                 sl_pct *= opposite_streak_factor
             # ======================================================================
