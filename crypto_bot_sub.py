@@ -60,6 +60,7 @@ try:
 except ImportError:
     from daily_report import build_daily_report_message
 from typing import Optional, List, Dict, Tuple, Any
+from email.header import Header
 import datetime as dt
 JST = timezone(timedelta(hours=9))
 
@@ -1170,53 +1171,50 @@ class CryptoTradingBot:
 
     def _resolve_smtp_password_for_mode(self, default_pw: str) -> str:
         if self._is_live_mode():
-            return default_pw  # liveは今のまま
+            return default_pw
         try:
             if getattr(self, "user_id", None) is not None:
                 from db import get_user_email_and_pw
-                info = get_user_email_and_pw(self.user_id)
-                enc = info.get("email_password_encrypted")
+                info = get_user_email_and_pw(self.user_id, decrypt=True)  # ★復号オン
+                pw_plain = (info or {}).get("email_password_plain")
+                if pw_plain:
+                    return pw_plain
+                enc = (info or {}).get("email_password_encrypted")
                 if enc:
-                    # ここで実プロジェクトの復号関数を呼ぶ想定
-                    # 例: from secrets_util import decrypt_secret
-                    # return decrypt_secret(enc)
-                    return enc  # 暫定：復号未実装ならそのまま文字列を使う
+                    # 復号鍵未設定などで平文が取れない場合の後方互換（従来の暫定）
+                    return enc
         except Exception as e:
             self.logger.debug(f"SMTPパスワード解決エラー: {e}")
         return default_pw
-    
-    def _send_email(self, subject, body):
-        """メール送信
-        
-        Parameters:
-        subject (str): メールの件名
-        body (str): メールの本文
+
+    def notify_users_by_email(self, user_ids: list[int], subject: str, body: str) -> int:
         """
-        if not (self.notification_settings or {}).get('enabled', False):
-            return
-
+        user_ids の email に一括送信（enabled=trueのみ）。戻り値は送信件数。
+        - LIVE/SIM問わず利用可能（SIMでは件名に [SIM] を付与すると安全）
+        """
         try:
-            email_settings = (self.notification_settings or {}).get('email', {}) or {}
-
-            # 必要な設定がすべて揃っているか確認
-            # recipient は本関数内で mode によって解決するため、チェック対象から外す
-            required_settings = ['smtp_server', 'smtp_port', 'sender', 'password']
-            missing_settings = [s for s in required_settings if not email_settings.get(s)]
-            
-            if missing_settings:
-                self.logger.warning(f"メール設定が不完全です。不足: {missing_settings}")
-                return
-            
-            # 1) 宛先解決（live=従来設定 / sim=DB優先）
-            recipients = self._resolve_recipients_for_mode()
+            from db import get_emails_for_users
+            recipients = list(dict.fromkeys(get_emails_for_users(user_ids, only_enabled=True)))  # 重複除去
             if not recipients:
-                self.logger.info("宛先メールが見つからないためメール送信をスキップ")
-                return
+                self.logger.info("notify_users_by_email: 宛先なし")
+                return 0
 
-            # 2) SIM時のみ、DBの暗号化パスワードで上書き可能
+            email_settings = (self.notification_settings or {}).get('email', {}) or {}
+            required = ['smtp_server', 'smtp_port', 'sender', 'password']
+            if any(not email_settings.get(k) for k in required):
+                self.logger.warning(f"メール設定不足: {required}")
+                return 0
+
+            # SIM時は件名タグ & パスワード復号
+            _subject = f"[SIM] {subject}" if self._is_sim_mode() else subject
             smtp_password = self._resolve_smtp_password_for_mode(email_settings['password'])
 
-            with smtplib.SMTP(email_settings['smtp_server'], email_settings['smtp_port']) as server:
+            import smtplib
+            from email.mime.text import MIMEText
+            from email.mime.multipart import MIMEMultipart
+
+            sent = 0
+            with smtplib.SMTP(email_settings['smtp_server'], email_settings['smtp_port'], timeout=20) as server:
                 server.starttls()
                 server.login(email_settings['sender'], smtp_password)
 
@@ -1224,12 +1222,60 @@ class CryptoTradingBot:
                     msg = MIMEMultipart()
                     msg['From'] = email_settings['sender']
                     msg['To'] = rcpt
-                    msg['Subject'] = subject
-                    msg.attach(MIMEText(body, 'plain'))
+                    msg['Subject'] = str(Header(_subject, 'utf-8'))
+                    msg.attach(MIMEText(body, 'plain', 'utf-8'))
                     server.sendmail(email_settings['sender'], rcpt, msg.as_string())
+                    sent += 1
 
-            self.logger.info(f"メール送信成功（{len(recipients)}件）")
-            
+            self.logger.info(f"notify_users_by_email: 送信成功 {sent}件")
+            return sent
+        except Exception as e:
+            self.logger.error(f"notify_users_by_email エラー: {e}")
+            return 0
+    
+    def _send_email(self, subject, body):
+        if not (self.notification_settings or {}).get('enabled', False):
+            return
+        try:
+            email_settings = (self.notification_settings or {}).get('email', {}) or {}
+            required_settings = ['smtp_server', 'smtp_port', 'sender', 'password']
+            missing = [s for s in required_settings if not email_settings.get(s)]
+            if missing:
+                self.logger.warning(f"メール設定が不完全: {missing}")
+                return
+
+            recipients = self._resolve_recipients_for_mode()
+            if not recipients:
+                self.logger.info("宛先なしのためスキップ")
+                return
+
+            # ★SIMタグ & 復号パスワード
+            _subject = f"[SIM] {subject}" if self._is_sim_mode() else subject
+            smtp_password = self._resolve_smtp_password_for_mode(email_settings['password'])
+
+            import smtplib, time
+            from email.mime.text import MIMEText
+            from email.mime.multipart import MIMEMultipart
+
+            for attempt in range(3):
+                try:
+                    with smtplib.SMTP(email_settings['smtp_server'], email_settings['smtp_port'], timeout=20) as server:
+                        server.starttls()
+                        server.login(email_settings['sender'], smtp_password)
+                        for rcpt in recipients:
+                            msg = MIMEMultipart()
+                            msg['From'] = email_settings['sender']
+                            msg['To'] = rcpt
+                            msg['Subject'] = str(Header(_subject, 'utf-8'))
+                            msg.attach(MIMEText(body, 'plain', 'utf-8'))
+                            server.sendmail(email_settings['sender'], rcpt, msg.as_string())
+                    self.logger.info(f"メール送信成功（{len(recipients)}件）")
+                    return
+                except Exception as e:
+                    self.logger.warning(f"SMTP送信失敗({attempt+1}/3): {e}")
+                    time.sleep(2 ** attempt)
+
+            self.logger.error("メール送信リトライ上限に到達し失敗")
         except Exception as e:
             self.logger.error(f"メール送信エラー: {e}")
 

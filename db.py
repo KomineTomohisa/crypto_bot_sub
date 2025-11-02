@@ -668,6 +668,61 @@ def mark_order_executed_with_fill(
     else:
         with begin() as c: _do(c)
 
+def get_user_email_and_pw(user_id: int, *, decrypt: bool = False):
+    """
+    ユーザー1名分の email / email_enabled / (必要なら) 復号済みパスワード を取得
+    戻り値: {'email': str|None, 'email_enabled': bool, 'email_password_encrypted': str|None, 'email_password_plain': str|None}
+    """
+    with begin() as conn:
+        if decrypt:
+            key = os.getenv("EMAIL_SMTP_SECRET_KEY", "")
+            sql = """
+                SELECT
+                email,
+                COALESCE(email_enabled, TRUE) AS email_enabled,
+                email_password_encrypted,
+                CASE
+                    WHEN email_password_encrypted IS NOT NULL AND :key <> '' THEN
+                    pgp_sym_decrypt(
+                        decode(email_password_encrypted, 'base64'),
+                        :key
+                    )
+                    ELSE NULL
+                END AS email_password_plain
+                FROM "user"
+                WHERE id = :uid
+            """
+            row = conn.execute(text(sql), {"uid": user_id, "key": key}).mappings().first()
+        else:
+            sql = """
+                SELECT
+                  email,
+                  COALESCE(email_enabled, TRUE) AS email_enabled,
+                  email_password_encrypted
+                FROM "user"
+                WHERE id = :uid
+            """
+            row = conn.execute(text(sql), {"uid": user_id}).mappings().first()
+
+    return dict(row) if row else {"email": None, "email_enabled": True, "email_password_encrypted": None, "email_password_plain": None}
+
+def get_emails_for_users(user_ids: list[int], *, only_enabled: bool = True) -> list[str]:
+    """
+    複数ユーザーの通知先メールをリストで返す（NULL/無効は除外）
+    """
+    if not user_ids:
+        return []
+    with begin() as conn:
+        sql = """
+            SELECT email
+            FROM "user"
+            WHERE id = ANY(:uids)
+            AND email IS NOT NULL
+            AND (:only_enabled = FALSE OR COALESCE(email_enabled, TRUE) = TRUE)
+        """
+        rows = conn.execute(text(sql), {"uids": user_ids, "only_enabled": only_enabled}).fetchall()
+    return [r[0] for r in rows]
+
 # -----------------------------------------------------------------------------
 # LINE関連（必要に応じて呼び出し側Txへ参加可のものは conn を増設）
 # -----------------------------------------------------------------------------
