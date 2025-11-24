@@ -601,6 +601,10 @@ def insert_signal(
     # 許可されたキーだけ拾う（None はそのまま渡せる。型はDB側でNUMERIC/JSONB等）
     extras = {k: v for k, v in (extra_cols or {}).items() if k in allowed_extras}
 
+    # ★ 追加: score_breakdown を JSON 化
+    if "score_breakdown" in extras and isinstance(extras["score_breakdown"], dict):
+        extras["score_breakdown"] = _jsonable(extras["score_breakdown"])
+
     base_cols = [
         "signal_id","user_id","symbol","timeframe","side","strength_score",
         "rsi","adx","atr","di_plus","di_minus","ema_fast","ema_slow","price",
