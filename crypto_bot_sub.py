@@ -3997,8 +3997,9 @@ class CryptoTradingBot:
                 df_5min.loc[df_5min['ma_score_long'].between(0.145, 0.195),'buy_signal'] = False
                 df_5min.loc[df_5min['ma_score_short'].between(0.191, 0.225),'sell_signal'] = False
                 df_5min.loc[df_5min['cci_score_long'].between(0.553, 0.606),'buy_signal'] = False
+                df_5min.loc[df_5min['cci_score_long'].between(0.715, 0.845),'buy_signal'] = False
                 df_5min.loc[df_5min['cci_score_short'] > 0.933, 'sell_signal'] = False
-                df_5min.loc[df_5min['cci_score_short'].between(0.34, 0.35),'sell_signal'] = False
+                df_5min.loc[df_5min['cci_score_short'].between(0.315, 0.377),'sell_signal'] = False
                 df_5min.loc[df_5min['adx_score_long'] > 0.997, 'buy_signal'] = False
                 df_5min.loc[df_5min['bb_score_long'].between(0.143, 0.21),'buy_signal'] = False
                 df_5min.loc[df_5min['bb_score_long'].between(0.35, 0.375),'buy_signal'] = False
@@ -4030,11 +4031,11 @@ class CryptoTradingBot:
                 df_5min.loc[df_5min['cci_score_long'].between(0.447, 0.488),'buy_signal'] = False
                 df_5min.loc[df_5min['cci_score_short'].between(0.3, 0.355),'sell_signal'] = False
                 df_5min.loc[df_5min['cci_score_short'].between(0.428, 0.496),'sell_signal'] = False
-                df_5min.loc[df_5min['bb_score_long'].between(0.2, 0.235),'buy_signal'] = False
+                df_5min.loc[df_5min['bb_score_long'].between(0.14, 0.235),'buy_signal'] = False
                 df_5min.loc[df_5min['bb_score_long'].between(0.425, 0.49),'buy_signal'] = False
                 df_5min.loc[df_5min['bb_score_short'].between(0.457, 0.552),'sell_signal'] = False
                 df_5min.loc[df_5min['bb_score_short'] > 0.571, 'sell_signal'] = False
-                df_5min.loc[df_5min['ma_score_long'].between(0.2, 0.223),'buy_signal'] = False
+                df_5min.loc[df_5min['ma_score_long'].between(0.14, 0.223),'buy_signal'] = False
                 df_5min.loc[df_5min['ma_score_short'].between(0.0566, 0.0848),'sell_signal'] = False
                 df_5min.loc[df_5min['mfi_score_long'].between(0.215, 0.23),'buy_signal'] = False
                 df_5min.loc[df_5min['mfi_score_long'].between(0.283, 0.309),'buy_signal'] = False
@@ -4059,6 +4060,7 @@ class CryptoTradingBot:
                 df_5min.loc[df_5min['rsi_score_short'].between(0.247, 0.372),'sell_signal'] = False
                 df_5min.loc[df_5min['bb_score_long'].between(0.315, 0.37),'buy_signal'] = False
                 df_5min.loc[df_5min['bb_score_short'] > 0.534, 'sell_signal'] = False
+                df_5min.loc[df_5min['mfi_score_long'].between(0.57, 0.65),'buy_signal'] = False
                 df_5min.loc[df_5min['mfi_score_short'] > 0.62, 'sell_signal'] = False
                 df_5min.loc[df_5min['cci_score_long'] > 0.786, 'buy_signal'] = False
                 df_5min.loc[df_5min['cci_score_long'].between(0.25, 0.296),'buy_signal'] = False
@@ -4096,7 +4098,7 @@ class CryptoTradingBot:
                 df_5min.loc[df_5min['adx_score_long'].between(0.468, 0.562),'buy_signal'] = False
                 df_5min.loc[df_5min['adx_score_short'].between(0.11, 0.145),'sell_signal'] = False
                 df_5min.loc[df_5min['adx_score_short'].between(0.217, 0.305),'sell_signal'] = False
-                df_5min.loc[df_5min['rsi_score_long'].between(0.3, 0.42),'buy_signal'] = False
+                df_5min.loc[df_5min['rsi_score_long'].between(0.3, 0.515),'buy_signal'] = False
                 df_5min.loc[df_5min['rsi_score_long'].between(0.446, 0.485),'buy_signal'] = False
                 df_5min.loc[df_5min['rsi_score_short'].between(0.12, 0.21),'sell_signal'] = False
                 df_5min.loc[df_5min['mfi_score_long'].between(0.15, 0.23),'buy_signal'] = False
@@ -7112,23 +7114,40 @@ class CryptoTradingBot:
 
     def calculate_dynamic_exit_levels(self, symbol, df_5min, position_type, entry_price):
         """
-        通貨ペア・ポジションタイプ別のATR & ADXに応じて、利確・損切レベルを調整
+        通貨ペア・ポジションタイプ別のATR & ADXに応じて、
+        基本SLはあまり動かさず、TPをメインで調整する戦略
+        （ロングはTPを伸ばしすぎず、SLはやや守備的に寄せる）
         """
         try:
-            # 最新ATRの取得
+            # ========= ATR / ADX の安全取得 =========
             atr_series = df_5min['ATR'].dropna()
-            if atr_series.empty:
+            if len(atr_series) == 0:
                 raise ValueError("ATRデータが存在しません。")
-            atr = atr_series.iloc[-2]
+            elif len(atr_series) == 1:
+                atr = atr_series.iloc[-1]
+            else:
+                atr = atr_series.iloc[-2]
 
-            # 最新ADXの取得
             adx_series = df_5min['ADX'].dropna()
-            adx = adx_series.iloc[-2] if not adx_series.empty else None
+            if len(adx_series) == 0:
+                adx = None
+                adx_prev = None
+            else:
+                adx = adx_series.iloc[-2] if len(adx_series) >= 2 else adx_series.iloc[-1]
+                adx_prev = adx_series.iloc[-3] if len(adx_series) >= 3 else adx
 
-            plus_di = df_5min['DI+'].dropna().iloc[-2] if 'DI+' in df_5min.columns else None
-            minus_di = df_5min['DI-'].dropna().iloc[-2] if 'DI-' in df_5min.columns else None
+            plus_di = None
+            minus_di = None
+            if 'DI+' in df_5min.columns:
+                di_plus_series = df_5min['DI+'].dropna()
+                if len(di_plus_series) >= 1:
+                    plus_di = di_plus_series.iloc[-2] if len(di_plus_series) >= 2 else di_plus_series.iloc[-1]
+            if 'DI-' in df_5min.columns:
+                di_minus_series = df_5min['DI-'].dropna()
+                if len(di_minus_series) >= 1:
+                    minus_di = di_minus_series.iloc[-2] if len(di_minus_series) >= 2 else di_minus_series.iloc[-1]
 
-            # ベースのTP/SL設定取得
+            # ========= ベースのTP/SL設定取得 =========
             base = self._get_dynamic_profit_loss_settings(symbol, df_5min)
             if position_type == 'long':
                 tp_ratio = base['long_profit_take']
@@ -7140,58 +7159,148 @@ class CryptoTradingBot:
             base_tp_pct = abs(tp_ratio - 1.0)
             base_sl_pct = abs(sl_ratio - 1.0)
 
-            # 通貨ペア別ATR倍率設定
+            # ========= 通貨ペア別 ATR 設定 =========
+            # ロング側は「TPを伸ばしすぎない」方針で high_mult_long_tp を 1.0 付近に揃える
             atr_thresholds = {
-                'ltc_jpy': {'low': 60, 'high': 75, 'low_mult': 0.88, 'high_mult_long': 1.10, 'high_mult_short': 1.10},
-                'ada_jpy': {'low': 0.50, 'high': 0.57, 'low_mult': 0.88, 'high_mult_long': 1.10, 'high_mult_short': 1.07},
-                'xrp_jpy': {'low': 1.5, 'high': 2.1, 'low_mult': 0.95, 'high_mult_long': 1.00, 'high_mult_short': 0.90},
-                'eth_jpy': {'low': 2000, 'high': 2500, 'low_mult': 0.92, 'high_mult_long': 1.00, 'high_mult_short': 1.10},
-                'sol_jpy': {'low': 100, 'high': 140, 'low_mult': 0.88, 'high_mult_long': 1.10, 'high_mult_short': 1.03},
-                'doge_jpy': {'low': 0.20, 'high': 0.24, 'low_mult': 0.93, 'high_mult_long': 0.95, 'high_mult_short': 1.00},
-                'bcc_jpy': {'low': 310, 'high': 350, 'low_mult': 0.88, 'high_mult_long': 1.08, 'high_mult_short': 1.08}
+                'ltc_jpy': {
+                    'low': 60,   'high': 75,
+                    'low_mult_tp': 0.95,
+                    'high_mult_long_tp': 1.00,   # ★ ロングは伸ばさない
+                    'high_mult_short_tp': 1.10,
+                },
+                'ada_jpy': {
+                    'low': 0.50, 'high': 0.57,
+                    'low_mult_tp': 0.95,
+                    'high_mult_long_tp': 1.00,   # ★ ロングは伸ばさない
+                    'high_mult_short_tp': 1.07,
+                },
+                'xrp_jpy': {
+                    'low': 1.5,  'high': 2.1,
+                    'low_mult_tp': 0.95,
+                    'high_mult_long_tp': 1.02,   # ★ XRPはややマシなので少しだけ許容
+                    'high_mult_short_tp': 1.00,
+                },
+                'eth_jpy': {
+                    'low': 2000, 'high': 2500,
+                    'low_mult_tp': 0.95,
+                    'high_mult_long_tp': 1.00,   # ★ ロング性能悪いので伸ばさない
+                    'high_mult_short_tp': 1.10,
+                },
+                'sol_jpy': {
+                    'low': 100,  'high': 140,
+                    'low_mult_tp': 0.95,
+                    'high_mult_long_tp': 1.00,   # ★ ロング伸ばさない
+                    'high_mult_short_tp': 1.05,
+                },
+                'doge_jpy': {
+                    'low': 0.20, 'high': 0.24,
+                    'low_mult_tp': 0.95,
+                    'high_mult_long_tp': 1.00,   # ★ ロング伸ばさない
+                    'high_mult_short_tp': 1.00,
+                },
+                'bcc_jpy': {
+                    'low': 310,  'high': 350,
+                    'low_mult_tp': 0.95,
+                    'high_mult_long_tp': 1.00,   # ★ ロング伸ばさない
+                    'high_mult_short_tp': 1.08,
+                },
             }
-            default_setting = {'low': 0.5, 'high': 2.0, 'low_mult': 0.9, 'high_mult_long': 1.1, 'high_mult_short': 1.1}
+            default_setting = {
+                'low': 0.5, 'high': 2.0,
+                'low_mult_tp': 0.95,
+                'high_mult_long_tp': 1.00,  # ★ デフォルトもロングは伸ばさない
+                'high_mult_short_tp': 1.10,
+            }
             config = atr_thresholds.get(symbol, default_setting)
+
+            # ========= 通貨ペア別 ADX 設定 =========
+            # high_mult_long_tp を追加して、ロングはあまり伸ばさない
             adx_thresholds = {
-                'ltc_jpy':   {'low': 20, 'high': 50, 'low_mult': 0.83, 'high_mult': 1.15},
-                'ada_jpy':   {'low': 22, 'high': 48, 'low_mult': 0.83, 'high_mult': 1.17},
-                'xrp_jpy':   {'low': 20, 'high': 50, 'low_mult': 0.80, 'high_mult': 1.20},
-                'eth_jpy':   {'low': 20, 'high': 50, 'low_mult': 0.85, 'high_mult': 1.17},
-                'sol_jpy':   {'low': 20, 'high': 50, 'low_mult': 0.85, 'high_mult': 1.15},
-                'doge_jpy':  {'low': 20, 'high': 50, 'low_mult': 0.80, 'high_mult': 1.20},
-                'bcc_jpy':   {'low': 22, 'high': 32, 'low_mult': 0.83, 'high_mult': 1.15}
+                'ltc_jpy': {
+                    'low': 20, 'high': 50,
+                    'low_mult_tp': 0.95,
+                    'high_mult_tp': 1.10,     # short 用
+                    'high_mult_long_tp': 1.00 # ★ long 用
+                },
+                'ada_jpy': {
+                    'low': 22, 'high': 48,
+                    'low_mult_tp': 0.95,
+                    'high_mult_tp': 1.12,
+                    'high_mult_long_tp': 1.00 # ★
+                },
+                'xrp_jpy': {
+                    'low': 20, 'high': 50,
+                    'low_mult_tp': 0.95,
+                    'high_mult_tp': 1.12,
+                    'high_mult_long_tp': 1.02 # ★ XRPは少しだけ許容
+                },
+                'eth_jpy': {
+                    'low': 20, 'high': 50,
+                    'low_mult_tp': 0.95,
+                    'high_mult_tp': 1.12,
+                    'high_mult_long_tp': 1.00 # ★
+                },
+                'sol_jpy': {
+                    'low': 20, 'high': 50,
+                    'low_mult_tp': 0.95,
+                    'high_mult_tp': 1.12,
+                    'high_mult_long_tp': 1.00 # ★
+                },
+                'doge_jpy': {
+                    'low': 20, 'high': 50,
+                    'low_mult_tp': 0.95,
+                    'high_mult_tp': 1.12,
+                    'high_mult_long_tp': 1.00 # ★
+                },
+                'bcc_jpy': {
+                    'low': 22, 'high': 32,
+                    'low_mult_tp': 0.95,
+                    'high_mult_tp': 1.10,
+                    'high_mult_long_tp': 1.00 # ★
+                },
             }
-            default_adx_setting = {'low': 20, 'high': 50, 'low_mult': 0.90, 'high_mult': 1.10}
+            default_adx_setting = {
+                'low': 20, 'high': 50,
+                'low_mult_tp': 0.95,
+                'high_mult_tp': 1.10,
+                'high_mult_long_tp': 1.00,  # ★ デフォルトlongは伸ばさない
+            }
             adx_config = adx_thresholds.get(symbol, default_adx_setting)
 
-            # ATRベース調整
+            # ========= TP/SL 基本値（SLは基本固定） =========
             tp_pct = base_tp_pct
-            sl_pct = base_sl_pct
-            if atr < config['low']:
-                tp_pct *= config['low_mult']
-                sl_pct *= config['low_mult']
-            elif atr > config['high']:
-                if position_type == 'long':
-                    tp_pct *= config['high_mult_long']
-                    sl_pct *= config['high_mult_long']
-                else:
-                    tp_pct *= config['high_mult_short']
-                    sl_pct *= config['high_mult_short']
+            sl_pct = base_sl_pct   # ← 基本はこの値をあまり動かさない
 
-            # ADXベース調整（弱→狭め、強→広げ）
+            # ========= 3-2: ロング専用のベースSL微修正 =========
+            # ロングのみ、全体的にSLを少しタイトにする（損失圧縮）
+            if position_type == 'long':
+                sl_pct *= 0.95  # ★ 例えば2.0%→1.9%のイメージ
+
+            # ========= ATRベース調整（TPのみ調整） =========
+            if atr is not None:
+                if atr < config['low']:
+                    tp_pct *= config['low_mult_tp']  # ボラ低 → 少し早め利確
+                elif atr > config['high']:
+                    if position_type == 'long':
+                        # ★ ロングは基本的にTPを伸ばさない / やや抑えめ
+                        tp_pct *= config.get('high_mult_long_tp', 1.0)
+                    else:
+                        tp_pct *= config['high_mult_short_tp']
+
+            # ========= ADXベース調整（TPのみ調整） =========
             if adx is not None:
                 if adx < adx_config['low']:
-                    tp_pct *= adx_config['low_mult']
-                    sl_pct *= adx_config['low_mult']
+                    tp_pct *= adx_config['low_mult_tp']   # トレンド弱 → 早め利確寄り
                 elif adx > adx_config['high']:
-                    tp_pct *= adx_config['high_mult']
-                    sl_pct *= adx_config['high_mult']
+                    if position_type == 'long':
+                        # ★ ロングはトレンド強でもTPをあまり伸ばさない
+                        tp_pct *= adx_config.get('high_mult_long_tp', 1.0)
+                    else:
+                        tp_pct *= adx_config['high_mult_tp']  # ショートは伸ばす
 
-            # --- ADX減衰チェック ---
-            adx_prev = df_5min['ADX'].dropna().iloc[-3] if len(df_5min['ADX'].dropna()) >= 3 else adx
+            # ========= 早期警戒シグナル（ここだけSLも狭める） =========
             adx_decreasing = (adx is not None and adx_prev is not None and adx < adx_prev)
 
-            # --- DIクロスチェック ---
             di_cross_signal = False
             if plus_di is not None and minus_di is not None:
                 if position_type == 'long' and plus_di < minus_di:
@@ -7199,23 +7308,20 @@ class CryptoTradingBot:
                 elif position_type == 'short' and minus_di < plus_di:
                     di_cross_signal = True
 
-            # --- 早期警戒シグナルでの補正 ---
             if adx_decreasing or di_cross_signal:
-                tp_pct *= 0.8    # 利確幅を縮小（早期確定）
-                sl_pct *= 0.9    # 損切りを少し手前に
+                tp_pct *= 0.85   # 利確幅を縮小（早期確定寄り）
+                sl_pct *= 0.95   # 損切りを少し手前に（広げることはしない）
 
-
-            # トレンド方向と一致しているかを+DI / -DIで判定
+            # ========= トレンド逆行時の微調整（これもSLは狭める方向のみ） =========
             if plus_di is not None and minus_di is not None:
                 if position_type == 'long' and plus_di < minus_di:
-                    tp_pct *= 0.90  # トレンド逆行時は利確を保守的に
-                    sl_pct *= 0.95
+                    tp_pct *= 0.95
+                    sl_pct *= 0.97
                 elif position_type == 'short' and minus_di < plus_di:
-                    tp_pct *= 0.90
-                    sl_pct *= 0.95
+                    tp_pct *= 0.95
+                    sl_pct *= 0.97
 
-            # ========== 逆方向 4本中3本で開始、同方向 2本連続で解除（ロック継続版） ==========
-            # 対象バー：確定足のみ（-1 は含めない）
+            # ========= 逆方向シグナル連続ロジック（SLのみタイト化） =========
             score_true_thresh = 0.5
             has_buy_sig  = 'buy_signal'  in df_5min.columns
             has_sell_sig = 'sell_signal' in df_5min.columns
@@ -7223,11 +7329,9 @@ class CryptoTradingBot:
             has_sell_scr = 'sell_score'  in df_5min.columns
 
             def lastN_bool(series_or_boollike, N):
-                """確定N本（終値確定済み）を True/False 配列で取得（不足・NaNは False 扱い）"""
-                seq = series_or_boollike.iloc[-(N+1):-1]  # 例: N=4 → -5:-1（-5,-4,-3,-2）
+                seq = series_or_boollike.iloc[-(N+1):-1]  # -1 は未確定足前提
                 return seq.fillna(False).astype(bool)
 
-            # ---- True/False 配列の用意（フォールバック：score >= 0.5） ----
             if has_buy_sig:
                 buy_seq4 = lastN_bool(df_5min['buy_signal'], 4)
                 buy_seq2 = lastN_bool(df_5min['buy_signal'], 2)
@@ -7252,15 +7356,13 @@ class CryptoTradingBot:
             def is_two_streak_true(seq):
                 return (seq is not None) and (len(seq) == 2) and bool(seq.iloc[0]) and bool(seq.iloc[1])
 
-            # ---- 開始（逆方向3/4）／解除（同方向2連続）の判定 ----
             if position_type == 'long':
-                opp_start   = is_three_of_four(sell_seq4)   # 逆方向（ロング時は sell）が4本中3本
-                same_unlock = is_two_streak_true(buy_seq2)  # 同方向（ロング時は buy）が2本連続
-            else:  # short
-                opp_start   = is_three_of_four(buy_seq4)    # 逆方向（ショート時は buy）が4本中3本
-                same_unlock = is_two_streak_true(sell_seq2) # 同方向（ショート時は sell）が2本連続
+                opp_start   = is_three_of_four(sell_seq4)
+                same_unlock = is_two_streak_true(buy_seq2)
+            else:
+                opp_start   = is_three_of_four(buy_seq4)
+                same_unlock = is_two_streak_true(sell_seq2)
 
-            # ---- 状態辞書の安全初期化 ----
             if not hasattr(self, 'opposite_narrow_state'):
                 self.opposite_narrow_state = {}
             if symbol not in self.opposite_narrow_state:
@@ -7270,36 +7372,27 @@ class CryptoTradingBot:
 
             lock_on = self.opposite_narrow_state[symbol][position_type]
 
-            # ---- 状態更新ロジック ----
-            # 解除：同方向が2本連続で出たらロックOFF
             if same_unlock:
                 lock_on = False
-            # 開始：逆方向が4本中3本 かつ 解除条件は出ていない → ロックON
             elif opp_start and not same_unlock:
                 lock_on = True
-            # それ以外：状態維持
 
-            # 保存
             self.opposite_narrow_state[symbol][position_type] = lock_on
 
-            # ---- 適用 ----
-            opposite_streak_factor = 0.9  # 狭め係数（必要に応じて調整）
             if lock_on:
-                sl_pct *= opposite_streak_factor
-            # ======================================================================
+                sl_pct *= 0.9   # 逆方向シグナル連続時のみ、SLをさらにタイト化
 
-
-            # エグジット価格計算
+            # ========= エグジット価格計算 =========
             if position_type == 'long':
                 take_profit_price = entry_price * (1 + tp_pct)
-                stop_loss_price = entry_price * (1 - sl_pct)
+                stop_loss_price   = entry_price * (1 - sl_pct)
                 take_profit_ratio = 1 + tp_pct
-                stop_loss_ratio = 1 - sl_pct
+                stop_loss_ratio   = 1 - sl_pct
             else:
                 take_profit_price = entry_price * (1 - tp_pct)
-                stop_loss_price = entry_price * (1 + sl_pct)
+                stop_loss_price   = entry_price * (1 + sl_pct)
                 take_profit_ratio = 1 - tp_pct
-                stop_loss_ratio = 1 + sl_pct
+                stop_loss_ratio   = 1 + sl_pct
 
             risk_reward_ratio = tp_pct / sl_pct if sl_pct != 0 else float('inf')
 
@@ -7309,31 +7402,31 @@ class CryptoTradingBot:
                 'take_profit_ratio': take_profit_ratio,
                 'stop_loss_ratio': stop_loss_ratio,
                 'atr_value': atr,
-                'risk_reward_ratio': risk_reward_ratio
+                'risk_reward_ratio': risk_reward_ratio,
             }
 
         except Exception as e:
             self.logger.error(f"{symbol}のATR利確損切計算中にエラー: {str(e)}", exc_info=True)
             default_settings = self._get_dynamic_profit_loss_settings(symbol, df_5min)
             if position_type == 'long':
-                return {
-                    'take_profit_price': entry_price * default_settings['long_profit_take'],
-                    'stop_loss_price': entry_price * default_settings['long_stop_loss'],
-                    'take_profit_ratio': default_settings['long_profit_take'],
-                    'stop_loss_ratio': default_settings['long_stop_loss'],
-                    'atr_value': 0,
-                    'risk_reward_ratio': 2.0
-                }
+                tp_ratio = default_settings['long_profit_take']
+                sl_ratio = default_settings['long_stop_loss']
             else:
-                return {
-                    'take_profit_price': entry_price * default_settings['short_profit_take'],
-                    'stop_loss_price': entry_price * default_settings['short_stop_loss'],
-                    'take_profit_ratio': default_settings['short_profit_take'],
-                    'stop_loss_ratio': default_settings['short_stop_loss'],
-                    'atr_value': 0,
-                    'risk_reward_ratio': 2.0
-                }
+                tp_ratio = default_settings['short_profit_take']
+                sl_ratio = default_settings['short_stop_loss']
 
+            tp_pct = abs(tp_ratio - 1.0)
+            sl_pct = abs(sl_ratio - 1.0)
+            rr = tp_pct / sl_pct if sl_pct != 0 else float('inf')
+
+            return {
+                'take_profit_price': entry_price * tp_ratio,
+                'stop_loss_price': entry_price * sl_ratio,
+                'take_profit_ratio': tp_ratio,
+                'stop_loss_ratio': sl_ratio,
+                'atr_value': 0,
+                'risk_reward_ratio': rr,
+            }
 
 # ================================
 # メイン実行部分（統一版・重複禁止）
