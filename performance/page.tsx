@@ -253,9 +253,9 @@ export default async function Page({
                   <th scope="col" className="px-3 py-2 text-right">
                     <abbr title="Winの定義: pnl > 0。Win Rate = wins / total_trades">Win Rate</abbr>
                   </th>
-                  <th scope="col" className="px-3 py-2 text-right">
+                  {/* <th scope="col" className="px-3 py-2 text-right">
                     <abbr title="当日の pnl_pct の単純平均（JST日単位）">Avg PnL</abbr>
-                  </th>
+                  </th> */}
                   <th scope="col" className="px-3 py-2 text-right">
                     <abbr title="当日の全トレード損益合計（JPY）">Total PnL（¥）</abbr>
                   </th>
@@ -268,64 +268,57 @@ export default async function Page({
                     <td className="px-3 py-2">{r.date}</td>
                     <td className="px-3 py-2 text-right">{r.total_trades}</td>
                     <td className="px-3 py-2 text-right">{pct(r.win_rate, 1)}</td>
-                    <td className="px-3 py-2 text-right">{pct(r.avg_pnl_pct, 2)}</td>
                     <td className="px-3 py-2 text-right">
                       {Number(r.total_pnl).toLocaleString("ja-JP", { maximumFractionDigits: 0 })}
                     </td>
                   </tr>
                 ))}
 
-                {/* 合計行（データがあるときのみ表示） */}
+                {/* 合計行 */}
                 {data.length > 0 && (() => {
                   const sum = data.reduce((acc, cur) => acc + (cur.total_pnl ?? 0), 0);
                   const sign = sum > 0 ? "+" : sum < 0 ? "−" : "";
                   const abs = Math.abs(sum);
                   const cls =
-                    sum > 0 ? "text-green-600 dark:text-green-400"
-                  : sum < 0 ? "text-red-600 dark:text-red-400"
-                            : "text-gray-600 dark:text-gray-300";
+                    sum > 0
+                      ? "text-green-600 dark:text-green-400"
+                      : sum < 0
+                      ? "text-red-600 dark:text-red-400"
+                      : "text-gray-600 dark:text-gray-300";
 
                   return (
-                    <tr className="border-t border-gray-200 dark:border-gray-700 bg-gray-50/70 dark:bg-gray-800/40">
-                      {/* ラベルは先頭〜Avg PnL までまとめて表示 */}
-                      <td className="px-3 py-2 font-medium" colSpan={4}>
-                        合計
-                      </td>
-                      <td className="px-3 py-2 text-right font-semibold">
-                        <span className={cls}>
-                          {sign}
-                          {abs.toLocaleString("ja-JP", { maximumFractionDigits: 0 })}円
-                        </span>
-                      </td>
-                    </tr>
+                    <>
+                      <tr className="border-t border-gray-200 dark:border-gray-700 bg-gray-50/70 dark:bg-gray-800/40">
+                        <td className="px-3 py-2 font-medium" colSpan={3}>
+                          合計
+                        </td>
+                        <td className="px-3 py-2 text-right font-semibold">
+                          <span className={cls}>
+                            {sign}
+                            {abs.toLocaleString("ja-JP", { maximumFractionDigits: 0 })}円
+                          </span>
+                        </td>
+                      </tr>
+
+                      {/* 平均勝率行 */}
+                      <tr className="border-t border-gray-200 dark:border-gray-700 bg-gray-50/70 dark:bg-gray-800/40">
+                        <td className="px-3 py-2 font-medium" colSpan={3}>
+                          平均勝率（絞り込み区間）
+                        </td>
+                        <td className="px-3 py-2 text-right font-semibold">
+                          {pct(
+                            data.reduce(
+                              (acc, cur) => acc + (cur.win_rate ?? 0) * cur.total_trades,
+                              0
+                            ) /
+                              data.reduce((acc, cur) => acc + cur.total_trades, 0),
+                            1
+                          )}
+                        </td>
+                      </tr>
+                    </>
                   );
                 })()}
-
-                {data.length === 0 && (
-                  <tr>
-                    <td className="px-3 py-6 text-center text-gray-500" colSpan={5}>
-                      <div className="space-y-2">
-                        <div>データがありません。</div>
-                        <div className="flex gap-2 justify-center">
-                          <Link
-                            className="rounded-2xl border px-3 py-1.5 border-gray-300 dark:border-gray-700"
-                            href={`/performance?days=${Math.max(30, Math.min(90, days))}${symbol ? `&symbol=${encodeURIComponent(symbol)}` : ""}`}
-                          >
-                            期間を90日に広げる
-                          </Link>
-                          {symbol && (
-                            <Link
-                              className="rounded-2xl border px-3 py-1.5 border-gray-300 dark:border-gray-700"
-                              href={`/performance?days=${days}`}
-                            >
-                              シンボル解除
-                            </Link>
-                          )}
-                        </div>
-                      </div>
-                    </td>
-                  </tr>
-                )}
               </tbody>
             </table>
           </div>
