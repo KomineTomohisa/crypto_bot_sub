@@ -601,11 +601,11 @@ class CryptoTradingBot:
             sma_fast   = _get(df_row, "SMA_fast", "sma_fast")
             sma_slow   = _get(df_row, "SMA_slow", "sma_slow")
             bb_upper   = _get(df_row, "BB_upper", "bb_upper")
-            bb_middle  = _get(df_row, "BB_middle", "bb_middle")
+            bb_middle  = _get(df_row, "BB_middle", "BB_mid", "bb_middle")
             bb_lower   = _get(df_row, "BB_lower", "bb_lower")
             macd       = _get(df_row, "MACD", "macd")
             macd_sig   = _get(df_row, "MACD_signal", "macd_signal")
-            macd_hist  = _get(df_row, "MACD_hist", "macd_hist")
+            macd_hist  = _get(df_row, "MACD_hist", "MACD_histogram", "macd_hist")
             stoch_k    = _get(df_row, "Stoch_K", "stoch_k", "%K", "stoch_k_fast")
             stoch_d    = _get(df_row, "Stoch_D", "stoch_d", "%D", "stoch_d_fast")
             volatility = _get(df_row, "volatility")
@@ -618,10 +618,38 @@ class CryptoTradingBot:
             if not scores and isinstance(getattr(self, "entry_scores", {}).get(symbol, None), dict):
                 scores = dict(self.entry_scores[symbol])
 
-            def _s(key): 
+            # ★ 追加: df_row にスコア列がある場合はそこから fallback で埋める
+            if not scores and df_row is not None:
+                # df_5min に実際に存在しているスコアカラムを列挙
+                score_keys = [
+                    "rsi_score_long", "rsi_score_short",
+                    "adx_score_long", "adx_score_short",
+                    "atr_score_long", "atr_score_short",
+                    "cci_score_long", "cci_score_short",
+                    "ma_score_long",  "ma_score_short",
+                    "bb_score_long",  "bb_score_short",
+                    "macd_score_long", "macd_score_short",
+                    "mfi_score_long",  "mfi_score_short",
+                ]
+                tmp: dict[str, float] = {}
+                for k in score_keys:
+                    if k in df_row.index:
+                        v = df_row[k]
+                        # NaN などは一旦スキップ（不要ならこの if は削ってもOKです）
+                        try:
+                            if v is not None and not (isinstance(v, float) and (v != v)):  # NaN チェック簡易版
+                                tmp[k] = float(v)
+                        except Exception:
+                            pass
+                if tmp:
+                    scores = tmp
+
+            def _s(key):
                 v = scores.get(key)
-                try: return float(v) if v is not None else None
-                except Exception: return None
+                try:
+                    return float(v) if v is not None else None
+                except Exception:
+                    return None
 
             rsi_sl  = _s("rsi_score_long");   rsi_ss  = _s("rsi_score_short")
             adx_sl  = _s("adx_score_long");   adx_ss  = _s("adx_score_short")
@@ -2867,14 +2895,23 @@ class CryptoTradingBot:
             # 可能なら 5m の最新行を掴む（環境によっては self.df_5min 等のキャッシュ名が異なる想定。無ければ None のまま）
             df_row_latest = None
             try:
-                # 例: self.df_cache[("5m", symbol)] や self.df_5min[symbol] 等のキャッシュがある場合に対応
                 df_obj = None
-                if hasattr(self, "df_5min") and isinstance(self.df_5min, dict) and symbol in self.df_5min and len(self.df_5min[symbol]) > 0:
-                    df_obj = self.df_5min[symbol]
-                elif hasattr(self, "latest_df_5min") and isinstance(self.latest_df_5min, dict) and symbol in self.latest_df_5min and len(self.latest_df_5min[symbol]) > 0:
-                    df_obj = self.latest_df_5min[symbol]
-                if df_obj is not None:
+
+                # パターン1: self.df_5min が「そのまま DataFrame」として保持されているケース
+                if hasattr(self, "df_5min"):
+                    if isinstance(self.df_5min, pd.DataFrame):
+                        df_obj = self.df_5min
+                    elif isinstance(self.df_5min, dict) and symbol in self.df_5min and len(self.df_5min[symbol]) > 0:
+                        df_obj = self.df_5min[symbol]
+
+                # パターン2: シンボル別キャッシュ latest_df_5min を使うケース（将来用）
+                if df_obj is None and hasattr(self, "latest_df_5min") and isinstance(self.latest_df_5min, dict):
+                    if symbol in self.latest_df_5min and len(self.latest_df_5min[symbol]) > 0:
+                        df_obj = self.latest_df_5min[symbol]
+
+                if df_obj is not None and len(df_obj) > 0:
                     df_row_latest = df_obj.iloc[-1]
+
             except Exception:
                 df_row_latest = None
 
