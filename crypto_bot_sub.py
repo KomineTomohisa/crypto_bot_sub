@@ -2540,16 +2540,16 @@ class CryptoTradingBot:
                     )
                     upsert_position(
                         position_id=str(position_id),               # DB: varchar(80)
-                        symbol=symbol,                               # DB: varchar(32)
-                        side=("long" if side == "BUY" else "short"), # DB: varchar(8) 想定
-                        size=float(executed_size_pos),               # DB: numeric(24,8)
+                        symbol=symbol,                              # DB: varchar(32)
+                        side=("long" if side == "BUY" else "short"),# DB: varchar(8) 想定
+                        size=float(executed_size_pos),              # DB: numeric(24,8)
                         avg_entry_price=float(avg_entry) if avg_entry else 0.0,
-                        opened_at=utcnow(),                          # DB: timestamptz
-                        updated_at=utcnow(),                          # DB: timestamptz
+                        opened_at=utcnow(),                         # DB: timestamptz
+                        updated_at=utcnow(),                        # DB: timestamptz
                         raw={"order_response": response},
                         strategy_id=strategy_uuid,
-                        source=default_source,              # ← real を明示
-                        user_id=getattr(self, "user_id", None)        # DB: int8
+                        source=default_source,                      # ← real を明示
+                        user_id=getattr(self, "user_id", None),     # DB: int8
                     )
 
                 # 建玉から建値が取れたら entry_prices を更新
@@ -3032,6 +3032,11 @@ class CryptoTradingBot:
                                 _pos_id = self.position_ids.get(symbol)
                                 if _pos_id:
                                     sid = to_uuid_or_none(getattr(self, "strategy_id", None))
+                                    # ★ 追加: エントリー注文かつ signal_id がある場合のみ open_signal_id を渡す
+                                    extra_pos_kwargs = {}
+                                    if is_entry_order and signal_id:
+                                        extra_pos_kwargs["open_signal_id"] = to_uuid_or_none(signal_id)
+
                                     upsert_position(
                                         position_id=str(_pos_id),
                                         symbol=symbol,
@@ -3045,7 +3050,8 @@ class CryptoTradingBot:
                                         user_id=getattr(self, "user_id", None),
                                         source=default_source_from_env(self),          # ← 非NULLを保証
                                         conn=conn,
-                                    )                             
+                                        **extra_pos_kwargs,                            # ★ open_signal_id をここで渡す
+                                    )
                                 # 3) シグナルstatus（エントリー時だけ）
                                 if signal_id:
                                     update_signal_status(signal_id, "sent", conn=conn)
