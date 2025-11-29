@@ -2540,16 +2540,16 @@ class CryptoTradingBot:
                     )
                     upsert_position(
                         position_id=str(position_id),               # DB: varchar(80)
-                        symbol=symbol,                               # DB: varchar(32)
-                        side=("long" if side == "BUY" else "short"), # DB: varchar(8) 想定
-                        size=float(executed_size_pos),               # DB: numeric(24,8)
+                        symbol=symbol,                              # DB: varchar(32)
+                        side=("long" if side == "BUY" else "short"),# DB: varchar(8) 想定
+                        size=float(executed_size_pos),              # DB: numeric(24,8)
                         avg_entry_price=float(avg_entry) if avg_entry else 0.0,
-                        opened_at=utcnow(),                          # DB: timestamptz
-                        updated_at=utcnow(),                          # DB: timestamptz
+                        opened_at=utcnow(),                         # DB: timestamptz
+                        updated_at=utcnow(),                        # DB: timestamptz
                         raw={"order_response": response},
                         strategy_id=strategy_uuid,
-                        source=default_source,              # ← real を明示
-                        user_id=getattr(self, "user_id", None)        # DB: int8
+                        source=default_source,                      # ← real を明示
+                        user_id=getattr(self, "user_id", None),     # DB: int8
                     )
 
                 # 建玉から建値が取れたら entry_prices を更新
@@ -2870,15 +2870,23 @@ class CryptoTradingBot:
         signal_raw: dict | None = None,
     ):
         """確実に注文を実行し、ポジションが実際に保有されていることを確認する"""
-        # --- (追加) エントリー時のみシグナルを先に記録する --------------------
+
+        # --- 追加: エントリー/決済フラグと signal_id 初期化 --------------------
+        signal_id = ""
+        is_entry_order = False  # ← これがないと NameError になる
+
+        # --- エントリー時のみシグナルを先に記録する --------------------
         # current_position が None = 新規エントリー、Noneでない = 決済フェーズの可能性
         # 決済は signals には記録しない方針（必要なら別途 exit_signals を用意）
-        signal_id = ""
         try:
             current_position_preview = self.positions.get(symbol)
             # エントリー時のみ記録（決済では記録しない）
             if current_position_preview is not None:
+                # すでにポジションがある = 決済フェーズなのでシグナル記録はスキップ
                 raise RuntimeError("skip_recording_signal_for_exit")
+
+            # ここに来たら「新規エントリー」とみなせる
+            is_entry_order = True  # ★ エントリー注文であることをマーク
 
             side_for_signal = "long" if str(order_type).lower() == "buy" else "short"
             try:
@@ -2892,7 +2900,7 @@ class CryptoTradingBot:
                 "EMA_fast": ema_fast, "EMA_slow": ema_slow,
             } if any(v is not None for v in [rsi, adx, atr, di_plus, di_minus, ema_fast, ema_slow]) else None
 
-            # 可能なら 5m の最新行を掴む（環境によっては self.df_5min 等のキャッシュ名が異なる想定。無ければ None のまま）
+            # 可能なら 5m の最新行を掴む
             df_row_latest = None
             try:
                 df_obj = None
@@ -2904,7 +2912,7 @@ class CryptoTradingBot:
                     elif isinstance(self.df_5min, dict) and symbol in self.df_5min and len(self.df_5min[symbol]) > 0:
                         df_obj = self.df_5min[symbol]
 
-                # パターン2: シンボル別キャッシュ latest_df_5min を使うケース（将来用）
+                # パターン2: シンボル別キャッシュ latest_df_5min を使うケース
                 if df_obj is None and hasattr(self, "latest_df_5min") and isinstance(self.latest_df_5min, dict):
                     if symbol in self.latest_df_5min and len(self.latest_df_5min[symbol]) > 0:
                         df_obj = self.latest_df_5min[symbol]
@@ -2915,7 +2923,7 @@ class CryptoTradingBot:
             except Exception:
                 df_row_latest = None
 
-            # スコア辞書（あれば最大限渡す）。既存実装では entry_scores/signal_data にスコア群が格納される箇所あり。:contentReference[oaicite:4]{index=4}
+            # スコア辞書（あれば最大限渡す）
             scores_dict = None
             try:
                 if isinstance(getattr(self, "entry_scores", {}).get(symbol, None), dict):
@@ -3024,7 +3032,7 @@ class CryptoTradingBot:
                                         "source": "entry_tx",
                                         "symbol": symbol,
                                         "signal_id": signal_id or None,
-                                        "order_type": str(order_type).lower(),  # 参照用
+                                        "order_type": str(order_type).lower(),
                                     },
                                     conn=conn,
                                 )
@@ -3032,6 +3040,12 @@ class CryptoTradingBot:
                                 _pos_id = self.position_ids.get(symbol)
                                 if _pos_id:
                                     sid = to_uuid_or_none(getattr(self, "strategy_id", None))
+
+                                    # ★ エントリー注文かつ signal_id がある場合のみ open_signal_id を渡す
+                                    extra_pos_kwargs: dict[str, Any] = {}
+                                    if is_entry_order and signal_id:
+                                        extra_pos_kwargs["open_signal_id"] = to_uuid_or_none(signal_id)
+
                                     upsert_position(
                                         position_id=str(_pos_id),
                                         symbol=symbol,
@@ -3041,24 +3055,28 @@ class CryptoTradingBot:
                                         opened_at=utcnow(),
                                         updated_at=utcnow(),
                                         raw={"source": "entry_tx"},
-                                        strategy_id=sid,                               # uuid or None
+                                        strategy_id=sid,
                                         user_id=getattr(self, "user_id", None),
-                                        source=default_source_from_env(self),          # ← 非NULLを保証
+                                        source=default_source_from_env(self),
                                         conn=conn,
-                                    )                             
+                                        **extra_pos_kwargs,  # ← open_signal_id があればここで流れる
+                                    )
+
                                 # 3) シグナルstatus（エントリー時だけ）
                                 if signal_id:
                                     update_signal_status(signal_id, "sent", conn=conn)
                         except Exception as e:
-                            # Fail-Fast：Tx障害時は成功扱いにしない
-                            insert_error("entry/tx_commit", str(e),
-                                         raw={"order_id": order_id, "symbol": symbol, "signal_id": signal_id or None})
+                            insert_error(
+                                "entry/tx_commit",
+                                str(e),
+                                raw={"order_id": order_id, "symbol": symbol, "signal_id": signal_id or None},
+                            )
                             raise
 
                         return {
                             'success': True,
                             'order_id': order_id,
-                            'executed_size': executed_size
+                            'executed_size': executed_size,
                         }
 
                     self.logger.info(f"約定待機中... 試行 {check+1}/5")
@@ -3073,7 +3091,6 @@ class CryptoTradingBot:
                     if abs(net_size) > 0:
                         self.logger.info(f"ポジション情報から建玉を確認: サイズ {net_size}")
 
-                        # --- DB: フォールバックでも fills 登録 ---
                         try:
                             try:
                                 exec_price = float(self.entry_prices.get(symbol) or 0.0)
@@ -3091,11 +3108,10 @@ class CryptoTradingBot:
                                 fill_raw={
                                     "source": order_type,
                                     "symbol": symbol,
-                                    # （追加）signal_id を橋渡し
-                                    "signal_id": signal_id or None
-                                }
+                                    "signal_id": signal_id or None,
+                                },
                             )
-                            # --- メモリ側も同期（エントリー/エグジット双方の整合性向上） ---
+                            # メモリ側も同期
                             if current_position is None:
                                 # フォールバック成立 = エントリー成功とみなす
                                 self.positions[symbol] = ("long" if str(order_type).lower()=="buy" else "short")
@@ -3114,13 +3130,13 @@ class CryptoTradingBot:
                             insert_error(
                                 "execute_order_with_confirmation/fallback_fill",
                                 str(e),
-                                raw={"order_id": order_id, "symbol": symbol, "net_size": net_size, "signal_id": signal_id or None}
+                                raw={"order_id": order_id, "symbol": symbol, "net_size": net_size, "signal_id": signal_id or None},
                             )
 
                         return {
                             'success': True,
                             'order_id': order_id,
-                            'executed_size': abs(net_size)
+                            'executed_size': abs(net_size),
                         }
 
                 # 4) どちらでも確認できなかった

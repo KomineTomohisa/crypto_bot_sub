@@ -156,6 +156,8 @@ positions = sa.table(
     sa.column("raw", sa.JSON),
     sa.column("strategy_id", sa.String),
     sa.column("source", sa.String),
+    sa.column("open_signal_id", sa.String),
+    sa.column("close_signal_id", sa.String),
 )
 
 trades = sa.table(
@@ -441,14 +443,41 @@ def upsert_position(
     *,
     user_id: Optional[int] = None,
     source: Optional[str] = None,
+    # ★ 追加: シグナルとのひも付け
+    open_signal_id: Optional[str] = None,
+    close_signal_id: Optional[str] = None,
     conn: Optional[Connection] = None,
 ) -> None:
     stmt = sa.text("""
         INSERT INTO positions (
-            position_id, user_id, symbol, side, size, avg_entry_price, opened_at, updated_at, raw, strategy_id, source
+            position_id,
+            user_id,
+            symbol,
+            side,
+            size,
+            avg_entry_price,
+            opened_at,
+            updated_at,
+            raw,
+            strategy_id,
+            source,
+            open_signal_id,
+            close_signal_id
         )
         VALUES (
-            :position_id, :user_id, :symbol, :side, :size, :avg_entry_price, :opened_at, :updated_at, :raw, :strategy_id, :source
+            :position_id,
+            :user_id,
+            :symbol,
+            :side,
+            :size,
+            :avg_entry_price,
+            :opened_at,
+            :updated_at,
+            :raw,
+            :strategy_id,
+            :source,
+            :open_signal_id,
+            :close_signal_id
         )
         ON CONFLICT (position_id) DO UPDATE
         SET symbol = EXCLUDED.symbol,
@@ -460,7 +489,12 @@ def upsert_position(
             raw = COALESCE(EXCLUDED.raw, positions.raw),
             strategy_id = COALESCE(positions.strategy_id, EXCLUDED.strategy_id),
             user_id     = COALESCE(positions.user_id, EXCLUDED.user_id),
-            source      = COALESCE(positions.source, EXCLUDED.source)
+            source      = COALESCE(positions.source, EXCLUDED.source),
+            -- ★ ここがポイント:
+            -- 一度入った open_signal_id / close_signal_id は基本残し、
+            -- まだ NULL の場合にだけ新しい値を採用する
+            open_signal_id  = COALESCE(positions.open_signal_id, EXCLUDED.open_signal_id),
+            close_signal_id = COALESCE(positions.close_signal_id, EXCLUDED.close_signal_id)
     """)
     params = dict(
         position_id=position_id,
@@ -474,7 +508,9 @@ def upsert_position(
         raw=_jsonable(raw),
         strategy_id=strategy_id,
         source=source,
-     )
+        open_signal_id=open_signal_id,
+        close_signal_id=close_signal_id,
+    )
     _exec(stmt, params, conn)
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential_jitter(0.2, 1.5))
