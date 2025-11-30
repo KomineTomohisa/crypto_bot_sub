@@ -45,6 +45,44 @@ type Props = {
   positions: Position[];
 };
 
+// チャート1点分に追加したメタ情報
+type ChartPoint = Candle15m & {
+  timeLabel: string;
+  isEntry: boolean;
+  entrySide?: string;
+};
+
+// ★ を描画する Dot（エントリー足だけ表示）
+type EntryStarDotProps = {
+  cx?: number;
+  cy?: number;
+  payload?: {
+    isEntry?: boolean;
+    entrySide?: string;
+  };
+};
+
+const EntryStarDot = ({ cx, cy, payload }: EntryStarDotProps) => {
+  if (!payload?.isEntry) return null;
+  if (cx == null || cy == null) return null;
+
+  const isLong = payload.entrySide === "LONG";
+
+  return (
+    <text
+      x={cx}
+      y={cy}
+      dy={-8}
+      textAnchor="middle"
+      fontSize={16}
+      fontWeight="bold"
+      fill={isLong ? "#22c55e" : "#ef4444"} // LONG=緑, SHORT=赤
+    >
+      ★
+    </text>
+  );
+};
+
 // ---- 15分足取得（クライアント側 fetch） ----
 async function fetchCandles15minClient(
   symbol: string,
@@ -145,10 +183,39 @@ export default function PositionsTabsClient({ positions }: Props) {
     };
   }, [activeSymbol]);
 
-  // チャート用にラベルを整形
-  const chartData = useMemo(
-    () =>
-      candles.map((c) => ({
+  // チャート用データ生成
+  // ・timeLabel: 表示用の時刻
+  // ・isEntry: このポジションのエントリー足なら true
+  // ・entrySide: LONG / SHORT（★の色分け用）
+    const chartData: ChartPoint[] = useMemo(() => {
+      if (candles.length === 0) return [];
+
+      // このポジションのエントリー時刻（ミリ秒）
+      const entryTs = active?.entry_time
+        ? new Date(active.entry_time).getTime()
+        : null;
+
+      // 「どの足がエントリー足か」を一度だけ決める
+      let entryIndex = -1;
+      if (entryTs != null) {
+        let minDiff = Number.POSITIVE_INFINITY;
+
+        candles.forEach((c, idx) => {
+          const candleTime = new Date(c.time).getTime();
+          const diff = Math.abs(entryTs - candleTime);
+          if (diff < minDiff) {
+            minDiff = diff;
+            entryIndex = idx;
+          }
+        });
+
+        // エントリー時刻と最も近い足でも 15分以上離れていたら「該当なし」にする
+        if (minDiff > 15 * 60 * 1000) {
+          entryIndex = -1;
+        }
+      }
+
+      return candles.map((c, idx) => ({
         ...c,
         timeLabel: new Date(c.time).toLocaleString("ja-JP", {
           timeZone: "Asia/Tokyo",
@@ -157,9 +224,10 @@ export default function PositionsTabsClient({ positions }: Props) {
           hour: "2-digit",
           minute: "2-digit",
         }),
-      })),
-    [candles],
-  );
+        isEntry: idx === entryIndex,          // ← ここで1本だけ true になる
+        entrySide: active?.side?.toUpperCase(),
+      }));
+    }, [candles, active]);
 
   if (positions.length === 0) {
     return (
@@ -282,7 +350,7 @@ export default function PositionsTabsClient({ positions }: Props) {
 
           {/* 右：15分足チャート（幅7） */}
           <div className="md:col-span-7 rounded-2xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 p-4 shadow-sm h-[420px]">
-            <div className="flex items-center justify-between mb-2">
+            <div className="flex items-center justify_between mb-2">
               <div className="text-xs font-semibold text-gray-700 dark:text-gray-200">
                 価格推移（15分足, 直近7日）
               </div>
@@ -328,7 +396,7 @@ export default function PositionsTabsClient({ positions }: Props) {
                   <Line
                     type="monotone"
                     dataKey="close"
-                    dot={false}
+                    dot={<EntryStarDot />} // ★ を表示
                     strokeWidth={1.5}
                   />
                 </LineChart>
