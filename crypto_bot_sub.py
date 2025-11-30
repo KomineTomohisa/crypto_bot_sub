@@ -39,7 +39,6 @@ from db import update_signal_status
 from db import upsert_price_cache
 from db import mark_order_executed_with_fill
 from uuid import UUID
-from db import upsert_candles_from_df
 
 is_backtest_mode = "backtest" in sys.argv
 
@@ -373,101 +372,6 @@ class CryptoTradingBot:
         """LIVE でなければ SIM/PAPER/BACKTEST とみなす簡易判定"""
         return not self._is_live_mode()
 
-    # CryptoTradingBot クラス内（どこか適当な場所に）
-
-    def _store_candles(
-        self,
-        symbol: str,
-        df_15m,
-        df_hourly,
-    ):
-        """
-        現在の df_15m / df_hourly からローソク足をDBに保存する。
-        ・15分足は candles_15min
-        ・1時間足は candles_1hour
-        """
-        try:
-            src = default_source_from_env(self)  # 既存の source 判定関数を再利用
-
-            if df_15m is not None and not df_15m.empty:
-                upsert_candles_from_df(
-                    table_name="candles_15min",
-                    symbol=symbol,
-                    timeframe="15min",
-                    df=df_15m,
-                    source=src,
-                    keep_days=30,
-                )
-
-            if df_hourly is not None and not df_hourly.empty:
-                upsert_candles_from_df(
-                    table_name="candles_1hour",
-                    symbol=symbol,
-                    timeframe="1hour",
-                    df=df_hourly,
-                    source=src,
-                    keep_days=30,
-                )
-
-        except Exception as e:
-            self.logger.error(f"ローソク足保存中にエラー: {e}", exc_info=True)
-        
-    def _store_recent_candles(
-        self,
-        symbol: str,
-        df_15m,
-        df_1h,
-        n: int = 5,
-    ):
-        """
-        直近 n 本だけをローソク足テーブルに upsert する軽量版
-        """
-        try:
-            src = default_source_from_env(self)
-
-            # --- 15min ---
-            if df_15m is not None and len(df_15m) > 0:
-                df_15m = df_15m.sort_values("timestamp") if "timestamp" in df_15m.columns else df_15m
-                last_n_15m = df_15m.tail(n).copy()
-
-                # timestamp がカラムにない場合は index → timestamp にする
-                if "timestamp" not in last_n_15m.columns:
-                    last_n_15m = last_n_15m.reset_index()
-                    if "index" in last_n_15m.columns:
-                        last_n_15m = last_n_15m.rename(columns={"index": "timestamp"})
-
-                upsert_candles_from_df(
-                    table_name="candles_15min",
-                    symbol=symbol,
-                    timeframe="15min",
-                    df=last_n_15m,
-                    source=src,
-                    keep_days=30,
-                )
-
-            # --- 1hour ---
-            if df_1h is not None and len(df_1h) > 0:
-                if "timestamp" in df_1h.columns:
-                    df_1h = df_1h.sort_values("timestamp")
-                last_n_1h = df_1h.tail(n).copy()
-
-                if "timestamp" not in last_n_1h.columns:
-                    last_n_1h = last_n_1h.reset_index()
-                    if "index" in last_n_1h.columns:
-                        last_n_1h = last_n_1h.rename(columns={"index": "timestamp"})
-
-                upsert_candles_from_df(
-                    table_name="candles_1hour",
-                    symbol=symbol,
-                    timeframe="1hour",
-                    df=last_n_1h,
-                    source=src,
-                    keep_days=30,
-                )
-
-        except Exception as e:
-            self.logger.error(f"ローソク足保存中のエラー: {e}", exc_info=True)
-        
     def _prepare_trade_logs_for_excel_report(self, trade_logs):
         """Excel レポート用に取引ログを準備"""
         try:
@@ -5768,8 +5672,6 @@ class CryptoTradingBot:
                             df_5min = df_5min.sort_values('timestamp').reset_index(drop=True)
                             if len(df_5min) > 96:
                                 df_5min = df_5min.iloc[-96:].copy().reset_index(drop=True)
-
-                            self._store_recent_candles(symbol, df_5min, df_hourly)
                             
                             # 最新のシグナル情報を取得
                             latest_signals = df_5min.iloc[-2]
