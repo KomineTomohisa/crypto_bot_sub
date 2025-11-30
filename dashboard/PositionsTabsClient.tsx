@@ -45,25 +45,23 @@ type Props = {
   positions: Position[];
 };
 
-// チャート1点分に追加したメタ情報
 type ChartPoint = Candle15m & {
   timeLabel: string;
   isEntry: boolean;
   entrySide?: string;
+  entryPrice: number | null;
 };
 
-// ★ を描画する Dot（エントリー足だけ表示）
 type EntryStarDotProps = {
   cx?: number;
   cy?: number;
-  payload?: {
-    isEntry?: boolean;
-    entrySide?: string;
-  };
+  payload?: ChartPoint;
 };
 
+// エントリー価格の位置に★を描画
 const EntryStarDot = ({ cx, cy, payload }: EntryStarDotProps) => {
-  if (!payload?.isEntry) return null;
+  if (!payload) return null;
+  if (!payload.isEntry || payload.entryPrice == null) return null;
   if (cx == null || cy == null) return null;
 
   const isLong = payload.entrySide === "LONG";
@@ -76,7 +74,7 @@ const EntryStarDot = ({ cx, cy, payload }: EntryStarDotProps) => {
       textAnchor="middle"
       fontSize={16}
       fontWeight="bold"
-      fill={isLong ? "#22c55e" : "#ef4444"} // LONG=緑, SHORT=赤
+      fill={isLong ? "#22c55e" : "#ef4444"} // LONG=緑 / SHORT=赤
     >
       ★
     </text>
@@ -128,11 +126,7 @@ async function fetchCandles15minClient(
 
 // 含み損益（額）を計算（円換算）
 function computeUnrealizedPnlAmount(p: Position): number | null {
-  if (
-    p.entry_price == null ||
-    p.current_price == null ||
-    p.size == null
-  ) {
+  if (p.entry_price == null || p.current_price == null || p.size == null) {
     return null;
   }
 
@@ -183,39 +177,39 @@ export default function PositionsTabsClient({ positions }: Props) {
     };
   }, [activeSymbol]);
 
-  // チャート用データ生成
-  // ・timeLabel: 表示用の時刻
-  // ・isEntry: このポジションのエントリー足なら true
-  // ・entrySide: LONG / SHORT（★の色分け用）
-    const chartData: ChartPoint[] = useMemo(() => {
-      if (candles.length === 0) return [];
+  // チャート用データ生成（エントリー足を1本だけ特定し、その足に entryPrice を入れる）
+  const chartData: ChartPoint[] = useMemo(() => {
+    if (candles.length === 0) return [];
 
-      // このポジションのエントリー時刻（ミリ秒）
-      const entryTs = active?.entry_time
-        ? new Date(active.entry_time).getTime()
-        : null;
+    const entryTs = active?.entry_time
+      ? new Date(active.entry_time).getTime()
+      : null;
 
-      // 「どの足がエントリー足か」を一度だけ決める
-      let entryIndex = -1;
-      if (entryTs != null) {
-        let minDiff = Number.POSITIVE_INFINITY;
+    let entryIndex = -1;
+    let minDiff = Number.POSITIVE_INFINITY;
 
-        candles.forEach((c, idx) => {
-          const candleTime = new Date(c.time).getTime();
-          const diff = Math.abs(entryTs - candleTime);
-          if (diff < minDiff) {
-            minDiff = diff;
-            entryIndex = idx;
-          }
-        });
-
-        // エントリー時刻と最も近い足でも 15分以上離れていたら「該当なし」にする
-        if (minDiff > 15 * 60 * 1000) {
-          entryIndex = -1;
+    if (entryTs != null) {
+      candles.forEach((c, idx) => {
+        const candleTime = new Date(c.time).getTime();
+        const diff = Math.abs(entryTs - candleTime);
+        if (diff < minDiff) {
+          minDiff = diff;
+          entryIndex = idx;
         }
-      }
+      });
 
-      return candles.map((c, idx) => ({
+      // 一番近い足でも15分以上離れていたら「該当なし」
+      if (minDiff > 15 * 60 * 1000) {
+        entryIndex = -1;
+      }
+    }
+
+    return candles.map((c, idx) => {
+      const isEntry = idx === entryIndex;
+      const entryPriceForChart =
+        isEntry && active?.entry_price != null ? active.entry_price : null;
+
+      return {
         ...c,
         timeLabel: new Date(c.time).toLocaleString("ja-JP", {
           timeZone: "Asia/Tokyo",
@@ -224,10 +218,12 @@ export default function PositionsTabsClient({ positions }: Props) {
           hour: "2-digit",
           minute: "2-digit",
         }),
-        isEntry: idx === entryIndex,          // ← ここで1本だけ true になる
+        isEntry,
         entrySide: active?.side?.toUpperCase(),
-      }));
-    }, [candles, active]);
+        entryPrice: entryPriceForChart,
+      };
+    });
+  }, [candles, active]);
 
   if (positions.length === 0) {
     return (
@@ -316,7 +312,7 @@ export default function PositionsTabsClient({ positions }: Props) {
                         : "—"}
                     </span>
                   </div>
-                  <div className="flex justify-between">
+                  <div className="flex justify_between">
                     <span className="text-gray-500">現在価格</span>
                     <span className="font-semibold">
                       {active.current_price != null
@@ -350,7 +346,7 @@ export default function PositionsTabsClient({ positions }: Props) {
 
           {/* 右：15分足チャート（幅7） */}
           <div className="md:col-span-7 rounded-2xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 p-4 shadow-sm h-[420px]">
-            <div className="flex items-center justify_between mb-2">
+            <div className="flex items-center justify-between mb-2">
               <div className="text-xs font-semibold text-gray-700 dark:text-gray-200">
                 価格推移（15分足, 直近7日）
               </div>
@@ -361,7 +357,7 @@ export default function PositionsTabsClient({ positions }: Props) {
                 読み込み中…
               </div>
             ) : chartData.length === 0 ? (
-              <div className="h-full grid place-items-center text-xs text-gray-500">
+              <div className="h-full grid.place-items-center text-xs text-gray-500">
                 チャート用のローソク足データがありません。
               </div>
             ) : (
@@ -393,11 +389,22 @@ export default function PositionsTabsClient({ positions }: Props) {
                     }}
                     labelFormatter={(label: string) => `時刻: ${label}`}
                   />
+
+                  {/* 終値のライン（dotなし） */}
                   <Line
                     type="monotone"
                     dataKey="close"
-                    dot={<EntryStarDot />} // ★ を表示
+                    dot={false}
                     strokeWidth={1.5}
+                  />
+
+                  {/* エントリー価格に★を描画するための「見えないライン」 */}
+                  <Line
+                    type="monotone"
+                    dataKey="entryPrice"
+                    stroke="none"
+                    dot={<EntryStarDot />} // entryPrice の位置に★
+                    isAnimationActive={false}
                   />
                 </LineChart>
               </ResponsiveContainer>
