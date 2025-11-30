@@ -40,6 +40,8 @@ from db import upsert_price_cache
 from db import mark_order_executed_with_fill
 from uuid import UUID
 from db import upsert_candles_from_df
+from db import upsert_sr_zones
+from dataclasses import dataclass
 
 is_backtest_mode = "backtest" in sys.argv
 
@@ -170,6 +172,186 @@ def default_source_from_env(self) -> str:
     if self.exchange_settings_gmo.get("live_trade"):
         return "real"
     return "sim"
+
+@dataclass
+class SRZone:
+    symbol: str
+    zone_type: str      # "support" or "resistance"
+    price_center: float
+    price_low: float
+    price_high: float
+    touches: int
+    last_touched_at: dt.datetime
+    strength: float
+
+
+def detect_pivots(df: pd.DataFrame, left: int = 3, right: int = 3):
+    """
+    1時間足 df からピボット高値・安値を検出する
+    df: columns に ["timestamp", "high", "low"] がある前提
+    """
+    logger = logging.getLogger(__name__)
+
+    if df is None or df.empty:
+        logger.info("detect_pivots: 入力dfが空のため、ピボット0件で返します")
+        empty = pd.DataFrame(columns=["timestamp", "price"])
+        return empty.copy(), empty.copy()
+
+    df = df.sort_values("timestamp").reset_index(drop=True)
+
+    window = left + right + 1
+    logger.info(
+        f"detect_pivots: レコード数={len(df)}, window={window} "
+        f"(left={left}, right={right})"
+    )
+
+    high_roll_max = df["high"].rolling(window=window, center=True).max()
+    low_roll_min  = df["low"].rolling(window=window, center=True).min()
+
+    is_pivot_high = (df["high"] == high_roll_max) & high_roll_max.notna()
+    is_pivot_low  = (df["low"] == low_roll_min) & low_roll_min.notna()
+
+    pivot_highs = df[is_pivot_high][["timestamp", "high"]].rename(columns={"high": "price"})
+    pivot_lows  = df[is_pivot_low][["timestamp", "low"]].rename(columns={"low": "price"})
+
+    logger.info(
+        f"detect_pivots: 検出されたピボット数 highs={len(pivot_highs)}, lows={len(pivot_lows)}"
+    )
+
+    return pivot_highs.reset_index(drop=True), pivot_lows.reset_index(drop=True)
+
+def _cluster_levels(prices: list[float], max_distance: float) -> list[list[float]]:
+    """
+    価格リストを、max_distance 以内のもの同士でクラスタリング
+    戻り値: [ [cluster1_prices...], [cluster2_prices...], ...]
+    """
+    if not prices:
+        return []
+
+    prices = sorted(prices)
+    clusters: list[list[float]] = [[prices[0]]]
+
+    for p in prices[1:]:
+        current_cluster = clusters[-1]
+        center = sum(current_cluster) / len(current_cluster)
+        if abs(p - center) <= max_distance:
+            current_cluster.append(p)
+        else:
+            clusters.append([p])
+
+    return clusters
+
+
+def build_zones_from_pivots(
+    symbol: str,
+    pivot_df: pd.DataFrame,
+    zone_type: str,
+    max_distance_rate: float = 0.01,  # ±1.0% 以内を1クラスタ
+    band_width_rate: float = 0.005,   # ±0.5% をゾーン幅
+) -> list[SRZone]:
+    """
+    ピボット価格をクラスタリングして SRZone のリストに変換する
+    """
+    logger = logging.getLogger(__name__)
+
+    if pivot_df is None or pivot_df.empty:
+        logger.info(
+            f"{symbol} {zone_type}: ピボットが空のためゾーン0件で返します"
+        )
+        return []
+
+    prices = pivot_df["price"].astype(float).tolist()
+    avg_price = float(np.mean(prices))
+    max_distance = avg_price * max_distance_rate
+
+    logger.info(
+        f"{symbol} {zone_type}: pivot件数={len(prices)}, "
+        f"avg_price={avg_price:.4f}, max_distance={max_distance:.4f} "
+        f"(rate={max_distance_rate})"
+    )
+
+    clusters = _cluster_levels(prices, max_distance=max_distance)
+
+    logger.info(
+        f"{symbol} {zone_type}: 生成されたクラスタ数={len(clusters)}"
+    )
+
+    if not clusters:
+        return []
+
+    latest_ts = pivot_df["timestamp"].max()
+    zones: list[SRZone] = []
+
+    for idx, cluster in enumerate(clusters, start=1):
+        cluster_prices = np.array(cluster, dtype=float)
+        center = float(cluster_prices.mean())
+        width = center * band_width_rate
+
+        mask = pivot_df["price"].isin(cluster)
+        cluster_df = pivot_df[mask]
+
+        touches = int(len(cluster_df))
+        last_ts = cluster_df["timestamp"].max()
+
+        # 「タッチ回数 + 直近度」で強さスコア
+        days_since_last = (latest_ts - last_ts).total_seconds() / 86400.0
+        recency_score = max(0.0, 5.0 - days_since_last)  # 5日以内に触れているほど高スコア
+
+        strength = touches + recency_score
+
+        logger.debug(
+            f"{symbol} {zone_type}: cluster#{idx} center={center:.4f}, "
+            f"touches={touches}, last_ts={last_ts}, "
+            f"days_since_last={days_since_last:.2f}, strength={strength:.2f}"
+        )
+
+        zones.append(
+            SRZone(
+                symbol=symbol,
+                zone_type=zone_type,
+                price_center=center,
+                price_low=center - width,
+                price_high=center + width,
+                touches=touches,
+                last_touched_at=last_ts,
+                strength=strength,
+            )
+        )
+
+    # ① 直近のゾーンだけに絞る（例: 最後に触れてから20日以内）
+    RECENCY_DAYS_LIMIT = 20.0  # 必要に応じて調整
+    before_recency = len(zones)
+    recent_zones: list[SRZone] = []
+    for z in zones:
+        days_ago = (latest_ts - z.last_touched_at).total_seconds() / 86400.0
+        if days_ago <= RECENCY_DAYS_LIMIT:
+            recent_zones.append(z)
+
+    zones = recent_zones
+    logger.info(
+        f"{symbol} {zone_type}: recencyフィルタ適用 "
+        f"({before_recency} -> {len(zones)} zones, "
+        f"limit={RECENCY_DAYS_LIMIT}days)"
+    )
+
+    # ② タッチ回数でフィルタ（2回以上）
+    before_touches = len(zones)
+    zones = [z for z in zones if z.touches >= 2]
+    logger.info(
+        f"{symbol} {zone_type}: touchesフィルタ適用 "
+        f"({before_touches} -> {len(zones)} zones, min_touches=2)"
+    )
+
+    # ③ 強さ順にソートして上位のみ採用
+    zones.sort(key=lambda z: z.strength, reverse=True)
+
+    logger.info(
+        f"{symbol} {zone_type}: ゾーン生成件数={len(zones)} "
+        f"(top3 center={[f'{z.price_center:.1f}' for z in zones[:3]]})"
+    )
+
+    # 1サイドあたり最大10本
+    return zones[:10]
 
 class PriceCacheRefresher:
     def __init__(self, symbols, get_price_fn, interval_sec=30, logger=None):
@@ -467,6 +649,178 @@ class CryptoTradingBot:
 
         except Exception as e:
             self.logger.error(f"ローソク足保存中のエラー: {e}", exc_info=True)
+
+    def _load_hourly_candles_from_db(self, symbol: str, lookback_days: int = 30) -> pd.DataFrame:
+        """
+        candles_1hour テーブルから直近 lookback_days 日分の1時間足を取得
+        """
+        try:
+            src = "real"
+            since = utcnow() - timedelta(days=lookback_days)
+
+            self.logger.info(
+                f"{symbol}: SR用1時間足読み込み開始 "
+                f"(source={src}, since(UTC)={since.isoformat()})"
+            )
+
+            with begin() as conn:
+                rows = conn.execute(
+                    text(
+                        """
+                        SELECT
+                            ts AS timestamp,
+                            open,
+                            high,
+                            low,
+                            close,
+                            volume
+                        FROM candles_1hour
+                        WHERE symbol = :symbol
+                        AND source = :source
+                        AND ts >= :since
+                        ORDER BY ts
+                        """
+                    ),
+                    {
+                        "symbol": symbol,
+                        "source": src,
+                        "since": since,
+                    },
+                ).fetchall()
+
+            if not rows:
+                self.logger.warning(
+                    f"{symbol}: DBから取得できる1時間足が0件でした（SRゾーン用, "
+                    f"source={src}, since(UTC)={since.isoformat()}）"
+                )
+                return pd.DataFrame()
+
+            df = pd.DataFrame([dict(r._mapping) for r in rows])
+            df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+            before = len(df)
+            df = df.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+            after = len(df)
+
+            self.logger.info(
+                f"{symbol}: SR用1時間足取得完了 raw={before}件 -> 有効={after}件 "
+                f"(期間: {df['timestamp'].min()} 〜 {df['timestamp'].max()})"
+            )
+
+            if before != after:
+                self.logger.debug(
+                    f"{symbol}: timestamp 変換で {before - after} 件が除外されました（NaT）"
+                )
+
+            return df
+
+        except Exception as e:
+            self.logger.error(
+                f"{symbol}: 1時間足のDB読み込み中にエラー（SRゾーン用）: {e}",
+                exc_info=True,
+            )
+            return pd.DataFrame()
+
+
+    def _build_sr_zones_from_hourly(self, symbol: str, df_1h: pd.DataFrame) -> list[SRZone]:
+        """
+        1時間足 df_1h からサポレジゾーン（SRZone のリスト）を構築
+        """
+        if df_1h is None or df_1h.empty:
+            self.logger.info(f"{symbol}: SRゾーンを作るための1時間足データが空です")
+            return []
+
+        required_cols = {"timestamp", "high", "low"}
+        missing = required_cols - set(df_1h.columns)
+        if missing:
+            self.logger.warning(f"{symbol}: SRゾーン用に必要なカラムが不足: {missing}")
+            return []
+
+        df = df_1h.copy()
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+        df = df.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+
+        self.logger.info(
+            f"{symbol}: SR用1時間足整形後レコード数={len(df)} "
+            f"(期間: {df['timestamp'].min()} 〜 {df['timestamp'].max()})"
+        )
+
+        # ピボット検出
+        pivot_highs, pivot_lows = detect_pivots(df, left=3, right=3)
+
+        self.logger.info(
+            f"{symbol}: ピボット検出結果 highs={len(pivot_highs)}, lows={len(pivot_lows)}"
+        )
+
+        if len(pivot_highs) == 0 and len(pivot_lows) == 0:
+            self.logger.warning(f"{symbol}: ピボットが1つも検出できませんでした")
+            return []
+
+        # ゾーン化
+        res_zones = build_zones_from_pivots(symbol, pivot_highs, zone_type="resistance")
+        sup_zones = build_zones_from_pivots(symbol, pivot_lows,  zone_type="support")
+
+        zones = res_zones + sup_zones
+
+        # 代表値を少し出す（上位3つだけ）
+        def _summary(zlist: list[SRZone], ztype: str) -> str:
+            if not zlist:
+                return f"{ztype}:0件"
+            tops = sorted(zlist, key=lambda z: z.strength, reverse=True)[:3]
+            centers = ", ".join(f"{z.price_center:.1f}" for z in tops)
+            return f"{ztype}:{len(zlist)}件 (top3 center={centers})"
+
+        self.logger.info(
+            f"{symbol}: SRゾーン生成完了 "
+            f"({ _summary(res_zones, 'res') }, { _summary(sup_zones, 'sup') })"
+        )
+
+        return zones
+
+    
+    def update_sr_zones_for_symbol(self, symbol: str, lookback_days: int = 30) -> None:
+        """
+        指定シンボルについて、直近 lookback_days 日の1時間足から
+        サポート・レジスタンスゾーンを再計算してDBに保存
+        """
+        df_1h = self._load_hourly_candles_from_db(symbol, lookback_days=lookback_days)
+        if df_1h is None or df_1h.empty:
+            return
+
+        zones = self._build_sr_zones_from_hourly(symbol, df_1h)
+        if not zones:
+            return
+
+        self._save_sr_zones_to_db(zones, timeframe="1hour", lookback_days=lookback_days)
+
+    def _save_sr_zones_to_db(
+        self,
+        zones: list[SRZone],
+        timeframe: str = "1hour",
+        lookback_days: int = 30,
+    ) -> None:
+        """
+        SRゾーンを support_resistance_zones テーブルに保存
+        （実処理は db.upsert_sr_zones に委譲）
+        """
+        if not zones:
+            return
+
+        src = default_source_from_env(self)
+        uid = getattr(self, "user_id", None)
+
+        try:
+            upsert_sr_zones(
+                zones,
+                timeframe=timeframe,
+                lookback_days=lookback_days,
+                user_id=uid,
+                source=src,
+            )
+            self.logger.info(
+                f"SRゾーンを {len(zones)} 件保存しました: symbol={zones[0].symbol}, tf={timeframe}"
+            )
+        except Exception as e:
+            self.logger.error(f"SRゾーン保存中にエラー: {e}", exc_info=True)
         
     def _prepare_trade_logs_for_excel_report(self, trade_logs):
         """Excel レポート用に取引ログを準備"""
@@ -5770,6 +6124,14 @@ class CryptoTradingBot:
                                 df_5min = df_5min.iloc[-96:].copy().reset_index(drop=True)
 
                             self._store_recent_candles(symbol, df_5min, df_hourly)
+
+                            # === SRゾーン更新：1時間に1回だけ ===
+                            try:
+                                if jst_now.minute == 0:
+                                    self.logger.info(f"{symbol}: SRゾーン更新を実行します（直近30日・1時間足）")
+                                    self.update_sr_zones_for_symbol(symbol, lookback_days=30)
+                            except Exception as e:
+                                self.logger.warning(f"{symbol}: SRゾーン更新中にエラー: {e}", exc_info=True)
                             
                             # 最新のシグナル情報を取得
                             latest_signals = df_5min.iloc[-2]
