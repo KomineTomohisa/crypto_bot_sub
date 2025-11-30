@@ -4,6 +4,7 @@ import Link from "next/link";
 import { PageHeader, Section } from "@/components/ui";
 import ChartClient from "@/app/performance/ChartClient";
 import EquityChartClient from "./EquityChartClient";
+import PositionsTabsClient from "./PositionsTabsClient";
 
 /* =========================
    Types
@@ -431,43 +432,35 @@ export default async function Page({
       {/* 3. 現在の保有ポジション（最新シグナルの代替） */}
       <Section
         title="現在の保有ポジション"
-        headerRight={
-          (() => {
-            // positions の price_ts の最大（最新）を取得して時刻表示
-            const toDateMs = (v: string | number | null | undefined): number | null => {
-              const d = parseDateFlexible(v);
-              return d ? d.getTime() : null;
-            };
-            const times = positions
-              .map(p => toDateMs(p.price_ts))
-              .filter((t): t is number => typeof t === "number");
-            const latestMs = times.length ? Math.max(...times) : null;
+        headerRight={(() => {
+          const toDateMs = (v: string | number | null | undefined): number | null => {
+            const d = parseDateFlexible(v);
+            return d ? d.getTime() : null;
+          };
+          const times = positions
+            .map(p => toDateMs(p.price_ts))
+            .filter((t): t is number => typeof t === "number");
+          const latestMs = times.length ? Math.max(...times) : null;
 
-            const latestLabel = latestMs ? fmtJST(latestMs) : "—";
-            // しきい値：5分より古ければ stale
-            const stale = latestMs ? (Date.now() - latestMs) > 5 * 60 * 1000 : false;
+          const latestLabel = latestMs ? fmtJST(latestMs) : "—";
+          const stale = latestMs ? (Date.now() - latestMs) > 5 * 60 * 1000 : false;
 
-            return (
-              <div className="flex items-center gap-2 text-xs text-gray-500">
-                <span>更新: {latestLabel}</span>
-                {stale && (
-                  <span className="ml-1 rounded px-1.5 py-0.5 bg-yellow-100 text-yellow-800 dark:bg-yellow-900/40 dark:text-yellow-300">
-                    stale
-                  </span>
-                )}
-              </div>
-            );
-          })()
-        }
+          return (
+            <div className="flex items-center gap-2 text-xs text-gray-500">
+              <span>更新: {latestLabel}</span>
+              {stale && (
+                <span className="ml-1 rounded px-1.5 py-0.5 bg-yellow-100 text-yellow-800 dark:bg-yellow-900/40 dark:text-yellow-300">
+                  stale
+                </span>
+              )}
+            </div>
+          );
+        })()}
       >
         {positions.length === 0 ? (
           <div className="text-sm text-gray-500">保有中のポジションはありません。</div>
         ) : (
-          <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">
-            {positions.map((p, i) => (
-              <PositionCard key={`${p.symbol}-${i}`} p={p} />
-            ))}
-          </div>
+          <PositionsTabsClient positions={positions} />
         )}
       </Section>
 

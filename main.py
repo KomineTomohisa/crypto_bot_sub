@@ -435,6 +435,23 @@ RETURNING id, symbol, timeframe, score_col, op, v1, v2, target_side, action, pri
           valid_from, valid_to, user_id, strategy_id, notes
 """)
 
+CANDLES_15MIN_SQL = sa.text("""
+SELECT
+  ts,
+  open,
+  high,
+  low,
+  close,
+  volume
+FROM public.candles_15min
+WHERE lower(symbol) = lower(:symbol)
+  AND ts >= (NOW() AT TIME ZONE 'UTC') - (:days || ' days')::interval
+ORDER BY ts ASC
+""").bindparams(
+    sa.bindparam("symbol", type_=sa.String),
+    sa.bindparam("days", type_=sa.Integer),
+)
+
 # ------------------- エンドポイント -------------------
 
 # q（簡易全文）条件を動的に足す
@@ -1042,6 +1059,37 @@ def create_signal_rule(payload: RuleCreateIn):
     with engine.begin() as conn:
         row = conn.execute(INSERT_RULE_SQL, params).mappings().first()
     return _row_to_json(row)
+
+@app.get("/public/candles_15min")
+def get_candles_15min(
+    symbol: str = Query(..., min_length=1, max_length=50, description="例: ltc_jpy"),
+    days: int = Query(7, ge=1, le=30, description="取得する日数（最大30日）"),
+):
+    """
+    candles_15min テーブルから、指定シンボルのローソク足（15分足）を返す。
+    Frontendの PositionsTabsClient でチャート描画に利用。
+    """
+    try:
+        with engine.begin() as conn:
+            rows = conn.execute(CANDLES_15MIN_SQL, {
+                "symbol": symbol,
+                "days": days,
+            }).all()
+    except Exception as e:
+        logger.exception("GET /public/candles_15min failed")
+        raise HTTPException(status_code=500, detail=f"candles_15min query failed: {e}")
+
+    out = []
+    for ts, open_, high_, low_, close_, volume_ in rows:
+        out.append({
+            "time": ts.isoformat(),
+            "open": float(open_),
+            "high": float(high_),
+            "low": float(low_),
+            "close": float(close_),
+            "volume": float(volume_) if volume_ is not None else None,
+        })
+    return out
 
 JST = timezone(timedelta(hours=9))
 
