@@ -914,6 +914,115 @@ def get_line_channel_token(provider_key: str) -> Optional[bytes]:
         row = c.execute(stmt, {"k": provider_key}).fetchone()
     return row[0] if row else None
 
+# -----------------------------------------------------------------------------
+# ローソク足保存用ヘルパー
+# -----------------------------------------------------------------------------
+def upsert_candles_from_df(
+    table_name: str,
+    symbol: str,
+    timeframe: str,
+    df,
+    *,
+    source: str = "gmo",
+    keep_days: int = 30,
+    conn: Optional[Connection] = None,
+) -> None:
+    """
+    df からローソク足情報をまとめて UPSERT するヘルパー。
+    想定カラム: ['timestamp', 'open', 'high', 'low', 'close'] (+任意で 'volume')
+    - table_name: 'candles_15min' や 'candles_1hour' を想定（固定文字列で渡すこと）
+    - symbol: 'ltc_jpy' など
+    - timeframe: '15min', '1hour' など
+    """
+    if df is None or getattr(df, "empty", True):
+        return
+
+    # 必須カラムチェック
+    required_cols = ["timestamp", "open", "high", "low", "close"]
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        # 必要であれば logger を使ってもよい
+        print(f"[upsert_candles_from_df] missing columns in df: {missing}")
+        return
+
+    # DataFrame -> dict のリストに変換
+    rows: list[dict[str, Any]] = []
+    for _, r in df.iterrows():
+        ts = r["timestamp"]
+        if isinstance(ts, datetime):
+            # JST naive なら JST を付けてから UTC へ変換
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=JST)
+        else:
+            # 文字列などの場合は一応パースを試みる
+            try:
+                ts = datetime.fromisoformat(str(ts))
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=JST)
+            except Exception:
+                continue
+
+        rows.append(
+            {
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "ts": _as_utc(ts),  # DB には UTC で保存
+                "open": float(r["open"]),
+                "high": float(r["high"]),
+                "low": float(r["low"]),
+                "close": float(r["close"]),
+                "volume": float(r["volume"]) if "volume" in df.columns and r["volume"] is not None else None,
+                "source": source,
+            }
+        )
+
+    if not rows:
+        return
+
+    # ※ table_name は外部入力を通さず、呼び出し側で固定文字列を渡す前提
+    insert_sql = sa.text(
+        f"""
+        INSERT INTO {table_name} (
+            symbol, timeframe, ts,
+            open, high, low, close, volume,
+            source
+        )
+        VALUES (
+            :symbol, :timeframe, :ts,
+            :open, :high, :low, :close, :volume,
+            :source
+        )
+        ON CONFLICT (symbol, timeframe, ts)
+        DO UPDATE SET
+            open   = EXCLUDED.open,
+            high   = EXCLUDED.high,
+            low    = EXCLUDED.low,
+            close  = EXCLUDED.close,
+            volume = EXCLUDED.volume,
+            source = EXCLUDED.source
+        """
+    )
+
+    delete_sql = sa.text(
+        f"""
+        DELETE FROM {table_name}
+        WHERE symbol = :symbol
+          AND timeframe = :timeframe
+          AND ts < (now() - (:keep_days || ' days')::interval)
+        """
+    )
+
+    # 既存の begin / _exec に合わせて Tx を扱う
+    if conn is not None:
+        # 呼び出し側のトランザクションに参加
+        conn.execute(insert_sql, rows)
+        conn.execute(delete_sql, {"symbol": symbol, "timeframe": timeframe, "keep_days": keep_days})
+    else:
+        # 単独でトランザクション開始
+        with begin() as c:
+            c.execute(insert_sql, rows)
+            c.execute(delete_sql, {"symbol": symbol, "timeframe": timeframe, "keep_days": keep_days})
+
 @retry(stop=stop_after_attempt(3), wait=wait_exponential_jitter(0.2, 1.5))
 def upsert_price_cache(
     symbol: str,
