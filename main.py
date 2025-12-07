@@ -452,6 +452,36 @@ ORDER BY ts ASC
     sa.bindparam("days", type_=sa.Integer),
 )
 
+SR_ZONES_SQL = sa.text("""
+SELECT
+  zone_id,
+  user_id,
+  symbol,
+  timeframe,
+  lookback_days,
+  zone_type,
+  price_center,
+  price_low,
+  price_high,
+  touches,
+  strength,
+  last_touched_at,
+  generated_at,
+  source
+FROM support_resistance_zones
+WHERE
+  source = 'sim'
+  AND lower(symbol) = lower(:symbol)
+  AND timeframe = :timeframe
+  AND lookback_days = :lookback_days
+ORDER BY price_center ASC
+""").bindparams(
+    sa.bindparam("symbol", type_=sa.String),
+    sa.bindparam("timeframe", type_=sa.String),
+    sa.bindparam("lookback_days", type_=sa.Integer),
+)
+
+
 # ------------------- エンドポイント -------------------
 
 # q（簡易全文）条件を動的に足す
@@ -1012,6 +1042,45 @@ def export_signal_rules_csv(
     return StreamingResponse(iter([data]), media_type="text/csv",
         headers={"Content-Disposition": 'attachment; filename="signal_rule_thresholds.csv"'}
     )
+
+@app.get("/public/support_resistance_zones")
+def get_support_resistance_zones(
+    symbol: str = Query(..., min_length=1, max_length=50, description="例: ltc_jpy"),
+    timeframe: str = Query("1hour", description="SRを作成した足種 (例: 1hour / 15min)"),
+    lookback_days: int = Query(30, ge=1, le=180),
+):
+    """
+    support_resistance_zones テーブルから、指定シンボルのSRゾーンを返す。
+    価格チャート上に水平ゾーンとして描画する用途。
+    """
+    try:
+        with engine.begin() as conn:
+            rows = conn.execute(SR_ZONES_SQL, {
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "lookback_days": lookback_days,
+            }).mappings().all()
+    except Exception as e:
+        logger.exception("GET /public/support_resistance_zones failed")
+        raise HTTPException(status_code=500, detail=f"sr_zones query failed: {e}")
+
+    out = []
+    for r in rows:
+        out.append({
+            "zone_id": str(r["zone_id"]),
+            "symbol": r["symbol"],
+            "timeframe": r["timeframe"],
+            "lookback_days": int(r["lookback_days"]),
+            "zone_type": r["zone_type"],
+            "price_center": float(r["price_center"]),
+            "price_low": float(r["price_low"]),
+            "price_high": float(r["price_high"]),
+            "touches": int(r["touches"]),
+            "strength": float(r["strength"]),
+            "last_touched_at": r["last_touched_at"].isoformat() if r["last_touched_at"] else None,
+            "generated_at": r["generated_at"].isoformat() if r["generated_at"] else None,
+        })
+    return out
 
 def _row_to_json(r):
     return {

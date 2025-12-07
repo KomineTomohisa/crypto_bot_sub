@@ -247,7 +247,7 @@ def build_zones_from_pivots(
     pivot_df: pd.DataFrame,
     zone_type: str,
     max_distance_rate: float = 0.01,  # ±1.0% 以内を1クラスタ
-    band_width_rate: float = 0.005,   # ±0.5% をゾーン幅
+    band_width_rate: float = 0.003,   # ±0.3% をゾーン幅
 ) -> list[SRZone]:
     """
     ピボット価格をクラスタリングして SRZone のリストに変換する
@@ -6025,6 +6025,15 @@ class CryptoTradingBot:
 
             # バックテストにあわせてlast_sentiment_timeを初期化
             self.last_sentiment_time = None
+
+            # === 起動時にSRゾーンを一括更新 ==========================
+            try:
+                self.logger.info("起動時SRゾーン更新を実行します（直近30日・1時間足）")
+                for symbol in self.symbols:
+                    self.logger.info(f"{symbol}: 起動時SRゾーン更新を開始します")
+                    self.update_sr_zones_for_symbol(symbol, lookback_days=30)
+            except Exception as e:
+                self.logger.warning(f"起動時SRゾーン更新中にエラー: {e}", exc_info=True)
 
             # メインループ - より堅牢なエラーハンドリングを追加
             while True:

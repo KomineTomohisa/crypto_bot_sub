@@ -21,6 +21,7 @@ try:
     from psycopg2.extras import Json as _PsycoJson
 except Exception:
     _PsycoJson = None
+import uuid
 
 # -----------------------------------------------------------------------------
 # 環境

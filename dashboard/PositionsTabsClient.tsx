@@ -9,6 +9,7 @@ import {
   YAxis,
   Tooltip,
   CartesianGrid,
+  ReferenceArea,
 } from "recharts";
 
 type Position = {
@@ -32,6 +33,15 @@ type Candle15m = {
   volume?: number | null;
 };
 
+type SrZone = {
+  zone_id: string;
+  zone_type: string;
+  price_center: number;
+  price_low: number;
+  price_high: number;
+  strength: number;
+};
+
 type RawCandle = {
   time: string;
   open: number | string;
@@ -39,10 +49,6 @@ type RawCandle = {
   low: number | string;
   close: number | string;
   volume?: number | string | null;
-};
-
-type Props = {
-  positions: Position[];
 };
 
 type ChartPoint = Candle15m & {
@@ -58,21 +64,20 @@ type EntryStarDotProps = {
   payload?: ChartPoint;
 };
 
-// エントリー価格の位置に★を描画
+// エントリー価格の位置に★を描画する dot コンポーネント
 const EntryStarDot = ({ cx, cy, payload }: EntryStarDotProps) => {
   if (!payload) return null;
   if (!payload.isEntry || payload.entryPrice == null) return null;
   if (cx == null || cy == null) return null;
 
-  const isLong = payload.entrySide === "LONG";
+  const isLong = (payload.entrySide ?? "").toUpperCase() === "LONG";
 
   return (
     <text
       x={cx}
       y={cy}
-      dy={-8}
       textAnchor="middle"
-      fontSize={16}
+      fontSize={14}
       fontWeight="bold"
       fill={isLong ? "#22c55e" : "#ef4444"} // LONG=緑 / SHORT=赤
     >
@@ -98,18 +103,20 @@ async function fetchCandles15minClient(
 
   const res = await fetch(url.toString());
   if (!res.ok) {
-    console.warn("candles_15min fetch failed", res.status);
+    console.warn("candles_15min fetch failed", res.status, await res.text());
     return [];
   }
 
-  const raw: unknown = await res.json();
-
-  const toNum = (v: unknown): number =>
-    typeof v === "number" ? v : v == null ? NaN : Number(v);
-
+  const raw = (await res.json()) as unknown;
   if (!Array.isArray(raw)) {
+    console.warn("candles_15min response is not array");
     return [];
   }
+
+  const toNum = (v: number | string): number => {
+    const n = typeof v === "number" ? v : Number(v);
+    return Number.isNaN(n) ? 0 : n;
+  };
 
   return (raw as RawCandle[]).map((r) => ({
     time: String(r.time),
@@ -124,9 +131,56 @@ async function fetchCandles15minClient(
   }));
 }
 
+// ---- SRゾーン取得（クライアント側 fetch） ----
+async function fetchSrZonesClient(
+  symbol: string,
+  timeframe: string = "1hour",
+  lookbackDays: number = 30,
+): Promise<SrZone[]> {
+  const base = process.env.NEXT_PUBLIC_API_BASE;
+  if (!base) {
+    console.warn("NEXT_PUBLIC_API_BASE が設定されていません");
+    return [];
+  }
+
+  const url = new URL(`${base}/public/support_resistance_zones`);
+  url.searchParams.set("symbol", symbol);
+  url.searchParams.set("timeframe", timeframe);
+  url.searchParams.set("lookback_days", String(lookbackDays));
+
+  const res = await fetch(url.toString());
+  if (!res.ok) {
+    console.warn(
+      "support_resistance_zones fetch failed",
+      res.status,
+      await res.text(),
+    );
+    return [];
+  }
+
+  const raw = (await res.json()) as unknown;
+  if (!Array.isArray(raw)) return [];
+
+  // any を使わず Record<string, unknown> で扱う
+  const rows = raw as Array<Record<string, unknown>>;
+
+  return rows.map((z) => ({
+    zone_id: String(z["zone_id"]),
+    zone_type: String(z["zone_type"] ?? ""),
+    price_center: Number(z["price_center"]),
+    price_low: Number(z["price_low"]),
+    price_high: Number(z["price_high"]),
+    strength:
+      z["strength"] != null ? Number(z["strength"] as number | string) : 0,
+  }));
+}
+
 // 含み損益（額）を計算（円換算）
 function computeUnrealizedPnlAmount(p: Position): number | null {
   if (p.entry_price == null || p.current_price == null || p.size == null) {
+    return null;
+  }
+  if (Number.isNaN(p.entry_price) || Number.isNaN(p.current_price)) {
     return null;
   }
 
@@ -146,10 +200,15 @@ function computeUnrealizedPnlAmount(p: Position): number | null {
   return diff * size;
 }
 
+type Props = {
+  positions: Position[];
+};
+
 // ---- メインコンポーネント ----
 export default function PositionsTabsClient({ positions }: Props) {
   const [activeIndex, setActiveIndex] = useState(0);
   const [candles, setCandles] = useState<Candle15m[]>([]);
+  const [srZones, setSrZones] = useState<SrZone[]>([]);
   const [loading, setLoading] = useState(false);
 
   const active = positions[activeIndex];
@@ -161,10 +220,14 @@ export default function PositionsTabsClient({ positions }: Props) {
     let cancelled = false;
     setLoading(true);
 
-    fetchCandles15minClient(activeSymbol, 7)
-      .then((data) => {
+    Promise.all([
+      fetchCandles15minClient(activeSymbol, 7),
+      fetchSrZonesClient(activeSymbol, "1hour", 30),
+    ])
+      .then(([candlesData, srZonesData]) => {
         if (cancelled) return;
-        setCandles(data);
+        setCandles(candlesData);
+        setSrZones(srZonesData);
       })
       .finally(() => {
         if (!cancelled) {
@@ -197,16 +260,13 @@ export default function PositionsTabsClient({ positions }: Props) {
           entryIndex = idx;
         }
       });
-
-      // 一番近い足でも15分以上離れていたら「該当なし」
-      if (minDiff > 15 * 60 * 1000) {
-        entryIndex = -1;
-      }
     }
+
+    const sideUpper = (active?.side ?? "").toUpperCase();
 
     return candles.map((c, idx) => {
       const isEntry = idx === entryIndex;
-      const entryPriceForChart =
+      const entryPrice =
         isEntry && active?.entry_price != null ? active.entry_price : null;
 
       return {
@@ -219,19 +279,24 @@ export default function PositionsTabsClient({ positions }: Props) {
           minute: "2-digit",
         }),
         isEntry,
-        entrySide: active?.side?.toUpperCase(),
-        entryPrice: entryPriceForChart,
+        entrySide: sideUpper,
+        entryPrice,
       };
     });
-  }, [candles, active]);
+  }, [candles, active?.entry_price, active?.entry_time, active?.side]);
 
-  if (positions.length === 0) {
-    return (
-      <div className="text-sm text-gray-500">
-        保有中のポジションはありません。
-      </div>
-    );
-  }
+  const pnlInfo = useMemo(() => {
+    const amount = active ? computeUnrealizedPnlAmount(active) : null;
+    const pct = active?.unrealized_pnl_pct ?? null;
+
+    let colorClass = "text-gray-700";
+    if (typeof amount === "number" && typeof pct === "number") {
+      if (amount > 0 && pct > 0) colorClass = "text-emerald-500";
+      else if (amount < 0 && pct < 0) colorClass = "text-red-500";
+    }
+
+    return { amount, pct, colorClass };
+  }, [active]);
 
   return (
     <div className="space-y-4">
@@ -246,11 +311,10 @@ export default function PositionsTabsClient({ positions }: Props) {
               type="button"
               onClick={() => setActiveIndex(i)}
               className={[
-                "px-3 py-1.5 rounded-full text-xs font-medium border transition",
-                "max-w-[140px] truncate",
+                "px-3 py-1.5 rounded-full border text-xs md:text-sm transition-colors",
                 isActive
                   ? "bg-blue-600 text-white border-blue-600"
-                  : "bg-white dark:bg-gray-900 text-gray-700 dark:text-gray-200 border-gray-300 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-800",
+                  : "bg-white text-gray-700 border-gray-300 hover:bg-gray-50",
               ].join(" ")}
             >
               {sym}
@@ -259,156 +323,177 @@ export default function PositionsTabsClient({ positions }: Props) {
         })}
       </div>
 
-      {/* 選択中ポジションの情報 + チャート */}
+      {/* 詳細エリア */}
       {active && (
-        <div className="grid grid-cols-1 md:grid-cols-10 gap-4 items-start">
-          {/* 左：ポジション概要（幅3） */}
-          <div className="md:col-span-3 rounded-2xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 p-4 shadow-sm space-y-3">
-            <div className="flex items-center justify-between">
-              <div className="text-sm font-semibold truncate">
-                {(active.symbol ?? "").toUpperCase()}
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+          {/* 左：ポジション情報 */}
+          <div className="lg:col-span-1 space-y-3 rounded-lg border border-gray-200 bg-white p-4 shadow-sm">
+            <h3 className="text-sm font-semibold text-gray-800 mb-1">
+              ポジション詳細
+            </h3>
+            <div className="text-xs space-y-1.5">
+              <div className="flex justify-between">
+                <span className="text-gray-500">シンボル</span>
+                <span className="font-semibold">
+                  {(active.symbol ?? "").toUpperCase()}
+                </span>
               </div>
-              <span
-                className={[
-                  "inline-flex items-center rounded px-2 py-0.5 text-[11px] font-medium",
-                  active.side?.toUpperCase() === "LONG"
-                    ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300"
-                    : "bg-rose-100 text-rose-700 dark:bg-rose-900/30 dark:text-rose-300",
-                ].join(" ")}
-              >
-                {active.side?.toUpperCase()}
-              </span>
+              <div className="flex justify-between">
+                <span className="text-gray-500">サイド</span>
+                <span className="font-semibold">
+                  {(active.side ?? "").toUpperCase()}
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-gray-500">サイズ</span>
+                <span className="font-semibold">
+                  {active.size != null
+                    ? active.size.toLocaleString("ja-JP")
+                    : "—"}
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-gray-500">エントリー価格</span>
+                <span className="font-semibold">
+                  {active.entry_price != null
+                    ? active.entry_price.toLocaleString("ja-JP")
+                    : "—"}
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-gray-500">現在価格</span>
+                <span className="font-semibold">
+                  {active.current_price != null
+                    ? active.current_price.toLocaleString("ja-JP")
+                    : "—"}
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-gray-500">含み損益（額）</span>
+                <span className={[pnlInfo.colorClass, "font-semibold"].join(" ")}>
+                  {typeof pnlInfo.amount === "number"
+                    ? `${pnlInfo.amount >= 0 ? "+" : ""}${pnlInfo.amount.toLocaleString(
+                        "ja-JP",
+                        { maximumFractionDigits: 0 },
+                      )} 円`
+                    : "—"}
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-gray-500">含み損益（%）</span>
+                <span className={[pnlInfo.colorClass, "font-semibold"].join(" ")}>
+                  {typeof pnlInfo.pct === "number"
+                    ? `${pnlInfo.pct >= 0 ? "+" : ""}${pnlInfo.pct.toFixed(2)}%`
+                    : "—"}
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-gray-500">エントリー日時</span>
+                <span className="font-semibold">
+                  {active.entry_time
+                    ? new Date(active.entry_time).toLocaleString("ja-JP", {
+                        timeZone: "Asia/Tokyo",
+                      })
+                    : "—"}
+                </span>
+              </div>
             </div>
-
-            {(() => {
-              const amount = computeUnrealizedPnlAmount(active);
-              const pct = active.unrealized_pnl_pct;
-              const isPositive =
-                typeof amount === "number"
-                  ? amount >= 0
-                  : typeof pct === "number"
-                  ? pct >= 0
-                  : null;
-              const colorClass =
-                isPositive == null
-                  ? ""
-                  : isPositive
-                  ? "text-emerald-600"
-                  : "text-rose-600";
-
-              return (
-                <div className="space-y-2 text-sm">
-                  <div className="flex justify-between">
-                    <span className="text-gray-500">サイズ</span>
-                    <span className="font-semibold">
-                      {active.size != null ? active.size : "—"}
-                    </span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span className="text-gray-500">エントリー価格</span>
-                    <span className="font-semibold">
-                      {active.entry_price != null
-                        ? active.entry_price.toLocaleString("ja-JP")
-                        : "—"}
-                    </span>
-                  </div>
-                  <div className="flex justify_between">
-                    <span className="text-gray-500">現在価格</span>
-                    <span className="font-semibold">
-                      {active.current_price != null
-                        ? active.current_price.toLocaleString("ja-JP")
-                        : "—"}
-                    </span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span className="text-gray-500">含み損益（額）</span>
-                    <span className={["font-semibold", colorClass].join(" ")}>
-                      {typeof amount === "number"
-                        ? `${amount >= 0 ? "+" : ""}${amount.toLocaleString(
-                            "ja-JP",
-                            { maximumFractionDigits: 0 },
-                          )} 円`
-                        : "—"}
-                    </span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span className="text-gray-500">含み損益（%）</span>
-                    <span className={["font-semibold", colorClass].join(" ")}>
-                      {typeof pct === "number"
-                        ? `${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%`
-                        : "—"}
-                    </span>
-                  </div>
-                </div>
-              );
-            })()}
           </div>
 
-          {/* 右：15分足チャート（幅7） */}
-          <div className="md:col-span-7 rounded-2xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 p-4 shadow-sm h-[420px]">
+          {/* 右：価格推移チャート */}
+          <div className="lg:col-span-2 rounded-lg border border-gray-200 bg-white p-4 shadow-sm">
             <div className="flex items-center justify-between mb-2">
-              <div className="text-xs font-semibold text-gray-700 dark:text-gray-200">
-                価格推移（15分足, 直近7日）
-              </div>
+              <h3 className="text-sm font-semibold text-gray-800">
+                価格推移（15分足 / 直近7日）
+              </h3>
+              {loading && (
+                <span className="text-xs text-gray-500">読み込み中...</span>
+              )}
             </div>
 
-            {loading ? (
-              <div className="h-full grid place-items-center text-xs text-gray-500">
-                読み込み中…
-              </div>
-            ) : chartData.length === 0 ? (
-              <div className="h-full grid.place-items-center text-xs text-gray-500">
-                チャート用のローソク足データがありません。
-              </div>
-            ) : (
-              <ResponsiveContainer width="100%" height="100%">
-                <LineChart data={chartData}>
-                  <CartesianGrid strokeDasharray="3 3" />
-                  <XAxis
-                    dataKey="timeLabel"
-                    minTickGap={16}
-                    tick={{ fontSize: 10 }}
-                  />
-                  <YAxis
-                    tick={{ fontSize: 10 }}
-                    width={60}
-                    domain={["auto", "auto"]}
-                  />
-                  <Tooltip
-                    contentStyle={{
-                      fontSize: 11,
-                    }}
-                    formatter={(value: number | string, name: string) => {
-                      if (name === "close") {
-                        return [
-                          Number(value).toLocaleString("ja-JP"),
-                          "終値",
-                        ];
+            <div className="h-72">
+              {chartData.length === 0 ? (
+                <div className="flex h-full items-center justify-center text-xs text-gray-400">
+                  データがありません
+                </div>
+              ) : (
+                <ResponsiveContainer width="100%" height="100%">
+                  <LineChart data={chartData}>
+                    <CartesianGrid strokeDasharray="3 3" />
+                    <XAxis
+                      dataKey="timeLabel"
+                      minTickGap={16}
+                      tick={{ fontSize: 10 }}
+                    />
+                    <YAxis
+                      tick={{ fontSize: 10 }}
+                      width={60}
+                      domain={[
+                        (dataMin: number) => dataMin * 0.995,
+                        (dataMax: number) => dataMax * 1.005,
+                      ]}
+                      tickFormatter={(value: number) =>
+                        value % 1 === 0
+                          ? value.toLocaleString("ja-JP")              // 整数 → そのまま区切りつき
+                          : value.toLocaleString("ja-JP", {            // 小数 → 最大2桁
+                              minimumFractionDigits: 0,
+                              maximumFractionDigits: 2,
+                            })
                       }
-                      return [String(value), name];
-                    }}
-                    labelFormatter={(label: string) => `時刻: ${label}`}
-                  />
+                    />
+                    <Tooltip
+                      contentStyle={{
+                        fontSize: 11,
+                      }}
+                      formatter={(value: number | string, name: string) => {
+                        if (name === "close") {
+                          return [
+                            Number(value).toLocaleString("ja-JP"),
+                            "終値",
+                          ];
+                        }
+                        return [String(value), name];
+                      }}
+                      labelFormatter={(label: string) => `時刻: ${label}`}
+                    />
 
-                  {/* 終値のライン（dotなし） */}
-                  <Line
-                    type="monotone"
-                    dataKey="close"
-                    dot={false}
-                    strokeWidth={1.5}
-                  />
+                    {/* SRゾーン帯を表示 */}
+                    {srZones.map((z) => {
+                      const isSupport =
+                        (z.zone_type ?? "").toLowerCase() === "support";
+                      return (
+                        <ReferenceArea
+                          key={z.zone_id}
+                          y1={z.price_low}
+                          y2={z.price_high}
+                          stroke={isSupport ? "#22c55e" : "#ef4444"}
+                          strokeOpacity={0.8}
+                          fill={isSupport ? "#22c55e" : "#ef4444"}
+                          fillOpacity={0.06}
+                        />
+                      );
+                    })}
 
-                  {/* エントリー価格に★を描画するための「見えないライン」 */}
-                  <Line
-                    type="monotone"
-                    dataKey="entryPrice"
-                    stroke="none"
-                    dot={<EntryStarDot />} // entryPrice の位置に★
-                    isAnimationActive={false}
-                  />
-                </LineChart>
-              </ResponsiveContainer>
-            )}
+                    {/* 終値のライン（dotなし） */}
+                    <Line
+                      type="monotone"
+                      dataKey="close"
+                      dot={false}
+                      strokeWidth={1.5}
+                    />
+
+                    {/* エントリー価格に★を描画するための「見えないライン」 */}
+                    <Line
+                      type="monotone"
+                      dataKey="entryPrice"
+                      stroke="none"
+                      dot={<EntryStarDot />} // entryPrice の位置に★
+                      isAnimationActive={false}
+                    />
+                  </LineChart>
+                </ResponsiveContainer>
+              )}
+            </div>
           </div>
         </div>
       )}
