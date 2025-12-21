@@ -22,6 +22,7 @@ try:
 except Exception:
     _PsycoJson = None
 import uuid
+import pandas as pd
 
 # -----------------------------------------------------------------------------
 # 環境
@@ -1143,6 +1144,7 @@ def upsert_candles_from_df(
                 "low": float(r["low"]),
                 "close": float(r["close"]),
                 "volume": float(r["volume"]) if "volume" in df.columns and r["volume"] is not None else None,
+                "atr": float(r["ATR"]) if "ATR" in df.columns and not pd.isna(r["ATR"]) else None,
                 "source": source,
             }
         )
@@ -1156,11 +1158,13 @@ def upsert_candles_from_df(
         INSERT INTO {table_name} (
             symbol, timeframe, ts,
             open, high, low, close, volume,
+            atr,
             source
         )
         VALUES (
             :symbol, :timeframe, :ts,
             :open, :high, :low, :close, :volume,
+            :atr,
             :source
         )
         ON CONFLICT (symbol, timeframe, ts)
@@ -1170,6 +1174,7 @@ def upsert_candles_from_df(
             low    = EXCLUDED.low,
             close  = EXCLUDED.close,
             volume = EXCLUDED.volume,
+            atr    = EXCLUDED.atr,
             source = EXCLUDED.source
         """
     )

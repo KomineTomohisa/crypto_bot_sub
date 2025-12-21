@@ -42,6 +42,9 @@ from uuid import UUID
 from db import upsert_candles_from_df
 from db import upsert_sr_zones
 from dataclasses import dataclass
+from typing import Literal
+from dataclasses import replace
+from typing import List, Callable
 
 is_backtest_mode = "backtest" in sys.argv
 
@@ -241,117 +244,502 @@ def _cluster_levels(prices: list[float], max_distance: float) -> list[list[float
 
     return clusters
 
+def _normalize_zone_type(zone_type: str) -> str:
+    z = (zone_type or "").strip().lower()
+    if z not in ("support", "resistance"):
+        raise ValueError(f"zone_type must be 'support' or 'resistance', got: {zone_type!r}")
+    return z
+
+
+def count_zone_rejects_unique(
+    df: pd.DataFrame,
+    zone_low: float,
+    zone_high: float,
+    zone_type: str,
+) -> int:
+    """
+    ゾーンでの「反発(reject)」回数をカウントする
+    ・連続反発は1回扱い
+    ・終値での戻りを必須条件にする（厳しめ）
+    """
+    zt = _normalize_zone_type(zone_type)
+
+    required = {"high", "low", "close"}
+    missing = required - set(df.columns)
+    if missing:
+        return 0
+
+    d = df.dropna(subset=["high", "low", "close"])
+
+    reject_count = 0
+    in_reject = False
+
+    for _, row in d.iterrows():
+        high = float(row["high"])
+        low = float(row["low"])
+        close = float(row["close"])
+
+        if zt == "resistance":
+            is_reject = (high >= zone_low) and (close < zone_low)
+        else:  # support
+            is_reject = (low <= zone_high) and (close > zone_high)
+
+        if is_reject:
+            if not in_reject:
+                reject_count += 1
+                in_reject = True
+        else:
+            in_reject = False
+
+    return reject_count
+
+
+def get_last_reject_time(
+    df: pd.DataFrame,
+    zone_low: float,
+    zone_high: float,
+    zone_type: str,
+):
+    zt = _normalize_zone_type(zone_type)
+
+    required = {"timestamp", "high", "low", "close"}
+    missing = required - set(df.columns)
+    if missing:
+        return None
+
+    d = df.dropna(subset=["timestamp", "high", "low", "close"])
+
+    last_ts = None
+    for _, row in d.iterrows():
+        high = float(row["high"])
+        low = float(row["low"])
+        close = float(row["close"])
+
+        if zt == "resistance":
+            if high >= zone_low and close < zone_low:
+                last_ts = row["timestamp"]
+        else:  # support
+            if low <= zone_high and close > zone_high:
+                last_ts = row["timestamp"]
+
+    return last_ts
+
+def is_zone_broken(
+    df: pd.DataFrame,
+    zone_low: float,
+    zone_high: float,
+    zone_type: str,        # "support" or "resistance"
+    n_closes: int = 2,     # 連続本数
+    lookback: int = 60,    # 直近何本を見るか（1時間足なら60=約2.5日）
+) -> bool:
+    """
+    ブレイク済みゾーン判定（終値ベース）
+    - resistance: close > zone_high が n_closes 本連続 → ブレイク
+    - support   : close < zone_low  が n_closes 本連続 → ブレイク
+    """
+    if df is None or df.empty:
+        return False
+
+    zt = (zone_type or "").strip().lower()
+    if zt not in ("support", "resistance"):
+        return False
+
+    if "close" not in df.columns:
+        return False
+
+    d = df.dropna(subset=["close"])
+    if d.empty:
+        return False
+
+    # 直近 lookback 本だけ確認
+    d = d.tail(max(lookback, n_closes))
+
+    closes = d["close"].astype(float).to_numpy()
+    if len(closes) < n_closes:
+        return False
+
+    # 連続判定：末尾から n_closes 本が条件を満たすか
+    tail = closes[-n_closes:]
+
+    if zt == "resistance":
+        return bool((tail > zone_high).all())
+    else:  # support
+        return bool((tail < zone_low).all())
+
+BreakState = Literal["none", "broken", "broken_confirmed"]
+
+def get_zone_break_state(
+    df: pd.DataFrame,
+    zone_low: float,
+    zone_high: float,
+    zone_type: str,              # "support" or "resistance"
+    *,
+    n_closes: int = 2,
+    lookback: int = 60,
+    buffer: float = 0.0,         # ブレイク判定の余裕（0でOK。必要ならATR連動で）
+) -> BreakState:
+    """
+    終値ベースで「ブレイク済みか」を判定する（方向は zone_type に内包）
+      - resistance: close > zone_high + buffer が n_closes 本連続 → broken_confirmed
+      - support   : close < zone_low  - buffer が n_closes 本連続 → broken_confirmed
+    """
+    if df is None or df.empty:
+        return "none"
+
+    zt = (zone_type or "").strip().lower()
+    if zt not in ("support", "resistance"):
+        return "none"
+
+    if "close" not in df.columns:
+        return "none"
+
+    d = df.dropna(subset=["close"]).tail(max(lookback, n_closes))
+    if len(d) < n_closes:
+        return "none"
+
+    closes = d["close"].astype(float).to_numpy()
+    tail = closes[-n_closes:]
+
+    if zt == "resistance":
+        return "broken_confirmed" if (tail > (zone_high + buffer)).all() else "none"
+    else:  # support
+        return "broken_confirmed" if (tail < (zone_low - buffer)).all() else "none"
+
+
+def flip_zone_type(zone_type: str) -> str:
+    zt = (zone_type or "").strip().lower()
+    if zt == "resistance":
+        return "support"
+    if zt == "support":
+        return "resistance"
+    return zt
+
+def merge_close_zones(
+    zones: List[SRZone],
+    *,
+    atr: float | None,
+    zone_type: str,
+    merge_gap_atr_mult: float = 0.2,
+    merge_gap_rate: float = 0.001,
+    max_span_rate: float | None = 0.01,  # ✅ 追加: ゾーン全幅の上限（例: 1.2%）
+) -> List[SRZone]:
+    """
+    範囲（low/high）の重なり・近さで統合する
+    - next.low <= cur.high + allow なら統合
+    - allow = max(atr*merge_gap_atr_mult, center*merge_gap_rate)
+
+    ✅ 追加: merge後のゾーンが太くなりすぎた場合、強い側をアンカーして帯幅をキャップする
+       span_rate = (high - low) / center > max_span_rate のとき発動
+       support    : price_high（上端）を固定して下端を詰める
+       resistance : price_low（下端）を固定して上端を詰める
+    """
+    if not zones:
+        return []
+
+    zt_norm = (zone_type or "").lower()
+    targets = [z for z in zones if (z.zone_type or "").lower() == zt_norm]
+    if len(targets) <= 1:
+        return targets
+
+    targets.sort(key=lambda z: float(z.price_low))
+
+    def gap_allow(center: float) -> float:
+        if atr is not None and atr > 0:
+            return max(atr * merge_gap_atr_mult, center * merge_gap_rate)
+        return center * merge_gap_rate
+
+    def apply_anchor_cap(zt: str, low: float, high: float) -> tuple[float, float]:
+        """強い側アンカーで最大帯幅をキャップ"""
+        if max_span_rate is None:
+            return low, high
+        if low >= high:
+            return low, high
+
+        center = (low + high) / 2.0
+        if center <= 0:
+            return low, high
+
+        span = high - low
+        max_span = center * max_span_rate
+        if span <= max_span:
+            return low, high
+
+        zt = (zt or "").lower()
+        if zt == "support":
+            # ✅ 上端（反発判定の基準）を維持して、下端だけ詰める
+            new_high = high
+            new_low = high - max_span
+            return new_low, new_high
+
+        if zt == "resistance":
+            # ✅ 下端（反発判定の基準）を維持して、上端だけ詰める
+            new_low = low
+            new_high = low + max_span
+            return new_low, new_high
+
+        # 不明タイプは中心固定にフォールバック
+        half = max_span / 2.0
+        return center - half, center + half
+
+    merged: List[SRZone] = []
+    cur = targets[0]
+
+    for nxt in targets[1:]:
+        allow = max(gap_allow(cur.price_center), gap_allow(nxt.price_center))
+
+        # 「重なり or 近い」を見る
+        if nxt.price_low <= cur.price_high + allow:
+            # union
+            new_low = min(cur.price_low, nxt.price_low)
+            new_high = max(cur.price_high, nxt.price_high)
+
+            # ✅ 強い側アンカーキャップ（ここが今回の本体）
+            new_low, new_high = apply_anchor_cap(cur.zone_type, new_low, new_high)
+
+            # cap後の中心で更新
+            new_center = (new_low + new_high) / 2.0
+
+            cur = SRZone(
+                symbol=cur.symbol,
+                zone_type=cur.zone_type,
+                price_center=new_center,
+                price_low=new_low,
+                price_high=new_high,
+                touches=int(cur.touches) + int(nxt.touches),
+                last_touched_at=max(cur.last_touched_at, nxt.last_touched_at),
+                strength=max(cur.strength, nxt.strength),
+            )
+        else:
+            merged.append(cur)
+            cur = nxt
+
+    merged.append(cur)
+    return merged
+
+def merge_zones_by_type(
+    zones: List[SRZone],
+    *,
+    atr: float | None,
+    merge_gap_atr_mult: float = 0.2,
+    merge_gap_rate: float = 0.001,
+    max_span_rate: float | None = 0.01,  # ✅ 追加
+) -> List[SRZone]:
+    out: List[SRZone] = []
+    for zt in ("support", "resistance"):
+        out.extend(
+            merge_close_zones(
+                zones,
+                atr=atr,
+                zone_type=zt,
+                merge_gap_atr_mult=merge_gap_atr_mult,
+                merge_gap_rate=merge_gap_rate,
+                max_span_rate=max_span_rate,  # ✅ 追加
+            )
+        )
+    return out
 
 def build_zones_from_pivots(
     symbol: str,
     pivot_df: pd.DataFrame,
+    df_1h: pd.DataFrame,
     zone_type: str,
-    max_distance_rate: float = 0.01,  # ±1.0% 以内を1クラスタ
-    band_width_rate: float = 0.003,   # ±0.3% をゾーン幅
+    atr: float | None = None,
+    max_distance_rate: float = 0.01,
+    band_width_rate: float = 0.003,
 ) -> list[SRZone]:
     """
-    ピボット価格をクラスタリングして SRZone のリストに変換する
+    ✅ 改善版（reject採用）：
+    ・クラスタ距離 → ATR基準
+    ・タッチではなく「反発(reject)」を touches として扱う（互換のため touches 欄に格納）
+    ・直近度は last_rejected_at で評価
+    ・上位10本制限 → strength閾値 + 上限30本のソフト制限
     """
+
     logger = logging.getLogger(__name__)
 
     if pivot_df is None or pivot_df.empty:
-        logger.info(
-            f"{symbol} {zone_type}: ピボットが空のためゾーン0件で返します"
-        )
+        logger.info(f"{symbol} {zone_type}: ピボットが空のためゾーン0件で返します")
+        return []
+    
+    zone_type = (zone_type or "").strip().lower()
+    if zone_type not in ("support", "resistance"):
+        logger.warning(f"{symbol}: invalid zone_type={zone_type}")
         return []
 
-    prices = pivot_df["price"].astype(float).tolist()
-    avg_price = float(np.mean(prices))
-    max_distance = avg_price * max_distance_rate
+    # df_1h 必須カラム（reject判定に close が要る）
+    required_1h = {"timestamp", "high", "low", "close"}
+    missing_1h = required_1h - set(df_1h.columns)
+    if missing_1h:
+        logger.warning(f"{symbol} {zone_type}: df_1hに必要カラムが不足: {missing_1h}")
+        return []
 
-    logger.info(
-        f"{symbol} {zone_type}: pivot件数={len(prices)}, "
-        f"avg_price={avg_price:.4f}, max_distance={max_distance:.4f} "
-        f"(rate={max_distance_rate})"
-    )
+    df = pivot_df.copy()
+    if df.empty:
+        logger.info(f"{symbol} {zone_type}: ゾーン0件")
+        return []
+
+    prices = df["price"].astype(float).tolist()
+    avg_price = float(np.mean(prices))
+
+    # クラスタ距離：ATR基準
+    if atr is not None and atr > 0:
+        max_distance = atr * 1.5
+    else:
+        max_distance = avg_price * max_distance_rate
 
     clusters = _cluster_levels(prices, max_distance=max_distance)
-
-    logger.info(
-        f"{symbol} {zone_type}: 生成されたクラスタ数={len(clusters)}"
-    )
-
     if not clusters:
         return []
 
-    latest_ts = pivot_df["timestamp"].max()
+    df_1h = df_1h.copy()
+    df_1h["timestamp"] = pd.to_datetime(df_1h["timestamp"], errors="coerce")
+    df_1h = df_1h.dropna(subset=["timestamp"]).sort_values("timestamp")
+    if df_1h.empty:
+        logger.warning(f"{symbol} {zone_type}: df_1hが空になりました")
+        return []
+    latest_ts = df_1h["timestamp"].iloc[-1]
     zones: list[SRZone] = []
+
+    prices_series = df["price"].astype(float).to_numpy()
 
     for idx, cluster in enumerate(clusters, start=1):
         cluster_prices = np.array(cluster, dtype=float)
         center = float(cluster_prices.mean())
-        width = center * band_width_rate
 
-        mask = pivot_df["price"].isin(cluster)
-        cluster_df = pivot_df[mask]
+        # ✅ ゾーン幅も ATR 連動
+        if atr is not None and atr > 0:
+            width = max(center * band_width_rate, atr * 0.4)
+        else:
+            width = center * band_width_rate
 
-        touches = int(len(cluster_df))
-        last_ts = cluster_df["timestamp"].max()
+        price_low = center - width
+        price_high = center + width
 
-        # 「タッチ回数 + 直近度」で強さスコア
-        days_since_last = (latest_ts - last_ts).total_seconds() / 86400.0
-        recency_score = max(0.0, 5.0 - days_since_last)  # 5日以内に触れているほど高スコア
+        # --- Role Reversal 用パラメータ（最初は固定でOK） ---
+        BREAK_N_CLOSES = 2
+        BREAK_LOOKBACK = 60
+        # buffer（最初は0でOK。必要なら ATR 連動で後から入れる）
+        break_buffer = max((atr or 0.0) * 0.2, center * 0.001)
+        # 反転後の最低条件（まずは1でOK。厳しければ2）
+        MIN_REJECTS_AFTER_FLIP = 2
 
-        strength = touches + recency_score
+        # ✅ ブレイク判定（方向付き）
+        break_state = get_zone_break_state(
+            df=df_1h,
+            zone_low=price_low,
+            zone_high=price_high,
+            zone_type=zone_type,
+            n_closes=BREAK_N_CLOSES,
+            lookback=BREAK_LOOKBACK,
+            buffer=break_buffer,
+        )
+
+        effective_zone_type = zone_type
+
+        # ✅ ブレイク済みなら役割反転
+        if break_state == "broken_confirmed":
+            effective_zone_type = flip_zone_type(zone_type)
+            logger.debug(
+                f"{symbol} {zone_type}: cluster#{idx} center={center:.2f} broken -> flip to {effective_zone_type}"
+            )
+
+        # NOTE: isinはfloat一致に弱い（必要なら np.isclose 版に）
+        cluster_arr = np.array(cluster, dtype=float)
+        mask = np.isclose(prices_series[:, None], cluster_arr[None, :], rtol=0, atol=1e-8).any(axis=1)
+        cluster_df = df.loc[mask]
+
+        # ✅ reject回数
+        rejects = count_zone_rejects_unique(
+            df=df_1h,
+            zone_low=price_low,
+            zone_high=price_high,
+            zone_type=effective_zone_type,
+        )
+
+        # ✅ 最終reject時刻
+        last_rejected_at = get_last_reject_time(
+            df=df_1h,
+            zone_low=price_low,
+            zone_high=price_high,
+            zone_type=effective_zone_type,
+        )
+
+        # rejectが無いならゾーンとして弱いので捨てる
+        if last_rejected_at is None:
+            continue
+
+        if break_state == "broken_confirmed" and rejects < MIN_REJECTS_AFTER_FLIP:
+            continue
+
+        # ✅ 直近度（reject 기준）
+        days_since_last = max(0.0, (latest_ts - last_rejected_at).total_seconds() / 86400.0)
+        recency_score = max(0.0, 5.0 - days_since_last)
+
+        # ✅ 出来高（現状pivot_dfにvolumeが無いなら常に0になる可能性あり）
+        volume_score = 0.0
+        if "volume" in cluster_df.columns and not cluster_df.empty:
+            vol_mean = float(cluster_df["volume"].mean())
+            volume_score = np.log1p(max(vol_mean, 0.0)) / 10.0
+
+        # ✅ strength（touches→rejectsに統一）
+        strength = rejects * 1.5 + recency_score  # + volume_score（使うなら足す）
 
         logger.debug(
-            f"{symbol} {zone_type}: cluster#{idx} center={center:.4f}, "
-            f"touches={touches}, last_ts={last_ts}, "
+            f"{symbol} {zone_type}: cluster#{idx} center={center:.2f}, "
+            f"rejects={rejects}, volume_score={volume_score:.3f}, "
             f"days_since_last={days_since_last:.2f}, strength={strength:.2f}"
         )
 
         zones.append(
             SRZone(
                 symbol=symbol,
-                zone_type=zone_type,
+                zone_type=effective_zone_type,
                 price_center=center,
-                price_low=center - width,
-                price_high=center + width,
-                touches=touches,
-                last_touched_at=last_ts,
+                price_low=price_low,
+                price_high=price_high,
+                touches=rejects,                  # ✅ 互換：touchesにrejectsを格納
+                last_touched_at=last_rejected_at, # ✅ 互換：last_touched_atにlast_reject
                 strength=strength,
             )
         )
 
-    # ① 直近のゾーンだけに絞る（例: 最後に触れてから20日以内）
-    RECENCY_DAYS_LIMIT = 20.0  # 必要に応じて調整
-    before_recency = len(zones)
-    recent_zones: list[SRZone] = []
-    for z in zones:
-        days_ago = (latest_ts - z.last_touched_at).total_seconds() / 86400.0
-        if days_ago <= RECENCY_DAYS_LIMIT:
-            recent_zones.append(z)
 
-    zones = recent_zones
-    logger.info(
-        f"{symbol} {zone_type}: recencyフィルタ適用 "
-        f"({before_recency} -> {len(zones)} zones, "
-        f"limit={RECENCY_DAYS_LIMIT}days)"
-    )
+    # フィルタ：直近30日
+    RECENCY_DAYS_LIMIT = 30.0
+    zones = [
+        z for z in zones
+        if (latest_ts - z.last_touched_at).total_seconds() / 86400.0 <= RECENCY_DAYS_LIMIT
+    ]
 
-    # ② タッチ回数でフィルタ（2回以上）
-    before_touches = len(zones)
+    # フィルタ：reject 2回以上（touches欄に入れている）
     zones = [z for z in zones if z.touches >= 2]
-    logger.info(
-        f"{symbol} {zone_type}: touchesフィルタ適用 "
-        f"({before_touches} -> {len(zones)} zones, min_touches=2)"
+
+    # ✅ 近すぎるゾーンを統合（Merge / Dedup）
+    zones = merge_zones_by_type(
+        zones,
+        atr=atr,
+        merge_gap_atr_mult=0.3,   # すき間許容 ATR の 20%
+        merge_gap_rate=0.001,     # ATR無い時は 0.1%
     )
 
-    # ③ 強さ順にソートして上位のみ採用
+    for z in zones:
+        days_since_last = max(0.0, (latest_ts - z.last_touched_at).total_seconds() / 86400.0)
+        recency_score = max(0.0, 5.0 - days_since_last)
+        z.strength = z.touches * 1.5 + recency_score
+
     zones.sort(key=lambda z: z.strength, reverse=True)
 
-    logger.info(
-        f"{symbol} {zone_type}: ゾーン生成件数={len(zones)} "
-        f"(top3 center={[f'{z.price_center:.1f}' for z in zones[:3]]})"
-    )
+    MIN_STRENGTH = 2.5
+    MAX_ZONES = 30
+    filtered = [z for z in zones if z.strength >= MIN_STRENGTH]
+    if len(filtered) > MAX_ZONES:
+        filtered = filtered[:MAX_ZONES]
 
-    # 1サイドあたり最大10本
-    return zones[:10]
+    logger.info(
+        f"{symbol} {zone_type}: ゾーン最終件数={len(filtered)} "
+        f"(top3 center={[f'{z.price_center:.1f}' for z in filtered[:3]]})"
+    )
+    return filtered
 
 class PriceCacheRefresher:
     def __init__(self, symbols, get_price_fn, interval_sec=30, logger=None):
@@ -564,29 +952,59 @@ class CryptoTradingBot:
         df_hourly,
     ):
         """
-        現在の df_15m / df_hourly からローソク足をDBに保存する。
+        現在の df_15m / df_hourly からローソク足をDBに保存する（ATR対応）。
         ・15分足は candles_15min
         ・1時間足は candles_1hour
         """
         try:
             src = default_source_from_env(self)  # 既存の source 判定関数を再利用
 
+            # =========================
+            # ✅ 15分足（ATR対応）
+            # =========================
             if df_15m is not None and not df_15m.empty:
+                df_15m = df_15m.copy()
+
+                # ✅ ATR計算（14期間）
+                if {"high", "low", "close"}.issubset(df_15m.columns):
+                    tr1 = df_15m["high"] - df_15m["low"]
+                    tr2 = (df_15m["high"] - df_15m["close"].shift()).abs()
+                    tr3 = (df_15m["low"]  - df_15m["close"].shift()).abs()
+                    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+                    df_15m["ATR"] = tr.rolling(window=14).mean()
+                else:
+                    self.logger.warning(f"{symbol}: 15分足に high/low/close が無く ATR を計算できません")
+
                 upsert_candles_from_df(
                     table_name="candles_15min",
                     symbol=symbol,
                     timeframe="15min",
-                    df=df_15m,
+                    df=df_15m,      # ✅ ATR付きで保存
                     source=src,
                     keep_days=30,
                 )
 
+            # =========================
+            # ✅ 1時間足（ATR対応）
+            # =========================
             if df_hourly is not None and not df_hourly.empty:
+                df_hourly = df_hourly.copy()
+
+                # ✅ ATR計算（14期間）
+                if {"high", "low", "close"}.issubset(df_hourly.columns):
+                    tr1 = df_hourly["high"] - df_hourly["low"]
+                    tr2 = (df_hourly["high"] - df_hourly["close"].shift()).abs()
+                    tr3 = (df_hourly["low"]  - df_hourly["close"].shift()).abs()
+                    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+                    df_hourly["ATR"] = tr.rolling(window=14).mean()
+                else:
+                    self.logger.warning(f"{symbol}: 1時間足に high/low/close が無く ATR を計算できません")
+
                 upsert_candles_from_df(
                     table_name="candles_1hour",
                     symbol=symbol,
                     timeframe="1hour",
-                    df=df_hourly,
+                    df=df_hourly,   # ✅ ATR付きで保存
                     source=src,
                     keep_days=30,
                 )
@@ -595,67 +1013,100 @@ class CryptoTradingBot:
             self.logger.error(f"ローソク足保存中にエラー: {e}", exc_info=True)
         
     def _store_recent_candles(
-        self,
-        symbol: str,
-        df_15m,
-        df_1h,
-        n: int = 5,
-    ):
-        """
-        直近 n 本だけをローソク足テーブルに upsert する軽量版
-        """
-        try:
-            src = default_source_from_env(self)
+            self,
+            symbol: str,
+            df_15m,
+            df_1h,
+            n: int = 5,
+        ):
+            """
+            直近 n 本だけをローソク足テーブルに upsert する軽量版（ATR完全対応・NaN防止版）
+            """
+            try:
+                src = default_source_from_env(self)
 
-            # --- 15min ---
-            if df_15m is not None and len(df_15m) > 0:
-                df_15m = df_15m.sort_values("timestamp") if "timestamp" in df_15m.columns else df_15m
-                last_n_15m = df_15m.tail(n).copy()
+                # =========================
+                # ✅ 15分足（ATR完全対応）
+                # =========================
+                if df_15m is not None and len(df_15m) > 0:
+                    df_15m = df_15m.sort_values("timestamp") if "timestamp" in df_15m.columns else df_15m
+                    df_15m = df_15m.copy()
 
-                # timestamp がカラムにない場合は index → timestamp にする
-                if "timestamp" not in last_n_15m.columns:
-                    last_n_15m = last_n_15m.reset_index()
-                    if "index" in last_n_15m.columns:
-                        last_n_15m = last_n_15m.rename(columns={"index": "timestamp"})
+                    # ✅【重要】フルDFでATRを先に計算
+                    if {"high", "low", "close"}.issubset(df_15m.columns):
+                        tr1 = df_15m["high"] - df_15m["low"]
+                        tr2 = (df_15m["high"] - df_15m["close"].shift()).abs()
+                        tr3 = (df_15m["low"]  - df_15m["close"].shift()).abs()
+                        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+                        df_15m["ATR"] = tr.rolling(window=14).mean()
+                    else:
+                        self.logger.warning(f"{symbol}: 15分足に high/low/close が無く ATR を計算できません")
+                        df_15m["ATR"] = None
 
-                upsert_candles_from_df(
-                    table_name="candles_15min",
-                    symbol=symbol,
-                    timeframe="15min",
-                    df=last_n_15m,
-                    source=src,
-                    keep_days=30,
-                )
+                    # ✅ 最後に tail(n)
+                    last_n_15m = df_15m.tail(n).copy()
 
-            # --- 1hour ---
-            if df_1h is not None and len(df_1h) > 0:
-                if "timestamp" in df_1h.columns:
-                    df_1h = df_1h.sort_values("timestamp")
-                last_n_1h = df_1h.tail(n).copy()
+                    # timestamp がカラムにない場合は index → timestamp にする
+                    if "timestamp" not in last_n_15m.columns:
+                        last_n_15m = last_n_15m.reset_index()
+                        if "index" in last_n_15m.columns:
+                            last_n_15m = last_n_15m.rename(columns={"index": "timestamp"})
 
-                if "timestamp" not in last_n_1h.columns:
-                    last_n_1h = last_n_1h.reset_index()
-                    if "index" in last_n_1h.columns:
-                        last_n_1h = last_n_1h.rename(columns={"index": "timestamp"})
+                    upsert_candles_from_df(
+                        table_name="candles_15min",
+                        symbol=symbol,
+                        timeframe="15min",
+                        df=last_n_15m,   # ✅ ATR入りで保存される
+                        source=src,
+                        keep_days=30,
+                    )
 
-                upsert_candles_from_df(
-                    table_name="candles_1hour",
-                    symbol=symbol,
-                    timeframe="1hour",
-                    df=last_n_1h,
-                    source=src,
-                    keep_days=30,
-                )
+                # =========================
+                # ✅ 1時間足（ATR完全対応）
+                # =========================
+                if df_1h is not None and len(df_1h) > 0:
+                    if "timestamp" in df_1h.columns:
+                        df_1h = df_1h.sort_values("timestamp")
 
-        except Exception as e:
-            self.logger.error(f"ローソク足保存中のエラー: {e}", exc_info=True)
+                    df_1h = df_1h.copy()
+
+                    # ✅【重要】フルDFでATRを先に計算
+                    if {"high", "low", "close"}.issubset(df_1h.columns):
+                        tr1 = df_1h["high"] - df_1h["low"]
+                        tr2 = (df_1h["high"] - df_1h["close"].shift()).abs()
+                        tr3 = (df_1h["low"]  - df_1h["close"].shift()).abs()
+                        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+                        df_1h["ATR"] = tr.rolling(window=14).mean()
+                    else:
+                        self.logger.warning(f"{symbol}: 1時間足に high/low/close が無く ATR を計算できません")
+                        df_1h["ATR"] = None
+
+                    # ✅ 最後に tail(n)
+                    last_n_1h = df_1h.tail(n).copy()
+
+                    if "timestamp" not in last_n_1h.columns:
+                        last_n_1h = last_n_1h.reset_index()
+                        if "index" in last_n_1h.columns:
+                            last_n_1h = last_n_1h.rename(columns={"index": "timestamp"})
+
+                    upsert_candles_from_df(
+                        table_name="candles_1hour",
+                        symbol=symbol,
+                        timeframe="1hour",
+                        df=last_n_1h,   # ✅ ATR入りで保存される
+                        source=src,
+                        keep_days=30,
+                    )
+
+            except Exception as e:
+                self.logger.error(f"ローソク足保存中のエラー: {e}", exc_info=True)
 
     def _load_hourly_candles_from_db(self, symbol: str, lookback_days: int = 30) -> pd.DataFrame:
         """
-        candles_1hour テーブルから直近 lookback_days 日分の1時間足を取得
+        candles_1hour テーブルから直近 lookback_days 日分の1時間足を取得（ATR対応）
         """
         try:
-            src = "real"
+            src = "sim"
             since = utcnow() - timedelta(days=lookback_days)
 
             self.logger.info(
@@ -673,7 +1124,8 @@ class CryptoTradingBot:
                             high,
                             low,
                             close,
-                            volume
+                            volume,
+                            atr          -- ✅ 追加
                         FROM candles_1hour
                         WHERE symbol = :symbol
                         AND source = :source
@@ -696,7 +1148,10 @@ class CryptoTradingBot:
                 return pd.DataFrame()
 
             df = pd.DataFrame([dict(r._mapping) for r in rows])
+
+            # ✅ timestamp 整形
             df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+
             before = len(df)
             df = df.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
             after = len(df)
@@ -711,6 +1166,10 @@ class CryptoTradingBot:
                     f"{symbol}: timestamp 変換で {before - after} 件が除外されました（NaT）"
                 )
 
+            # ✅ 念のため atr 型を float に統一（NaN含む）
+            if "atr" in df.columns:
+                df["atr"] = pd.to_numeric(df["atr"], errors="coerce")
+
             return df
 
         except Exception as e:
@@ -720,16 +1179,16 @@ class CryptoTradingBot:
             )
             return pd.DataFrame()
 
-
     def _build_sr_zones_from_hourly(self, symbol: str, df_1h: pd.DataFrame) -> list[SRZone]:
         """
-        1時間足 df_1h からサポレジゾーン（SRZone のリスト）を構築
+        1時間足 df_1h からサポレジゾーン（SRZone のリスト）を構築（ATR連動対応）
         """
         if df_1h is None or df_1h.empty:
             self.logger.info(f"{symbol}: SRゾーンを作るための1時間足データが空です")
             return []
 
-        required_cols = {"timestamp", "high", "low"}
+        # ✅ ATR を必須カラムに追加
+        required_cols = {"timestamp", "high", "low", "atr"}
         missing = required_cols - set(df_1h.columns)
         if missing:
             self.logger.warning(f"{symbol}: SRゾーン用に必要なカラムが不足: {missing}")
@@ -744,7 +1203,21 @@ class CryptoTradingBot:
             f"(期間: {df['timestamp'].min()} 〜 {df['timestamp'].max()})"
         )
 
-        # ピボット検出
+        # =========================
+        # ✅ 最新の安全な ATR を取得（-2 本ルール）
+        # =========================
+        atr_series = df["atr"].dropna()
+
+        atr = None
+        if len(atr_series) >= 2:
+            atr = float(atr_series.iloc[-2])
+            self.logger.info(f"{symbol}: SR用ATR={atr:.6f}")
+        else:
+            self.logger.warning(f"{symbol}: SR用ATRが取得できません（atrが不足）")
+
+        # =========================
+        # ✅ ピボット検出
+        # =========================
         pivot_highs, pivot_lows = detect_pivots(df, left=3, right=3)
 
         self.logger.info(
@@ -755,13 +1228,44 @@ class CryptoTradingBot:
             self.logger.warning(f"{symbol}: ピボットが1つも検出できませんでした")
             return []
 
-        # ゾーン化
-        res_zones = build_zones_from_pivots(symbol, pivot_highs, zone_type="resistance")
-        sup_zones = build_zones_from_pivots(symbol, pivot_lows,  zone_type="support")
+        # =========================
+        # ✅ ゾーン化（ATR連動SR）
+        # =========================
+        res_zones = build_zones_from_pivots(
+            symbol,
+            pivot_highs,
+            df,
+            zone_type="resistance",
+            atr=atr,
+        )
+
+        sup_zones = build_zones_from_pivots(
+            symbol,
+            pivot_lows,
+            df,
+            zone_type="support",
+            atr=atr,
+        )
 
         zones = res_zones + sup_zones
 
-        # 代表値を少し出す（上位3つだけ）
+        zones = merge_zones_by_type(
+            zones,
+            atr=atr,
+            merge_gap_atr_mult=0.0,   # ← “重なりだけ”を統合（すき間は統合しない）
+            merge_gap_rate=0.0,
+        )
+
+        # strength を touches と直近度で再計算（任意だが整合性が良い）
+        latest_ts = df["timestamp"].iloc[-1]
+        for z in zones:
+            days_since_last = max(0.0, (latest_ts - z.last_touched_at).total_seconds() / 86400.0)
+            recency_score = max(0.0, 5.0 - days_since_last)
+            z.strength = z.touches * 1.5 + recency_score
+
+        # =========================
+        # ✅ ログ用サマリー
+        # =========================
         def _summary(zlist: list[SRZone], ztype: str) -> str:
             if not zlist:
                 return f"{ztype}:0件"
@@ -775,7 +1279,6 @@ class CryptoTradingBot:
         )
 
         return zones
-
     
     def update_sr_zones_for_symbol(self, symbol: str, lookback_days: int = 30) -> None:
         """
@@ -4501,7 +5004,7 @@ class CryptoTradingBot:
                 df_5min.loc[df_5min['ma_score_short'].between(0.191, 0.225),'sell_signal'] = False
                 df_5min.loc[df_5min['cci_score_long'].between(0.553, 0.606),'buy_signal'] = False
                 df_5min.loc[df_5min['cci_score_long'].between(0.715, 0.845),'buy_signal'] = False
-                df_5min.loc[df_5min['cci_score_short'] > 0.933, 'sell_signal'] = False
+                df_5min.loc[df_5min['cci_score_short'] > 0.867, 'sell_signal'] = False
                 df_5min.loc[df_5min['cci_score_short'].between(0.315, 0.377),'sell_signal'] = False
                 df_5min.loc[df_5min['adx_score_long'] > 0.997, 'buy_signal'] = False
                 df_5min.loc[df_5min['bb_score_long'].between(0.143, 0.21),'buy_signal'] = False
@@ -4514,7 +5017,7 @@ class CryptoTradingBot:
                 df_5min.loc[df_5min['rsi_score_long'].between(0.59, 0.7),'buy_signal'] = False
                 df_5min.loc[df_5min['rsi_score_short'].between(0.39, 0.43),'sell_signal'] = False
                 df_5min.loc[df_5min['rsi_score_short'].between(0.58, 0.61),'sell_signal'] = False
-                df_5min.loc[df_5min['rsi_score_short'] < 0.15, 'sell_signal'] = False
+                df_5min.loc[df_5min['rsi_score_short'] < 0.27, 'sell_signal'] = False
                 df_5min.loc[df_5min['mfi_score_short'] > 0.6, 'sell_signal'] = False
 
             if symbol == 'sol_jpy':
@@ -4527,6 +5030,7 @@ class CryptoTradingBot:
                 df_5min.loc[df_5min['cci_score_long'].between(0.114, 0.149),'buy_signal'] = False
                 df_5min.loc[df_5min['cci_score_long'].between(0.17, 0.264),'buy_signal'] = False
                 df_5min.loc[df_5min['cci_score_long'].between(0.424, 0.445),'buy_signal'] = False
+                df_5min.loc[df_5min['cci_score_long'].between(0.58, 0.623),'buy_signal'] = False
                 df_5min.loc[df_5min['adx_score_long'].between(0.444, 0.56),'buy_signal'] = False
                 df_5min.loc[df_5min['adx_score_long'].between(0.197, 0.29),'buy_signal'] = False
                 df_5min.loc[df_5min['adx_score_short'] < 0.15, 'sell_signal'] = False
@@ -4594,7 +5098,7 @@ class CryptoTradingBot:
                 df_5min.loc[df_5min['bb_score_long'] > 0.686, 'buy_signal'] = False
                 df_5min.loc[df_5min['bb_score_short'].between(0.566, 0.72),'sell_signal'] = False
                 df_5min.loc[df_5min['ma_score_long'].between(0.165, 0.184),'buy_signal'] = False
-                df_5min.loc[df_5min['ma_score_short'].between(0.0369, 0.0806),'sell_signal'] = False
+                df_5min.loc[df_5min['ma_score_short'].between(0.01, 0.0806),'sell_signal'] = False
                 df_5min.loc[df_5min['ma_score_short'].between(0.13, 0.162),'sell_signal'] = False
                 df_5min.loc[df_5min['ma_score_short'] > 0.25, 'sell_signal'] = False
                 df_5min.loc[df_5min['adx_score_long'].between(0.321, 0.395),'buy_signal'] = False
@@ -4625,6 +5129,7 @@ class CryptoTradingBot:
                 df_5min.loc[df_5min['rsi_score_short'].between(0.255, 0.393),'sell_signal'] = False
                 df_5min.loc[df_5min['mfi_score_long'].between(0.405, 0.44),'buy_signal'] = False
                 df_5min.loc[df_5min['mfi_score_short'] > 0.54, 'sell_signal'] = False
+                df_5min.loc[df_5min['cci_score_long'].between(0.275, 0.34),'buy_signal'] = False
 
             if symbol == 'xrp_jpy':
                 df_5min.loc[df_5min['atr_score_long'].between(0.15, 0.228),'buy_signal'] = False
@@ -4650,6 +5155,7 @@ class CryptoTradingBot:
                 df_5min.loc[df_5min['adx_score_short'].between(0.221, 0.306),'sell_signal'] = False
                 df_5min.loc[df_5min['adx_score_short'].between(0.7, 0.763),'sell_signal'] = False
                 df_5min.loc[df_5min['ma_score_long'].between(0.136, 0.16),'buy_signal'] = False
+                df_5min.loc[df_5min['ma_score_long'].between(0.175, 0.22),'buy_signal'] = False
                 df_5min.loc[df_5min['ma_score_long'] > 0.293, 'buy_signal'] = False
                 df_5min.loc[df_5min['ma_score_short'].between(0.032, 0.077),'sell_signal'] = False
                 df_5min.loc[df_5min['bb_score_long'].between(0.251, 0.278),'buy_signal'] = False
