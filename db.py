@@ -377,6 +377,64 @@ def get_user_email_and_pw(user_id: int) -> Dict[str, Optional[str]]:
             "email_enabled": bool(row[2]),
         }
 
+def fetch_sr_zones(
+    symbol: str,
+    *,
+    timeframe: str = "1hour",
+    lookback_days: int = 30,
+    user_id: Optional[int] = None,
+    source: str = "real",
+    min_strength: float = 0.0,
+    limit: int = 100,
+    conn: Optional["Connection"] = None,
+) -> list[dict[str, Any]]:
+    """
+    support_resistance_zones から SRゾーンを取得して dict list で返す
+    """
+    stmt = sa.text("""
+        SELECT
+            zone_id,
+            user_id,
+            symbol,
+            timeframe,
+            lookback_days,
+            zone_type,
+            price_center,
+            price_low,
+            price_high,
+            touches,
+            strength,
+            last_touched_at,
+            source
+        FROM support_resistance_zones
+        WHERE symbol        = :symbol
+          AND timeframe     = :timeframe
+          AND lookback_days = :lookback_days
+          AND source        = :source
+          AND (user_id IS NOT DISTINCT FROM :user_id)
+          AND strength >= :min_strength
+        ORDER BY strength DESC, last_touched_at DESC
+        LIMIT :limit
+    """)
+
+    params = {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "lookback_days": lookback_days,
+        "source": source,
+        "user_id": user_id,
+        "min_strength": float(min_strength),
+        "limit": int(limit),
+    }
+
+    if conn is None:
+        with engine.begin() as c:
+            rows = c.execute(stmt, params).mappings().all()
+    else:
+        rows = conn.execute(stmt, params).mappings().all()
+
+    return [dict(r) for r in rows]
+
 # （必要なら）
 def get_user_password_hash(user_id: int) -> Optional[str]:
     with begin() as conn:

@@ -45,6 +45,7 @@ from dataclasses import dataclass
 from typing import Literal
 from dataclasses import replace
 from typing import List, Callable
+from db import fetch_sr_zones
 
 is_backtest_mode = "backtest" in sys.argv
 
@@ -7017,6 +7018,101 @@ class CryptoTradingBot:
             }
         }
         return thresholds_dict, explanation_text, signal_raw
+    
+    def _sr_entry_guard_params(self):
+        """
+        エントリー抑制のパラメータ。
+        とりあえず固定でOK。後で env 化しても良い。
+        """
+        return {
+            "enabled": True,
+            "timeframe": "1hour",
+            "lookback_days": 30,
+            # 「ゾーンの中」判定は price_low <= price <= price_high でOK
+            # 「近い」判定の許容率（例: 0.0015 = 0.15%）
+            "near_rate": 0.0015,
+            # strength が弱い帯は無視（build_zones側がMIN_STRENGTHを持ってますが念のため）
+            "min_strength": 5.0,
+            # 取得上限
+            "limit": 60,
+        }
+
+    def _should_block_entry_by_sr(self, symbol: str, position_type: str, price: float) -> tuple[bool, str]:
+        """
+        ロング：resistance に近い/中ならブロック
+        ショート：support    に近い/中ならブロック
+        戻り値: (block?, reason)
+        """
+        p = float(price or 0)
+        if p <= 0:
+            return False, ""
+
+        cfg = self._sr_entry_guard_params()
+        if not cfg.get("enabled", True):
+            return False, ""
+
+        src = default_source_from_env(self)  # live=real/backtest=backtest/それ以外sim :contentReference[oaicite:5]{index=5}
+        zones = fetch_sr_zones(
+            symbol,
+            timeframe=str(cfg["timeframe"]),
+            lookback_days=int(cfg["lookback_days"]),
+            user_id=None,
+            source=src,
+            min_strength=float(cfg["min_strength"]),
+            limit=int(cfg["limit"]),
+        )
+
+        if not zones:
+            return False, ""
+
+        near_rate = float(cfg["near_rate"])
+        pt = (position_type or "").lower().strip()
+
+        if pt == "long":
+            target_type = "resistance"
+            # ロングは「上の抵抗」が危険（天井付近で掴む）なので、price <= zone_low で近さを見る
+            for z in zones:
+                if (z.get("zone_type") or "").lower() != target_type:
+                    continue
+                zl = float(z.get("price_low"))
+                zh = float(z.get("price_high"))
+                strength = float(z.get("strength") or 0)
+
+                # 1) ゾーン内
+                if zl <= p <= zh:
+                    return True, f"SRブロック: priceがresistanceゾーン内 ({zl:.2f}-{zh:.2f}, strength={strength:.2f})"
+
+                # 2) ゾーン直下に近い（上端帯の手前で買うのを抑制）
+                if p < zl:
+                    dist_rate = (zl - p) / p
+                    if dist_rate <= near_rate:
+                        return True, f"SRブロック: resistance直下に近い (price={p:.2f}, zone_low={zl:.2f}, dist={dist_rate:.4%}, strength={strength:.2f})"
+
+            return False, ""
+
+        if pt == "short":
+            target_type = "support"
+            # ショートは「下の支持」が危険（底付近で売る）なので、price >= zone_high で近さを見る
+            for z in zones:
+                if (z.get("zone_type") or "").lower() != target_type:
+                    continue
+                zl = float(z.get("price_low"))
+                zh = float(z.get("price_high"))
+                strength = float(z.get("strength") or 0)
+
+                # 1) ゾーン内
+                if zl <= p <= zh:
+                    return True, f"SRブロック: priceがsupportゾーン内 ({zl:.2f}-{zh:.2f}, strength={strength:.2f})"
+
+                # 2) ゾーン直上に近い（下端帯の手前で売るのを抑制）
+                if p > zh:
+                    dist_rate = (p - zh) / p
+                    if dist_rate <= near_rate:
+                        return True, f"SRブロック: support直上に近い (price={p:.2f}, zone_high={zh:.2f}, dist={dist_rate:.4%}, strength={strength:.2f})"
+
+            return False, ""
+
+        return False, ""
 
     def _handle_entry(self, symbol, position_type, signal_data, stats, trade_logs):
         """エントリー処理を実行する（backtest関数と整合性あり）
@@ -7072,6 +7168,11 @@ class CryptoTradingBot:
         ):
             self.logger.warning(f"{symbol}の{position_type}エントリーに必要な資金が不足しています")
             return
+
+        block, reason = self._should_block_entry_by_sr(symbol, position_type, current_price)
+        if block:
+            self.logger.info(f"{symbol} {position_type} エントリー抑制: {reason}")
+            return
         
         # 注文実行
         self.logger.info(f"{symbol}の{position_type}エントリー注文を実行します: 価格 {current_price:.2f}, サイズ {order_size:.3f}, 金額 {order_amount:.0f}円")
@@ -7100,10 +7201,6 @@ class CryptoTradingBot:
 
         # バージョン
         version = self._current_strategy_version()  # 上で例示
-
-        thresholds_dict, explanation_text, signal_raw = self._build_entry_explanation(
-            symbol, position_type, signal_data, price=current_price
-        )
 
         order_result = self.execute_order_with_confirmation(
             symbol,
