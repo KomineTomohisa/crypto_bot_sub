@@ -9,6 +9,7 @@ from decimal import Decimal
 from typing import List, Optional, Dict, Any, Sequence
 from uuid import uuid4
 from pathlib import Path
+from typing import Iterable
 
 from dotenv import load_dotenv
 from tenacity import retry, stop_after_attempt, wait_exponential_jitter
@@ -20,6 +21,8 @@ try:
     from psycopg2.extras import Json as _PsycoJson
 except Exception:
     _PsycoJson = None
+import uuid
+import pandas as pd
 
 # -----------------------------------------------------------------------------
 # 環境
@@ -373,6 +376,64 @@ def get_user_email_and_pw(user_id: int) -> Dict[str, Optional[str]]:
             "email_password_encrypted": row[1] or None,
             "email_enabled": bool(row[2]),
         }
+
+def fetch_sr_zones(
+    symbol: str,
+    *,
+    timeframe: str = "1hour",
+    lookback_days: int = 30,
+    user_id: Optional[int] = None,
+    source: str = "real",
+    min_strength: float = 0.0,
+    limit: int = 100,
+    conn: Optional["Connection"] = None,
+) -> list[dict[str, Any]]:
+    """
+    support_resistance_zones から SRゾーンを取得して dict list で返す
+    """
+    stmt = sa.text("""
+        SELECT
+            zone_id,
+            user_id,
+            symbol,
+            timeframe,
+            lookback_days,
+            zone_type,
+            price_center,
+            price_low,
+            price_high,
+            touches,
+            strength,
+            last_touched_at,
+            source
+        FROM support_resistance_zones
+        WHERE symbol        = :symbol
+          AND timeframe     = :timeframe
+          AND lookback_days = :lookback_days
+          AND source        = :source
+          AND (user_id IS NOT DISTINCT FROM :user_id)
+          AND strength >= :min_strength
+        ORDER BY strength DESC, last_touched_at DESC
+        LIMIT :limit
+    """)
+
+    params = {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "lookback_days": lookback_days,
+        "source": source,
+        "user_id": user_id,
+        "min_strength": float(min_strength),
+        "limit": int(limit),
+    }
+
+    if conn is None:
+        with engine.begin() as c:
+            rows = c.execute(stmt, params).mappings().all()
+    else:
+        rows = conn.execute(stmt, params).mappings().all()
+
+    return [dict(r) for r in rows]
 
 # （必要なら）
 def get_user_password_hash(user_id: int) -> Optional[str]:
@@ -915,6 +976,175 @@ def get_line_channel_token(provider_key: str) -> Optional[bytes]:
     return row[0] if row else None
 
 # -----------------------------------------------------------------------------
+# サポレジゾーン保存用ヘルパー
+# -----------------------------------------------------------------------------
+def upsert_sr_zones(
+    zones: Iterable[object],
+    *,
+    timeframe: str,
+    lookback_days: int,
+    user_id: Optional[int] = None,
+    source: str = "real",
+    conn: Optional[Connection] = None,
+) -> None:
+    """
+    support_resistance_zones テーブルに SRゾーンをまとめて保存するヘルパー。
+
+    方針:
+      - zones を symbol ごとにグルーピング
+      - 各 symbol について、
+          1) (user_id, symbol, timeframe, lookback_days, source) で既存レコードを全削除
+          2) 今回の zones を新規 INSERT
+      - zone_id はここで uuid.uuid4() により自動採番する
+
+    zones: SRZone など、少なくとも以下の属性を持つオブジェクトの Iterable
+        - symbol: str
+        - zone_type: str  ("support" / "resistance")
+        - price_center: float
+        - price_low: float
+        - price_high: float
+        - touches: int
+        - strength: float
+        - last_touched_at: datetime
+    """
+    zones = list(zones)
+    if not zones:
+        return
+
+    # symbol ごとにまとめる（安全のため複数シンボルにも対応）
+    from collections import defaultdict
+    symbol_to_zones: dict[str, list[object]] = defaultdict(list)
+    for z in zones:
+        symbol_to_zones[getattr(z, "symbol")].append(z)
+
+    # INSERT 用のステートメント（generated_at は DEFAULT now() に任せる）
+    insert_stmt = sa.text(
+        """
+        INSERT INTO support_resistance_zones (
+            zone_id,
+            user_id,
+            symbol,
+            timeframe,
+            lookback_days,
+            zone_type,
+            price_center,
+            price_low,
+            price_high,
+            touches,
+            strength,
+            last_touched_at,
+            source
+        )
+        VALUES (
+            :zone_id,
+            :user_id,
+            :symbol,
+            :timeframe,
+            :lookback_days,
+            :zone_type,
+            :price_center,
+            :price_low,
+            :price_high,
+            :touches,
+            :strength,
+            :last_touched_at,
+            :source
+        )
+        """
+    )
+
+    # DELETE 用ステートメント
+    delete_stmt = sa.text(
+        """
+        DELETE FROM support_resistance_zones
+        WHERE symbol        = :symbol
+          AND timeframe     = :timeframe
+          AND lookback_days = :lookback_days
+          AND source        = :source
+          AND (user_id IS NOT DISTINCT FROM :user_id)
+        """
+    )
+
+    # 外部から conn が渡されていればそれを使う／なければ begin() でトランザクション開始
+    if conn is None:
+        with begin() as conn_ctx:
+            _do_upsert_sr_zones_with_connection(
+                conn_ctx,
+                symbol_to_zones,
+                timeframe=timeframe,
+                lookback_days=lookback_days,
+                user_id=user_id,
+                source=source,
+                delete_stmt=delete_stmt,
+                insert_stmt=insert_stmt,
+            )
+    else:
+        _do_upsert_sr_zones_with_connection(
+            conn,
+            symbol_to_zones,
+            timeframe=timeframe,
+            lookback_days=lookback_days,
+            user_id=user_id,
+            source=source,
+            delete_stmt=delete_stmt,
+            insert_stmt=insert_stmt,
+        )
+
+
+def _do_upsert_sr_zones_with_connection(
+    conn: Connection,
+    symbol_to_zones: dict[str, list[object]],
+    *,
+    timeframe: str,
+    lookback_days: int,
+    user_id: Optional[int],
+    source: str,
+    delete_stmt: sa.sql.elements.TextClause,
+    insert_stmt: sa.sql.elements.TextClause,
+) -> None:
+    """
+    実処理部分: 既存削除 → 新規 INSERT
+    （トランザクション管理は呼び出し元に任せる）
+    """
+    for symbol, zones_for_symbol in symbol_to_zones.items():
+        # 1) 既存ゾーンを削除
+        conn.execute(
+            delete_stmt,
+            {
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "lookback_days": lookback_days,
+                "source": source,
+                "user_id": user_id,
+            },
+        )
+
+        # 2) 今回のゾーンを一括INSERT
+        records = []
+        for z in zones_for_symbol:
+            records.append(
+                {
+                    "zone_id": uuid.uuid4(),
+                    "user_id": user_id,
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "lookback_days": lookback_days,
+                    "zone_type": getattr(z, "zone_type"),
+                    "price_center": getattr(z, "price_center"),
+                    "price_low": getattr(z, "price_low"),
+                    "price_high": getattr(z, "price_high"),
+                    "touches": getattr(z, "touches"),
+                    "strength": getattr(z, "strength"),
+                    "last_touched_at": getattr(z, "last_touched_at"),
+                    "source": source,
+                }
+            )
+
+        if records:
+            conn.execute(insert_stmt, records)
+
+
+# -----------------------------------------------------------------------------
 # ローソク足保存用ヘルパー
 # -----------------------------------------------------------------------------
 def upsert_candles_from_df(
@@ -972,6 +1202,7 @@ def upsert_candles_from_df(
                 "low": float(r["low"]),
                 "close": float(r["close"]),
                 "volume": float(r["volume"]) if "volume" in df.columns and r["volume"] is not None else None,
+                "atr": float(r["ATR"]) if "ATR" in df.columns and not pd.isna(r["ATR"]) else None,
                 "source": source,
             }
         )
@@ -985,11 +1216,13 @@ def upsert_candles_from_df(
         INSERT INTO {table_name} (
             symbol, timeframe, ts,
             open, high, low, close, volume,
+            atr,
             source
         )
         VALUES (
             :symbol, :timeframe, :ts,
             :open, :high, :low, :close, :volume,
+            :atr,
             :source
         )
         ON CONFLICT (symbol, timeframe, ts)
@@ -999,6 +1232,7 @@ def upsert_candles_from_df(
             low    = EXCLUDED.low,
             close  = EXCLUDED.close,
             volume = EXCLUDED.volume,
+            atr    = EXCLUDED.atr,
             source = EXCLUDED.source
         """
     )

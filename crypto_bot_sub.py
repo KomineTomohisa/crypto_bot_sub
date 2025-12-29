@@ -40,6 +40,12 @@ from db import upsert_price_cache
 from db import mark_order_executed_with_fill
 from uuid import UUID
 from db import upsert_candles_from_df
+from db import upsert_sr_zones
+from dataclasses import dataclass
+from typing import Literal
+from dataclasses import replace
+from typing import List, Callable
+from db import fetch_sr_zones
 
 is_backtest_mode = "backtest" in sys.argv
 
@@ -170,6 +176,571 @@ def default_source_from_env(self) -> str:
     if self.exchange_settings_gmo.get("live_trade"):
         return "real"
     return "sim"
+
+@dataclass
+class SRZone:
+    symbol: str
+    zone_type: str      # "support" or "resistance"
+    price_center: float
+    price_low: float
+    price_high: float
+    touches: int
+    last_touched_at: dt.datetime
+    strength: float
+
+
+def detect_pivots(df: pd.DataFrame, left: int = 3, right: int = 3):
+    """
+    1時間足 df からピボット高値・安値を検出する
+    df: columns に ["timestamp", "high", "low"] がある前提
+    """
+    logger = logging.getLogger(__name__)
+
+    if df is None or df.empty:
+        logger.info("detect_pivots: 入力dfが空のため、ピボット0件で返します")
+        empty = pd.DataFrame(columns=["timestamp", "price"])
+        return empty.copy(), empty.copy()
+
+    df = df.sort_values("timestamp").reset_index(drop=True)
+
+    window = left + right + 1
+    logger.info(
+        f"detect_pivots: レコード数={len(df)}, window={window} "
+        f"(left={left}, right={right})"
+    )
+
+    high_roll_max = df["high"].rolling(window=window, center=True).max()
+    low_roll_min  = df["low"].rolling(window=window, center=True).min()
+
+    is_pivot_high = (df["high"] == high_roll_max) & high_roll_max.notna()
+    is_pivot_low  = (df["low"] == low_roll_min) & low_roll_min.notna()
+
+    pivot_highs = df[is_pivot_high][["timestamp", "high"]].rename(columns={"high": "price"})
+    pivot_lows  = df[is_pivot_low][["timestamp", "low"]].rename(columns={"low": "price"})
+
+    logger.info(
+        f"detect_pivots: 検出されたピボット数 highs={len(pivot_highs)}, lows={len(pivot_lows)}"
+    )
+
+    return pivot_highs.reset_index(drop=True), pivot_lows.reset_index(drop=True)
+
+def _cluster_levels(prices: list[float], max_distance: float) -> list[list[float]]:
+    """
+    価格リストを、max_distance 以内のもの同士でクラスタリング
+    戻り値: [ [cluster1_prices...], [cluster2_prices...], ...]
+    """
+    if not prices:
+        return []
+
+    prices = sorted(prices)
+    clusters: list[list[float]] = [[prices[0]]]
+
+    for p in prices[1:]:
+        current_cluster = clusters[-1]
+        center = sum(current_cluster) / len(current_cluster)
+        if abs(p - center) <= max_distance:
+            current_cluster.append(p)
+        else:
+            clusters.append([p])
+
+    return clusters
+
+def _normalize_zone_type(zone_type: str) -> str:
+    z = (zone_type or "").strip().lower()
+    if z not in ("support", "resistance"):
+        raise ValueError(f"zone_type must be 'support' or 'resistance', got: {zone_type!r}")
+    return z
+
+
+def count_zone_rejects_unique(
+    df: pd.DataFrame,
+    zone_low: float,
+    zone_high: float,
+    zone_type: str,
+) -> int:
+    """
+    ゾーンでの「反発(reject)」回数をカウントする
+    ・連続反発は1回扱い
+    ・終値での戻りを必須条件にする（厳しめ）
+    """
+    zt = _normalize_zone_type(zone_type)
+
+    required = {"high", "low", "close"}
+    missing = required - set(df.columns)
+    if missing:
+        return 0
+
+    d = df.dropna(subset=["high", "low", "close"])
+
+    reject_count = 0
+    in_reject = False
+
+    for _, row in d.iterrows():
+        high = float(row["high"])
+        low = float(row["low"])
+        close = float(row["close"])
+
+        if zt == "resistance":
+            is_reject = (high >= zone_low) and (close < zone_low)
+        else:  # support
+            is_reject = (low <= zone_high) and (close > zone_high)
+
+        if is_reject:
+            if not in_reject:
+                reject_count += 1
+                in_reject = True
+        else:
+            in_reject = False
+
+    return reject_count
+
+
+def get_last_reject_time(
+    df: pd.DataFrame,
+    zone_low: float,
+    zone_high: float,
+    zone_type: str,
+):
+    zt = _normalize_zone_type(zone_type)
+
+    required = {"timestamp", "high", "low", "close"}
+    missing = required - set(df.columns)
+    if missing:
+        return None
+
+    d = df.dropna(subset=["timestamp", "high", "low", "close"])
+
+    last_ts = None
+    for _, row in d.iterrows():
+        high = float(row["high"])
+        low = float(row["low"])
+        close = float(row["close"])
+
+        if zt == "resistance":
+            if high >= zone_low and close < zone_low:
+                last_ts = row["timestamp"]
+        else:  # support
+            if low <= zone_high and close > zone_high:
+                last_ts = row["timestamp"]
+
+    return last_ts
+
+def is_zone_broken(
+    df: pd.DataFrame,
+    zone_low: float,
+    zone_high: float,
+    zone_type: str,        # "support" or "resistance"
+    n_closes: int = 2,     # 連続本数
+    lookback: int = 60,    # 直近何本を見るか（1時間足なら60=約2.5日）
+) -> bool:
+    """
+    ブレイク済みゾーン判定（終値ベース）
+    - resistance: close > zone_high が n_closes 本連続 → ブレイク
+    - support   : close < zone_low  が n_closes 本連続 → ブレイク
+    """
+    if df is None or df.empty:
+        return False
+
+    zt = (zone_type or "").strip().lower()
+    if zt not in ("support", "resistance"):
+        return False
+
+    if "close" not in df.columns:
+        return False
+
+    d = df.dropna(subset=["close"])
+    if d.empty:
+        return False
+
+    # 直近 lookback 本だけ確認
+    d = d.tail(max(lookback, n_closes))
+
+    closes = d["close"].astype(float).to_numpy()
+    if len(closes) < n_closes:
+        return False
+
+    # 連続判定：末尾から n_closes 本が条件を満たすか
+    tail = closes[-n_closes:]
+
+    if zt == "resistance":
+        return bool((tail > zone_high).all())
+    else:  # support
+        return bool((tail < zone_low).all())
+
+BreakState = Literal["none", "broken", "broken_confirmed"]
+
+def get_zone_break_state(
+    df: pd.DataFrame,
+    zone_low: float,
+    zone_high: float,
+    zone_type: str,              # "support" or "resistance"
+    *,
+    n_closes: int = 2,
+    lookback: int = 60,
+    buffer: float = 0.0,         # ブレイク判定の余裕（0でOK。必要ならATR連動で）
+) -> BreakState:
+    """
+    終値ベースで「ブレイク済みか」を判定する（方向は zone_type に内包）
+      - resistance: close > zone_high + buffer が n_closes 本連続 → broken_confirmed
+      - support   : close < zone_low  - buffer が n_closes 本連続 → broken_confirmed
+    """
+    if df is None or df.empty:
+        return "none"
+
+    zt = (zone_type or "").strip().lower()
+    if zt not in ("support", "resistance"):
+        return "none"
+
+    if "close" not in df.columns:
+        return "none"
+
+    d = df.dropna(subset=["close"]).tail(max(lookback, n_closes))
+    if len(d) < n_closes:
+        return "none"
+
+    closes = d["close"].astype(float).to_numpy()
+    tail = closes[-n_closes:]
+
+    if zt == "resistance":
+        return "broken_confirmed" if (tail > (zone_high + buffer)).all() else "none"
+    else:  # support
+        return "broken_confirmed" if (tail < (zone_low - buffer)).all() else "none"
+
+
+def flip_zone_type(zone_type: str) -> str:
+    zt = (zone_type or "").strip().lower()
+    if zt == "resistance":
+        return "support"
+    if zt == "support":
+        return "resistance"
+    return zt
+
+def merge_close_zones(
+    zones: List[SRZone],
+    *,
+    atr: float | None,
+    zone_type: str,
+    merge_gap_atr_mult: float = 0.2,
+    merge_gap_rate: float = 0.001,
+    max_span_rate: float | None = 0.01,  # ✅ 追加: ゾーン全幅の上限（例: 1.2%）
+) -> List[SRZone]:
+    """
+    範囲（low/high）の重なり・近さで統合する
+    - next.low <= cur.high + allow なら統合
+    - allow = max(atr*merge_gap_atr_mult, center*merge_gap_rate)
+
+    ✅ 追加: merge後のゾーンが太くなりすぎた場合、強い側をアンカーして帯幅をキャップする
+       span_rate = (high - low) / center > max_span_rate のとき発動
+       support    : price_high（上端）を固定して下端を詰める
+       resistance : price_low（下端）を固定して上端を詰める
+    """
+    if not zones:
+        return []
+
+    zt_norm = (zone_type or "").lower()
+    targets = [z for z in zones if (z.zone_type or "").lower() == zt_norm]
+    if len(targets) <= 1:
+        return targets
+
+    targets.sort(key=lambda z: float(z.price_low))
+
+    def gap_allow(center: float) -> float:
+        if atr is not None and atr > 0:
+            return max(atr * merge_gap_atr_mult, center * merge_gap_rate)
+        return center * merge_gap_rate
+
+    def apply_anchor_cap(zt: str, low: float, high: float) -> tuple[float, float]:
+        """強い側アンカーで最大帯幅をキャップ"""
+        if max_span_rate is None:
+            return low, high
+        if low >= high:
+            return low, high
+
+        center = (low + high) / 2.0
+        if center <= 0:
+            return low, high
+
+        span = high - low
+        max_span = center * max_span_rate
+        if span <= max_span:
+            return low, high
+
+        zt = (zt or "").lower()
+        if zt == "support":
+            # ✅ 上端（反発判定の基準）を維持して、下端だけ詰める
+            new_high = high
+            new_low = high - max_span
+            return new_low, new_high
+
+        if zt == "resistance":
+            # ✅ 下端（反発判定の基準）を維持して、上端だけ詰める
+            new_low = low
+            new_high = low + max_span
+            return new_low, new_high
+
+        # 不明タイプは中心固定にフォールバック
+        half = max_span / 2.0
+        return center - half, center + half
+
+    merged: List[SRZone] = []
+    cur = targets[0]
+
+    for nxt in targets[1:]:
+        allow = max(gap_allow(cur.price_center), gap_allow(nxt.price_center))
+
+        # 「重なり or 近い」を見る
+        if nxt.price_low <= cur.price_high + allow:
+            # union
+            new_low = min(cur.price_low, nxt.price_low)
+            new_high = max(cur.price_high, nxt.price_high)
+
+            # ✅ 強い側アンカーキャップ（ここが今回の本体）
+            new_low, new_high = apply_anchor_cap(cur.zone_type, new_low, new_high)
+
+            # cap後の中心で更新
+            new_center = (new_low + new_high) / 2.0
+
+            cur = SRZone(
+                symbol=cur.symbol,
+                zone_type=cur.zone_type,
+                price_center=new_center,
+                price_low=new_low,
+                price_high=new_high,
+                touches=int(cur.touches) + int(nxt.touches),
+                last_touched_at=max(cur.last_touched_at, nxt.last_touched_at),
+                strength=max(cur.strength, nxt.strength),
+            )
+        else:
+            merged.append(cur)
+            cur = nxt
+
+    merged.append(cur)
+    return merged
+
+def merge_zones_by_type(
+    zones: List[SRZone],
+    *,
+    atr: float | None,
+    merge_gap_atr_mult: float = 0.2,
+    merge_gap_rate: float = 0.001,
+    max_span_rate: float | None = 0.01,  # ✅ 追加
+) -> List[SRZone]:
+    out: List[SRZone] = []
+    for zt in ("support", "resistance"):
+        out.extend(
+            merge_close_zones(
+                zones,
+                atr=atr,
+                zone_type=zt,
+                merge_gap_atr_mult=merge_gap_atr_mult,
+                merge_gap_rate=merge_gap_rate,
+                max_span_rate=max_span_rate,  # ✅ 追加
+            )
+        )
+    return out
+
+def build_zones_from_pivots(
+    symbol: str,
+    pivot_df: pd.DataFrame,
+    df_1h: pd.DataFrame,
+    zone_type: str,
+    atr: float | None = None,
+    max_distance_rate: float = 0.01,
+    band_width_rate: float = 0.003,
+) -> list[SRZone]:
+    """
+    ✅ 改善版（reject採用）：
+    ・クラスタ距離 → ATR基準
+    ・タッチではなく「反発(reject)」を touches として扱う（互換のため touches 欄に格納）
+    ・直近度は last_rejected_at で評価
+    ・上位10本制限 → strength閾値 + 上限30本のソフト制限
+    """
+
+    logger = logging.getLogger(__name__)
+
+    if pivot_df is None or pivot_df.empty:
+        logger.info(f"{symbol} {zone_type}: ピボットが空のためゾーン0件で返します")
+        return []
+    
+    zone_type = (zone_type or "").strip().lower()
+    if zone_type not in ("support", "resistance"):
+        logger.warning(f"{symbol}: invalid zone_type={zone_type}")
+        return []
+
+    # df_1h 必須カラム（reject判定に close が要る）
+    required_1h = {"timestamp", "high", "low", "close"}
+    missing_1h = required_1h - set(df_1h.columns)
+    if missing_1h:
+        logger.warning(f"{symbol} {zone_type}: df_1hに必要カラムが不足: {missing_1h}")
+        return []
+
+    df = pivot_df.copy()
+    if df.empty:
+        logger.info(f"{symbol} {zone_type}: ゾーン0件")
+        return []
+
+    prices = df["price"].astype(float).tolist()
+    avg_price = float(np.mean(prices))
+
+    # クラスタ距離：ATR基準
+    if atr is not None and atr > 0:
+        max_distance = atr * 1.5
+    else:
+        max_distance = avg_price * max_distance_rate
+
+    clusters = _cluster_levels(prices, max_distance=max_distance)
+    if not clusters:
+        return []
+
+    df_1h = df_1h.copy()
+    df_1h["timestamp"] = pd.to_datetime(df_1h["timestamp"], errors="coerce")
+    df_1h = df_1h.dropna(subset=["timestamp"]).sort_values("timestamp")
+    if df_1h.empty:
+        logger.warning(f"{symbol} {zone_type}: df_1hが空になりました")
+        return []
+    latest_ts = df_1h["timestamp"].iloc[-1]
+    zones: list[SRZone] = []
+
+    prices_series = df["price"].astype(float).to_numpy()
+
+    for idx, cluster in enumerate(clusters, start=1):
+        cluster_prices = np.array(cluster, dtype=float)
+        center = float(cluster_prices.mean())
+
+        # ✅ ゾーン幅も ATR 連動
+        if atr is not None and atr > 0:
+            width = max(center * band_width_rate, atr * 0.4)
+        else:
+            width = center * band_width_rate
+
+        price_low = center - width
+        price_high = center + width
+
+        # --- Role Reversal 用パラメータ（最初は固定でOK） ---
+        BREAK_N_CLOSES = 2
+        BREAK_LOOKBACK = 60
+        # buffer（最初は0でOK。必要なら ATR 連動で後から入れる）
+        break_buffer = max((atr or 0.0) * 0.2, center * 0.001)
+        # 反転後の最低条件（まずは1でOK。厳しければ2）
+        MIN_REJECTS_AFTER_FLIP = 2
+
+        # ✅ ブレイク判定（方向付き）
+        break_state = get_zone_break_state(
+            df=df_1h,
+            zone_low=price_low,
+            zone_high=price_high,
+            zone_type=zone_type,
+            n_closes=BREAK_N_CLOSES,
+            lookback=BREAK_LOOKBACK,
+            buffer=break_buffer,
+        )
+
+        effective_zone_type = zone_type
+
+        # ✅ ブレイク済みなら役割反転
+        if break_state == "broken_confirmed":
+            effective_zone_type = flip_zone_type(zone_type)
+            logger.debug(
+                f"{symbol} {zone_type}: cluster#{idx} center={center:.2f} broken -> flip to {effective_zone_type}"
+            )
+
+        # NOTE: isinはfloat一致に弱い（必要なら np.isclose 版に）
+        cluster_arr = np.array(cluster, dtype=float)
+        mask = np.isclose(prices_series[:, None], cluster_arr[None, :], rtol=0, atol=1e-8).any(axis=1)
+        cluster_df = df.loc[mask]
+
+        # ✅ reject回数
+        rejects = count_zone_rejects_unique(
+            df=df_1h,
+            zone_low=price_low,
+            zone_high=price_high,
+            zone_type=effective_zone_type,
+        )
+
+        # ✅ 最終reject時刻
+        last_rejected_at = get_last_reject_time(
+            df=df_1h,
+            zone_low=price_low,
+            zone_high=price_high,
+            zone_type=effective_zone_type,
+        )
+
+        # rejectが無いならゾーンとして弱いので捨てる
+        if last_rejected_at is None:
+            continue
+
+        if break_state == "broken_confirmed" and rejects < MIN_REJECTS_AFTER_FLIP:
+            continue
+
+        # ✅ 直近度（reject 기준）
+        days_since_last = max(0.0, (latest_ts - last_rejected_at).total_seconds() / 86400.0)
+        recency_score = max(0.0, 5.0 - days_since_last)
+
+        # ✅ 出来高（現状pivot_dfにvolumeが無いなら常に0になる可能性あり）
+        volume_score = 0.0
+        if "volume" in cluster_df.columns and not cluster_df.empty:
+            vol_mean = float(cluster_df["volume"].mean())
+            volume_score = np.log1p(max(vol_mean, 0.0)) / 10.0
+
+        # ✅ strength（touches→rejectsに統一）
+        strength = rejects * 1.5 + recency_score  # + volume_score（使うなら足す）
+
+        logger.debug(
+            f"{symbol} {zone_type}: cluster#{idx} center={center:.2f}, "
+            f"rejects={rejects}, volume_score={volume_score:.3f}, "
+            f"days_since_last={days_since_last:.2f}, strength={strength:.2f}"
+        )
+
+        zones.append(
+            SRZone(
+                symbol=symbol,
+                zone_type=effective_zone_type,
+                price_center=center,
+                price_low=price_low,
+                price_high=price_high,
+                touches=rejects,                  # ✅ 互換：touchesにrejectsを格納
+                last_touched_at=last_rejected_at, # ✅ 互換：last_touched_atにlast_reject
+                strength=strength,
+            )
+        )
+
+
+    # フィルタ：直近30日
+    RECENCY_DAYS_LIMIT = 30.0
+    zones = [
+        z for z in zones
+        if (latest_ts - z.last_touched_at).total_seconds() / 86400.0 <= RECENCY_DAYS_LIMIT
+    ]
+
+    # フィルタ：reject 2回以上（touches欄に入れている）
+    zones = [z for z in zones if z.touches >= 2]
+
+    # ✅ 近すぎるゾーンを統合（Merge / Dedup）
+    zones = merge_zones_by_type(
+        zones,
+        atr=atr,
+        merge_gap_atr_mult=0.3,   # すき間許容 ATR の 20%
+        merge_gap_rate=0.001,     # ATR無い時は 0.1%
+    )
+
+    for z in zones:
+        days_since_last = max(0.0, (latest_ts - z.last_touched_at).total_seconds() / 86400.0)
+        recency_score = max(0.0, 5.0 - days_since_last)
+        z.strength = z.touches * 1.5 + recency_score
+
+    zones.sort(key=lambda z: z.strength, reverse=True)
+
+    MIN_STRENGTH = 2.5
+    MAX_ZONES = 30
+    filtered = [z for z in zones if z.strength >= MIN_STRENGTH]
+    if len(filtered) > MAX_ZONES:
+        filtered = filtered[:MAX_ZONES]
+
+    logger.info(
+        f"{symbol} {zone_type}: ゾーン最終件数={len(filtered)} "
+        f"(top3 center={[f'{z.price_center:.1f}' for z in filtered[:3]]})"
+    )
+    return filtered
 
 class PriceCacheRefresher:
     def __init__(self, symbols, get_price_fn, interval_sec=30, logger=None):
@@ -382,29 +953,59 @@ class CryptoTradingBot:
         df_hourly,
     ):
         """
-        現在の df_15m / df_hourly からローソク足をDBに保存する。
+        現在の df_15m / df_hourly からローソク足をDBに保存する（ATR対応）。
         ・15分足は candles_15min
         ・1時間足は candles_1hour
         """
         try:
             src = default_source_from_env(self)  # 既存の source 判定関数を再利用
 
+            # =========================
+            # ✅ 15分足（ATR対応）
+            # =========================
             if df_15m is not None and not df_15m.empty:
+                df_15m = df_15m.copy()
+
+                # ✅ ATR計算（14期間）
+                if {"high", "low", "close"}.issubset(df_15m.columns):
+                    tr1 = df_15m["high"] - df_15m["low"]
+                    tr2 = (df_15m["high"] - df_15m["close"].shift()).abs()
+                    tr3 = (df_15m["low"]  - df_15m["close"].shift()).abs()
+                    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+                    df_15m["ATR"] = tr.rolling(window=14).mean()
+                else:
+                    self.logger.warning(f"{symbol}: 15分足に high/low/close が無く ATR を計算できません")
+
                 upsert_candles_from_df(
                     table_name="candles_15min",
                     symbol=symbol,
                     timeframe="15min",
-                    df=df_15m,
+                    df=df_15m,      # ✅ ATR付きで保存
                     source=src,
                     keep_days=30,
                 )
 
+            # =========================
+            # ✅ 1時間足（ATR対応）
+            # =========================
             if df_hourly is not None and not df_hourly.empty:
+                df_hourly = df_hourly.copy()
+
+                # ✅ ATR計算（14期間）
+                if {"high", "low", "close"}.issubset(df_hourly.columns):
+                    tr1 = df_hourly["high"] - df_hourly["low"]
+                    tr2 = (df_hourly["high"] - df_hourly["close"].shift()).abs()
+                    tr3 = (df_hourly["low"]  - df_hourly["close"].shift()).abs()
+                    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+                    df_hourly["ATR"] = tr.rolling(window=14).mean()
+                else:
+                    self.logger.warning(f"{symbol}: 1時間足に high/low/close が無く ATR を計算できません")
+
                 upsert_candles_from_df(
                     table_name="candles_1hour",
                     symbol=symbol,
                     timeframe="1hour",
-                    df=df_hourly,
+                    df=df_hourly,   # ✅ ATR付きで保存
                     source=src,
                     keep_days=30,
                 )
@@ -413,60 +1014,317 @@ class CryptoTradingBot:
             self.logger.error(f"ローソク足保存中にエラー: {e}", exc_info=True)
         
     def _store_recent_candles(
-        self,
-        symbol: str,
-        df_15m,
-        df_1h,
-        n: int = 5,
-    ):
+            self,
+            symbol: str,
+            df_15m,
+            df_1h,
+            n: int = 5,
+        ):
+            """
+            直近 n 本だけをローソク足テーブルに upsert する軽量版（ATR完全対応・NaN防止版）
+            """
+            try:
+                src = default_source_from_env(self)
+
+                # =========================
+                # ✅ 15分足（ATR完全対応）
+                # =========================
+                if df_15m is not None and len(df_15m) > 0:
+                    df_15m = df_15m.sort_values("timestamp") if "timestamp" in df_15m.columns else df_15m
+                    df_15m = df_15m.copy()
+
+                    # ✅【重要】フルDFでATRを先に計算
+                    if {"high", "low", "close"}.issubset(df_15m.columns):
+                        tr1 = df_15m["high"] - df_15m["low"]
+                        tr2 = (df_15m["high"] - df_15m["close"].shift()).abs()
+                        tr3 = (df_15m["low"]  - df_15m["close"].shift()).abs()
+                        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+                        df_15m["ATR"] = tr.rolling(window=14).mean()
+                    else:
+                        self.logger.warning(f"{symbol}: 15分足に high/low/close が無く ATR を計算できません")
+                        df_15m["ATR"] = None
+
+                    # ✅ 最後に tail(n)
+                    last_n_15m = df_15m.tail(n).copy()
+
+                    # timestamp がカラムにない場合は index → timestamp にする
+                    if "timestamp" not in last_n_15m.columns:
+                        last_n_15m = last_n_15m.reset_index()
+                        if "index" in last_n_15m.columns:
+                            last_n_15m = last_n_15m.rename(columns={"index": "timestamp"})
+
+                    upsert_candles_from_df(
+                        table_name="candles_15min",
+                        symbol=symbol,
+                        timeframe="15min",
+                        df=last_n_15m,   # ✅ ATR入りで保存される
+                        source=src,
+                        keep_days=30,
+                    )
+
+                # =========================
+                # ✅ 1時間足（ATR完全対応）
+                # =========================
+                if df_1h is not None and len(df_1h) > 0:
+                    if "timestamp" in df_1h.columns:
+                        df_1h = df_1h.sort_values("timestamp")
+
+                    df_1h = df_1h.copy()
+
+                    # ✅【重要】フルDFでATRを先に計算
+                    if {"high", "low", "close"}.issubset(df_1h.columns):
+                        tr1 = df_1h["high"] - df_1h["low"]
+                        tr2 = (df_1h["high"] - df_1h["close"].shift()).abs()
+                        tr3 = (df_1h["low"]  - df_1h["close"].shift()).abs()
+                        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+                        df_1h["ATR"] = tr.rolling(window=14).mean()
+                    else:
+                        self.logger.warning(f"{symbol}: 1時間足に high/low/close が無く ATR を計算できません")
+                        df_1h["ATR"] = None
+
+                    # ✅ 最後に tail(n)
+                    last_n_1h = df_1h.tail(n).copy()
+
+                    if "timestamp" not in last_n_1h.columns:
+                        last_n_1h = last_n_1h.reset_index()
+                        if "index" in last_n_1h.columns:
+                            last_n_1h = last_n_1h.rename(columns={"index": "timestamp"})
+
+                    upsert_candles_from_df(
+                        table_name="candles_1hour",
+                        symbol=symbol,
+                        timeframe="1hour",
+                        df=last_n_1h,   # ✅ ATR入りで保存される
+                        source=src,
+                        keep_days=30,
+                    )
+
+            except Exception as e:
+                self.logger.error(f"ローソク足保存中のエラー: {e}", exc_info=True)
+
+    def _load_hourly_candles_from_db(self, symbol: str, lookback_days: int = 30) -> pd.DataFrame:
         """
-        直近 n 本だけをローソク足テーブルに upsert する軽量版
+        candles_1hour テーブルから直近 lookback_days 日分の1時間足を取得（ATR対応）
         """
         try:
-            src = default_source_from_env(self)
+            src = "sim"
+            since = utcnow() - timedelta(days=lookback_days)
 
-            # --- 15min ---
-            if df_15m is not None and len(df_15m) > 0:
-                df_15m = df_15m.sort_values("timestamp") if "timestamp" in df_15m.columns else df_15m
-                last_n_15m = df_15m.tail(n).copy()
+            self.logger.info(
+                f"{symbol}: SR用1時間足読み込み開始 "
+                f"(source={src}, since(UTC)={since.isoformat()})"
+            )
 
-                # timestamp がカラムにない場合は index → timestamp にする
-                if "timestamp" not in last_n_15m.columns:
-                    last_n_15m = last_n_15m.reset_index()
-                    if "index" in last_n_15m.columns:
-                        last_n_15m = last_n_15m.rename(columns={"index": "timestamp"})
+            with begin() as conn:
+                rows = conn.execute(
+                    text(
+                        """
+                        SELECT
+                            ts AS timestamp,
+                            open,
+                            high,
+                            low,
+                            close,
+                            volume,
+                            atr          -- ✅ 追加
+                        FROM candles_1hour
+                        WHERE symbol = :symbol
+                        AND source = :source
+                        AND ts >= :since
+                        ORDER BY ts
+                        """
+                    ),
+                    {
+                        "symbol": symbol,
+                        "source": src,
+                        "since": since,
+                    },
+                ).fetchall()
 
-                upsert_candles_from_df(
-                    table_name="candles_15min",
-                    symbol=symbol,
-                    timeframe="15min",
-                    df=last_n_15m,
-                    source=src,
-                    keep_days=30,
+            if not rows:
+                self.logger.warning(
+                    f"{symbol}: DBから取得できる1時間足が0件でした（SRゾーン用, "
+                    f"source={src}, since(UTC)={since.isoformat()}）"
+                )
+                return pd.DataFrame()
+
+            df = pd.DataFrame([dict(r._mapping) for r in rows])
+
+            # ✅ timestamp 整形
+            df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+
+            before = len(df)
+            df = df.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+            after = len(df)
+
+            self.logger.info(
+                f"{symbol}: SR用1時間足取得完了 raw={before}件 -> 有効={after}件 "
+                f"(期間: {df['timestamp'].min()} 〜 {df['timestamp'].max()})"
+            )
+
+            if before != after:
+                self.logger.debug(
+                    f"{symbol}: timestamp 変換で {before - after} 件が除外されました（NaT）"
                 )
 
-            # --- 1hour ---
-            if df_1h is not None and len(df_1h) > 0:
-                if "timestamp" in df_1h.columns:
-                    df_1h = df_1h.sort_values("timestamp")
-                last_n_1h = df_1h.tail(n).copy()
+            # ✅ 念のため atr 型を float に統一（NaN含む）
+            if "atr" in df.columns:
+                df["atr"] = pd.to_numeric(df["atr"], errors="coerce")
 
-                if "timestamp" not in last_n_1h.columns:
-                    last_n_1h = last_n_1h.reset_index()
-                    if "index" in last_n_1h.columns:
-                        last_n_1h = last_n_1h.rename(columns={"index": "timestamp"})
-
-                upsert_candles_from_df(
-                    table_name="candles_1hour",
-                    symbol=symbol,
-                    timeframe="1hour",
-                    df=last_n_1h,
-                    source=src,
-                    keep_days=30,
-                )
+            return df
 
         except Exception as e:
-            self.logger.error(f"ローソク足保存中のエラー: {e}", exc_info=True)
+            self.logger.error(
+                f"{symbol}: 1時間足のDB読み込み中にエラー（SRゾーン用）: {e}",
+                exc_info=True,
+            )
+            return pd.DataFrame()
+
+    def _build_sr_zones_from_hourly(self, symbol: str, df_1h: pd.DataFrame) -> list[SRZone]:
+        """
+        1時間足 df_1h からサポレジゾーン（SRZone のリスト）を構築（ATR連動対応）
+        """
+        if df_1h is None or df_1h.empty:
+            self.logger.info(f"{symbol}: SRゾーンを作るための1時間足データが空です")
+            return []
+
+        # ✅ ATR を必須カラムに追加
+        required_cols = {"timestamp", "high", "low", "atr"}
+        missing = required_cols - set(df_1h.columns)
+        if missing:
+            self.logger.warning(f"{symbol}: SRゾーン用に必要なカラムが不足: {missing}")
+            return []
+
+        df = df_1h.copy()
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+        df = df.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+
+        self.logger.info(
+            f"{symbol}: SR用1時間足整形後レコード数={len(df)} "
+            f"(期間: {df['timestamp'].min()} 〜 {df['timestamp'].max()})"
+        )
+
+        # =========================
+        # ✅ 最新の安全な ATR を取得（-2 本ルール）
+        # =========================
+        atr_series = df["atr"].dropna()
+
+        atr = None
+        if len(atr_series) >= 2:
+            atr = float(atr_series.iloc[-2])
+            self.logger.info(f"{symbol}: SR用ATR={atr:.6f}")
+        else:
+            self.logger.warning(f"{symbol}: SR用ATRが取得できません（atrが不足）")
+
+        # =========================
+        # ✅ ピボット検出
+        # =========================
+        pivot_highs, pivot_lows = detect_pivots(df, left=3, right=3)
+
+        self.logger.info(
+            f"{symbol}: ピボット検出結果 highs={len(pivot_highs)}, lows={len(pivot_lows)}"
+        )
+
+        if len(pivot_highs) == 0 and len(pivot_lows) == 0:
+            self.logger.warning(f"{symbol}: ピボットが1つも検出できませんでした")
+            return []
+
+        # =========================
+        # ✅ ゾーン化（ATR連動SR）
+        # =========================
+        res_zones = build_zones_from_pivots(
+            symbol,
+            pivot_highs,
+            df,
+            zone_type="resistance",
+            atr=atr,
+        )
+
+        sup_zones = build_zones_from_pivots(
+            symbol,
+            pivot_lows,
+            df,
+            zone_type="support",
+            atr=atr,
+        )
+
+        zones = res_zones + sup_zones
+
+        zones = merge_zones_by_type(
+            zones,
+            atr=atr,
+            merge_gap_atr_mult=0.0,   # ← “重なりだけ”を統合（すき間は統合しない）
+            merge_gap_rate=0.0,
+        )
+
+        # strength を touches と直近度で再計算（任意だが整合性が良い）
+        latest_ts = df["timestamp"].iloc[-1]
+        for z in zones:
+            days_since_last = max(0.0, (latest_ts - z.last_touched_at).total_seconds() / 86400.0)
+            recency_score = max(0.0, 5.0 - days_since_last)
+            z.strength = z.touches * 1.5 + recency_score
+
+        # =========================
+        # ✅ ログ用サマリー
+        # =========================
+        def _summary(zlist: list[SRZone], ztype: str) -> str:
+            if not zlist:
+                return f"{ztype}:0件"
+            tops = sorted(zlist, key=lambda z: z.strength, reverse=True)[:3]
+            centers = ", ".join(f"{z.price_center:.1f}" for z in tops)
+            return f"{ztype}:{len(zlist)}件 (top3 center={centers})"
+
+        self.logger.info(
+            f"{symbol}: SRゾーン生成完了 "
+            f"({ _summary(res_zones, 'res') }, { _summary(sup_zones, 'sup') })"
+        )
+
+        return zones
+    
+    def update_sr_zones_for_symbol(self, symbol: str, lookback_days: int = 30) -> None:
+        """
+        指定シンボルについて、直近 lookback_days 日の1時間足から
+        サポート・レジスタンスゾーンを再計算してDBに保存
+        """
+        df_1h = self._load_hourly_candles_from_db(symbol, lookback_days=lookback_days)
+        if df_1h is None or df_1h.empty:
+            return
+
+        zones = self._build_sr_zones_from_hourly(symbol, df_1h)
+        if not zones:
+            return
+
+        self._save_sr_zones_to_db(zones, timeframe="1hour", lookback_days=lookback_days)
+
+    def _save_sr_zones_to_db(
+        self,
+        zones: list[SRZone],
+        timeframe: str = "1hour",
+        lookback_days: int = 30,
+    ) -> None:
+        """
+        SRゾーンを support_resistance_zones テーブルに保存
+        （実処理は db.upsert_sr_zones に委譲）
+        """
+        if not zones:
+            return
+
+        src = default_source_from_env(self)
+        uid = getattr(self, "user_id", None)
+
+        try:
+            upsert_sr_zones(
+                zones,
+                timeframe=timeframe,
+                lookback_days=lookback_days,
+                user_id=uid,
+                source=src,
+            )
+            self.logger.info(
+                f"SRゾーンを {len(zones)} 件保存しました: symbol={zones[0].symbol}, tf={timeframe}"
+            )
+        except Exception as e:
+            self.logger.error(f"SRゾーン保存中にエラー: {e}", exc_info=True)
         
     def _prepare_trade_logs_for_excel_report(self, trade_logs):
         """Excel レポート用に取引ログを準備"""
@@ -4107,200 +4965,166 @@ class CryptoTradingBot:
         if self.exchange_settings_gmo.get("live_trade", False) or getattr(self, "is_backtest", False):
             if symbol == 'bcc_jpy':
                 df_5min.loc[df_5min['adx_score_long'] < 0.00435, 'buy_signal'] = False
-                df_5min.loc[df_5min['atr_score_long'].between(0.675, 0.95),'buy_signal'] = False
-                df_5min.loc[df_5min['adx_score_short'] < 0.0594, 'sell_signal'] = False
-                df_5min.loc[df_5min['cci_score_long'] > 0.788, 'buy_signal'] = False
-                df_5min.loc[df_5min['ma_score_long'].between(0.0367, 0.0546),'buy_signal'] = False
-                df_5min.loc[df_5min['ma_score_long'].between(0.155, 0.173),'buy_signal'] = False
-                df_5min.loc[df_5min['ma_score_long'].between(0.186, 0.222),'buy_signal'] = False
-                df_5min.loc[df_5min['ma_score_short'].between(0.129, 0.152),'sell_signal'] = False
-                df_5min.loc[df_5min['bb_score_long'] > 0.75, 'buy_signal'] = False
-                df_5min.loc[df_5min['bb_score_long'].between(0.327, 0.48),'buy_signal'] = False
-                df_5min.loc[df_5min['bb_score_short'] > 0.74, 'sell_signal'] = False
-                df_5min.loc[df_5min['mfi_score_long'].between(0.1, 0.154),'buy_signal'] = False
-                df_5min.loc[df_5min['mfi_score_long'].between(0.23, 0.295),'buy_signal'] = False
-                df_5min.loc[df_5min['mfi_score_long'].between(0.456, 0.536),'buy_signal'] = False
-                df_5min.loc[df_5min['mfi_score_long'].between(0.565, 0.64),'buy_signal'] = False
+                df_5min.loc[df_5min['rsi_score_long'].between(0.408, 0.454), 'buy_signal'] = False
+                df_5min.loc[df_5min['cci_score_short'].between(0.079, 0.136), 'sell_signal'] = False
+                df_5min.loc[df_5min['cci_score_short'].between(0.226, 0.254), 'sell_signal'] = False
+                df_5min.loc[df_5min['cci_score_short'].between(0.278, 0.337), 'sell_signal'] = False
+                df_5min.loc[df_5min['bb_score_long'].between(0.4, 0.48), 'buy_signal'] = False
+                df_5min.loc[df_5min['mfi_score_long'].between(0.1, 0.154), 'buy_signal'] = False
+                df_5min.loc[df_5min['mfi_score_long'].between(0.456, 0.536), 'buy_signal'] = False
+                df_5min.loc[df_5min['mfi_score_long'].between(0.565, 0.64), 'buy_signal'] = False
                 df_5min.loc[df_5min['mfi_score_long'] > 0.79, 'buy_signal'] = False
-                df_5min.loc[df_5min['mfi_score_short'].between(0.391, 0.431),'sell_signal'] = False
-                df_5min.loc[df_5min['mfi_score_short'].between(0.657, 0.751),'sell_signal'] = False
-                df_5min.loc[df_5min['rsi_score_long'].between(0.408, 0.454),'buy_signal'] = False
-                df_5min.loc[df_5min['rsi_score_long'].between(0.475, 0.57),'buy_signal'] = False
-                df_5min.loc[df_5min['rsi_score_short'].between(0.205, 0.237),'sell_signal'] = False
-                df_5min.loc[df_5min['rsi_score_short'].between(0.33, 0.42),'sell_signal'] = False
-                df_5min.loc[df_5min['rsi_score_short'].between(0.556, 0.645),'sell_signal'] = False
-                df_5min.loc[df_5min['cci_score_long'].between(0.14, 0.175),'buy_signal'] = False
-                df_5min.loc[df_5min['cci_score_short'].between(0.079, 0.136),'sell_signal'] = False
-                df_5min.loc[df_5min['cci_score_short'].between(0.226, 0.254),'sell_signal'] = False
-                df_5min.loc[df_5min['cci_score_short'].between(0.278, 0.337),'sell_signal'] = False
+                df_5min.loc[df_5min['mfi_score_short'].between(0.391, 0.431), 'sell_signal'] = False
+                df_5min.loc[df_5min['mfi_score_short'].between(0.657, 0.751), 'sell_signal'] = False
+                df_5min.loc[df_5min['rsi_score_long'].between(0.475, 0.57), 'buy_signal'] = False
+                df_5min.loc[df_5min['rsi_score_short'].between(0.205, 0.237), 'sell_signal'] = False
+                df_5min.loc[df_5min['rsi_score_short'].between(0.33, 0.42), 'sell_signal'] = False
+                df_5min.loc[df_5min['rsi_score_short'].between(0.556, 0.645), 'sell_signal'] = False
+                df_5min.loc[df_5min['cci_score_long'].between(0.14, 0.175), 'buy_signal'] = False
+                df_5min.loc[df_5min['adx_score_short'] < 0.0594, 'sell_signal'] = False
+                df_5min.loc[df_5min['ma_score_long'].between(0.0367, 0.0546), 'buy_signal'] = False
+                df_5min.loc[df_5min['ma_score_long'].between(0.155, 0.173), 'buy_signal'] = False
+                df_5min.loc[df_5min['ma_score_long'].between(0.186, 0.222), 'buy_signal'] = False
+                df_5min.loc[df_5min['ma_score_short'].between(0.129, 0.152), 'sell_signal'] = False
+                df_5min.loc[df_5min['bb_score_long'] > 0.75, 'buy_signal'] = False
+                df_5min.loc[df_5min['bb_score_short'] > 0.74, 'sell_signal'] = False
+                df_5min.loc[df_5min['atr_score_long'].between(0.675, 0.95), 'buy_signal'] = False
 
             if symbol == 'doge_jpy':
-                df_5min.loc[df_5min['atr_score_short'].between(0.0385, 0.15),'sell_signal'] = False
-                df_5min.loc[df_5min['adx_score_long'].between(0.625, 0.662),'buy_signal'] = False
+                df_5min.loc[df_5min['atr_score_short'].between(0.0385, 0.15), 'sell_signal'] = False
+                df_5min.loc[df_5min['adx_score_long'].between(0.625, 0.662), 'buy_signal'] = False
                 df_5min.loc[df_5min['adx_score_short'] < 0.03741, 'sell_signal'] = False
-                df_5min.loc[df_5min['adx_score_short'].between(0.1, 0.18),'sell_signal'] = False
-                df_5min.loc[df_5min['adx_score_short'].between(0.228, 0.297),'sell_signal'] = False
-                df_5min.loc[df_5min['adx_score_short'].between(0.33, 0.382),'sell_signal'] = False
-                df_5min.loc[df_5min['adx_score_short'].between(0.437, 0.582),'sell_signal'] = False
-                df_5min.loc[df_5min['adx_score_short'].between(0.822, 0.826),'sell_signal'] = False
-                df_5min.loc[df_5min['ma_score_long'].between(0.145, 0.195),'buy_signal'] = False
-                df_5min.loc[df_5min['ma_score_short'].between(0.191, 0.225),'sell_signal'] = False
-                df_5min.loc[df_5min['cci_score_long'].between(0.553, 0.606),'buy_signal'] = False
-                df_5min.loc[df_5min['cci_score_long'].between(0.715, 0.845),'buy_signal'] = False
-                df_5min.loc[df_5min['cci_score_short'] > 0.933, 'sell_signal'] = False
-                df_5min.loc[df_5min['cci_score_short'].between(0.315, 0.377),'sell_signal'] = False
+                df_5min.loc[df_5min['adx_score_short'].between(0.1, 0.18), 'sell_signal'] = False
+                df_5min.loc[df_5min['adx_score_short'].between(0.228, 0.297), 'sell_signal'] = False
+                df_5min.loc[df_5min['adx_score_short'].between(0.33, 0.382), 'sell_signal'] = False
+                df_5min.loc[df_5min['adx_score_short'].between(0.437, 0.582), 'sell_signal'] = False
+                df_5min.loc[df_5min['adx_score_short'].between(0.822, 0.826), 'sell_signal'] = False
+                df_5min.loc[df_5min['ma_score_long'].between(0.151, 0.165), 'buy_signal'] = False
+                df_5min.loc[df_5min['ma_score_short'].between(0.191, 0.225), 'sell_signal'] = False
+                df_5min.loc[df_5min['cci_score_long'].between(0.553, 0.606), 'buy_signal'] = False
+                df_5min.loc[df_5min['cci_score_long'].between(0.715, 0.845), 'buy_signal'] = False
+                df_5min.loc[df_5min['cci_score_short'] > 0.867, 'sell_signal'] = False
+                df_5min.loc[df_5min['cci_score_short'].between(0.315, 0.377), 'sell_signal'] = False
                 df_5min.loc[df_5min['adx_score_long'] > 0.997, 'buy_signal'] = False
-                df_5min.loc[df_5min['bb_score_long'].between(0.143, 0.21),'buy_signal'] = False
-                df_5min.loc[df_5min['bb_score_long'].between(0.35, 0.375),'buy_signal'] = False
-                df_5min.loc[df_5min['bb_score_long'].between(0.413, 0.444),'buy_signal'] = False
-                df_5min.loc[df_5min['bb_score_long'].between(0.468, 0.51),'buy_signal'] = False
-                df_5min.loc[df_5min['bb_score_long'].between(0.565, 0.605),'buy_signal'] = False
-                df_5min.loc[df_5min['rsi_score_long'].between(0.13, 0.222),'buy_signal'] = False
-                df_5min.loc[df_5min['rsi_score_long'].between(0.36, 0.39),'buy_signal'] = False
-                df_5min.loc[df_5min['rsi_score_long'].between(0.59, 0.7),'buy_signal'] = False
-                df_5min.loc[df_5min['rsi_score_short'].between(0.39, 0.43),'sell_signal'] = False
-                df_5min.loc[df_5min['rsi_score_short'].between(0.58, 0.61),'sell_signal'] = False
-                df_5min.loc[df_5min['rsi_score_short'] < 0.15, 'sell_signal'] = False
-                df_5min.loc[df_5min['mfi_score_short'] > 0.6, 'sell_signal'] = False
+                df_5min.loc[df_5min['bb_score_long'].between(0.143, 0.21), 'buy_signal'] = False
+                df_5min.loc[df_5min['bb_score_long'].between(0.35, 0.375), 'buy_signal'] = False
+                df_5min.loc[df_5min['bb_score_long'].between(0.413, 0.444), 'buy_signal'] = False
+                df_5min.loc[df_5min['bb_score_long'].between(0.468, 0.51), 'buy_signal'] = False
+                df_5min.loc[df_5min['bb_score_long'].between(0.565, 0.605), 'buy_signal'] = False
+                df_5min.loc[df_5min['rsi_score_long'].between(0.13, 0.222), 'buy_signal'] = False
+                df_5min.loc[df_5min['rsi_score_long'].between(0.613, 0.68), 'buy_signal'] = False
 
             if symbol == 'sol_jpy':
-                df_5min.loc[df_5min['atr_score_long'].between(0.0067, 0.0366),'buy_signal'] = False
-                df_5min.loc[df_5min['atr_score_short'].between(0.41, 0.69),'sell_signal'] = False
-                df_5min.loc[df_5min['atr_score_short'].between(0.045, 0.11),'sell_signal'] = False
-                df_5min.loc[df_5min['rsi_score_long'].between(0.541, 0.61),'buy_signal'] = False
+                df_5min.loc[df_5min['atr_score_long'].between(0.0067, 0.0366), 'buy_signal'] = False
+                df_5min.loc[df_5min['atr_score_short'].between(0.045, 0.11), 'sell_signal'] = False
+                df_5min.loc[df_5min['rsi_score_long'].between(0.573, 0.61), 'buy_signal'] = False
                 df_5min.loc[df_5min['rsi_score_long'] > 0.757, 'buy_signal'] = False
-                df_5min.loc[df_5min['rsi_score_short'].between(0.12, 0.18),'sell_signal'] = False
-                df_5min.loc[df_5min['cci_score_long'].between(0.114, 0.149),'buy_signal'] = False
-                df_5min.loc[df_5min['cci_score_long'].between(0.17, 0.264),'buy_signal'] = False
-                df_5min.loc[df_5min['cci_score_long'].between(0.424, 0.445),'buy_signal'] = False
-                df_5min.loc[df_5min['adx_score_long'].between(0.444, 0.56),'buy_signal'] = False
-                df_5min.loc[df_5min['adx_score_long'].between(0.197, 0.29),'buy_signal'] = False
+                df_5min.loc[df_5min['rsi_score_short'].between(0.12, 0.18), 'sell_signal'] = False
+                df_5min.loc[df_5min['cci_score_long'].between(0.114, 0.149), 'buy_signal'] = False
+                df_5min.loc[df_5min['cci_score_long'].between(0.17, 0.264), 'buy_signal'] = False
+                df_5min.loc[df_5min['adx_score_long'].between(0.444, 0.56), 'buy_signal'] = False
+                df_5min.loc[df_5min['adx_score_long'].between(0.2, 0.25), 'buy_signal'] = False
                 df_5min.loc[df_5min['adx_score_short'] < 0.15, 'sell_signal'] = False
                 df_5min.loc[df_5min['adx_score_short'] > 0.919, 'sell_signal'] = False
-                df_5min.loc[df_5min['cci_score_long'].between(0.447, 0.488),'buy_signal'] = False
-                df_5min.loc[df_5min['cci_score_short'].between(0.3, 0.355),'sell_signal'] = False
-                df_5min.loc[df_5min['cci_score_short'].between(0.428, 0.496),'sell_signal'] = False
-                df_5min.loc[df_5min['bb_score_long'].between(0.14, 0.235),'buy_signal'] = False
-                df_5min.loc[df_5min['bb_score_long'].between(0.425, 0.49),'buy_signal'] = False
-                df_5min.loc[df_5min['bb_score_short'].between(0.457, 0.552),'sell_signal'] = False
+                df_5min.loc[df_5min['cci_score_short'].between(0.3, 0.355), 'sell_signal'] = False
+                df_5min.loc[df_5min['cci_score_short'].between(0.428, 0.496), 'sell_signal'] = False
+                df_5min.loc[df_5min['bb_score_long'].between(0.2, 0.235), 'buy_signal'] = False
+                df_5min.loc[df_5min['bb_score_long'].between(0.425, 0.49), 'buy_signal'] = False
+                df_5min.loc[df_5min['bb_score_short'].between(0.457, 0.552), 'sell_signal'] = False
                 df_5min.loc[df_5min['bb_score_short'] > 0.571, 'sell_signal'] = False
-                df_5min.loc[df_5min['ma_score_long'].between(0.14, 0.223),'buy_signal'] = False
-                df_5min.loc[df_5min['ma_score_short'].between(0.0566, 0.0848),'sell_signal'] = False
-                df_5min.loc[df_5min['mfi_score_long'].between(0.215, 0.23),'buy_signal'] = False
-                df_5min.loc[df_5min['mfi_score_long'].between(0.283, 0.309),'buy_signal'] = False
-                df_5min.loc[df_5min['mfi_score_long'].between(0.355, 0.385),'buy_signal'] = False
-                df_5min.loc[df_5min['mfi_score_long'].between(0.466, 0.529),'buy_signal'] = False
-                df_5min.loc[df_5min['mfi_score_short'].between(0.247, 0.273),'sell_signal'] = False
+                df_5min.loc[df_5min['ma_score_long'].between(0.2, 0.223), 'buy_signal'] = False
+                df_5min.loc[df_5min['ma_score_short'].between(0.0566, 0.0848), 'sell_signal'] = False
 
             if symbol == 'ada_jpy':
-                df_5min.loc[df_5min['atr_score_long'].between(0.475, 0.59),'buy_signal'] = False
-                df_5min.loc[df_5min['atr_score_short'].between(0.235, 0.296),'sell_signal'] = False
-                df_5min.loc[df_5min['atr_score_short'].between(0.38, 0.527),'sell_signal'] = False
-                df_5min.loc[df_5min['adx_score_long'].between(0.35, 0.63),'buy_signal'] = False
-                df_5min.loc[df_5min['adx_score_long'].between(0.8, 0.95),'buy_signal'] = False
+                df_5min.loc[df_5min['atr_score_long'].between(0.475, 0.59), 'buy_signal'] = False
+                df_5min.loc[df_5min['atr_score_short'].between(0.235, 0.296), 'sell_signal'] = False
+                df_5min.loc[df_5min['atr_score_short'].between(0.38, 0.527), 'sell_signal'] = False
+                df_5min.loc[df_5min['adx_score_long'].between(0.35, 0.63), 'buy_signal'] = False
+                df_5min.loc[df_5min['adx_score_long'].between(0.8, 0.95), 'buy_signal'] = False
                 df_5min.loc[df_5min['adx_score_short'] < 0.0011, 'sell_signal'] = False
-                df_5min.loc[df_5min['adx_score_short'].between(0.108, 0.188),'sell_signal'] = False
-                df_5min.loc[df_5min['adx_score_short'].between(0.51, 0.645),'sell_signal'] = False
-                df_5min.loc[df_5min['rsi_score_long'].between(0.105, 0.138),'buy_signal'] = False
-                df_5min.loc[df_5min['rsi_score_long'].between(0.233, 0.286),'buy_signal'] = False
-                df_5min.loc[df_5min['rsi_score_long'].between(0.555, 0.617),'buy_signal'] = False
-                df_5min.loc[df_5min['rsi_score_long'].between(0.691, 0.743),'buy_signal'] = False
+                df_5min.loc[df_5min['adx_score_short'].between(0.108, 0.188), 'sell_signal'] = False
+                df_5min.loc[df_5min['adx_score_short'].between(0.51, 0.645), 'sell_signal'] = False
+                df_5min.loc[df_5min['rsi_score_long'].between(0.105, 0.138), 'buy_signal'] = False
+                df_5min.loc[df_5min['rsi_score_long'].between(0.233, 0.286), 'buy_signal'] = False
+                df_5min.loc[df_5min['rsi_score_long'].between(0.555, 0.617), 'buy_signal'] = False
+                df_5min.loc[df_5min['rsi_score_long'].between(0.691, 0.743), 'buy_signal'] = False
                 df_5min.loc[df_5min['rsi_score_long'] > 0.768, 'buy_signal'] = False
-                df_5min.loc[df_5min['rsi_score_short'].between(0.247, 0.372),'sell_signal'] = False
-                df_5min.loc[df_5min['bb_score_long'].between(0.315, 0.37),'buy_signal'] = False
+                df_5min.loc[df_5min['rsi_score_short'].between(0.247, 0.372), 'sell_signal'] = False
+                df_5min.loc[df_5min['bb_score_long'].between(0.315, 0.37), 'buy_signal'] = False
                 df_5min.loc[df_5min['bb_score_short'] > 0.534, 'sell_signal'] = False
-                df_5min.loc[df_5min['mfi_score_long'].between(0.57, 0.65),'buy_signal'] = False
-                df_5min.loc[df_5min['mfi_score_short'] > 0.62, 'sell_signal'] = False
                 df_5min.loc[df_5min['cci_score_long'] > 0.786, 'buy_signal'] = False
-                df_5min.loc[df_5min['cci_score_long'].between(0.25, 0.296),'buy_signal'] = False
-                df_5min.loc[df_5min['cci_score_long'].between(0.33, 0.36),'buy_signal'] = False
-                df_5min.loc[df_5min['cci_score_long'].between(0.493, 0.547),'buy_signal'] = False            
-                df_5min.loc[df_5min['cci_score_long'].between(0.57, 0.616),'buy_signal'] = False
-                df_5min.loc[df_5min['cci_score_short'].between(0.446, 0.482),'sell_signal'] = False
-                df_5min.loc[df_5min['cci_score_short'].between(0.6, 0.685),'sell_signal'] = False
+                df_5min.loc[df_5min['cci_score_long'].between(0.25, 0.296), 'buy_signal'] = False
+                df_5min.loc[df_5min['cci_score_long'].between(0.33, 0.36), 'buy_signal'] = False
+                df_5min.loc[df_5min['cci_score_long'].between(0.493, 0.547), 'buy_signal'] = False
+                df_5min.loc[df_5min['cci_score_long'].between(0.57, 0.616), 'buy_signal'] = False
+                df_5min.loc[df_5min['cci_score_short'].between(0.446, 0.482), 'sell_signal'] = False
+                df_5min.loc[df_5min['cci_score_short'].between(0.6, 0.685), 'sell_signal'] = False
                 df_5min.loc[df_5min['cci_score_short'] > 0.786, 'sell_signal'] = False
-                df_5min.loc[df_5min['ma_score_long'].between(0.13, 0.145),'buy_signal'] = False
-                df_5min.loc[df_5min['ma_score_long'].between(0.173, 0.2),'buy_signal'] = False
-                df_5min.loc[df_5min['ma_score_long'].between(0.215, 0.33),'buy_signal'] = False
-                df_5min.loc[df_5min['ma_score_short'].between(0.2, 0.25),'sell_signal'] = False
+                df_5min.loc[df_5min['ma_score_long'].between(0.13, 0.145), 'buy_signal'] = False
+                df_5min.loc[df_5min['ma_score_long'].between(0.173, 0.2), 'buy_signal'] = False
+                df_5min.loc[df_5min['ma_score_long'].between(0.215, 0.33), 'buy_signal'] = False
+                df_5min.loc[df_5min['ma_score_short'].between(0.2, 0.25), 'sell_signal'] = False
 
             if symbol == 'ltc_jpy':
-                df_5min.loc[df_5min['atr_score_long'].between(0.61, 0.727),'buy_signal'] = False
-                df_5min.loc[df_5min['cci_score_long'].between(0.20, 0.30),'buy_signal'] = False
-                df_5min.loc[df_5min['cci_score_long'].between(0.494, 0.535),'buy_signal'] = False
-                df_5min.loc[df_5min['cci_score_long'].between(0.58, 0.663),'buy_signal'] = False
-                df_5min.loc[df_5min['cci_score_long'].between(0.722, 0.765),'buy_signal'] = False
-                df_5min.loc[df_5min['cci_score_short'].between(0.215, 0.255),'sell_signal'] = False
+                df_5min.loc[df_5min['atr_score_long'].between(0.61, 0.727), 'buy_signal'] = False
+                df_5min.loc[df_5min['cci_score_long'].between(0.2, 0.3), 'buy_signal'] = False
+                df_5min.loc[df_5min['cci_score_long'].between(0.494, 0.535), 'buy_signal'] = False
+                df_5min.loc[df_5min['cci_score_long'].between(0.58, 0.663), 'buy_signal'] = False
+                df_5min.loc[df_5min['cci_score_long'].between(0.722, 0.765), 'buy_signal'] = False
+                df_5min.loc[df_5min['cci_score_short'].between(0.215, 0.255), 'sell_signal'] = False
                 df_5min.loc[df_5min['cci_score_short'] < 0.12, 'sell_signal'] = False
-                df_5min.loc[df_5min['atr_score_short'].between(0.11, 0.225),'sell_signal'] = False
-                df_5min.loc[df_5min['atr_score_short'].between(0.239, 0.408),'sell_signal'] = False
-                df_5min.loc[df_5min['bb_score_long'].between(0.143, 0.305),'buy_signal'] = False
-                df_5min.loc[df_5min['bb_score_long'].between(0.4, 0.409),'buy_signal'] = False
-                df_5min.loc[df_5min['bb_score_long'].between(0.503, 0.554),'buy_signal'] = False
+                df_5min.loc[df_5min['atr_score_short'].between(0.11, 0.225), 'sell_signal'] = False
+                df_5min.loc[df_5min['atr_score_short'].between(0.239, 0.408), 'sell_signal'] = False
+                df_5min.loc[df_5min['bb_score_long'].between(0.143, 0.305), 'buy_signal'] = False
+                df_5min.loc[df_5min['bb_score_long'].between(0.4, 0.409), 'buy_signal'] = False
+                df_5min.loc[df_5min['bb_score_long'].between(0.503, 0.554), 'buy_signal'] = False
                 df_5min.loc[df_5min['bb_score_long'] > 0.686, 'buy_signal'] = False
-                df_5min.loc[df_5min['bb_score_short'].between(0.566, 0.72),'sell_signal'] = False
-                df_5min.loc[df_5min['ma_score_long'].between(0.165, 0.184),'buy_signal'] = False
-                df_5min.loc[df_5min['ma_score_short'].between(0.0369, 0.0806),'sell_signal'] = False
-                df_5min.loc[df_5min['ma_score_short'].between(0.13, 0.162),'sell_signal'] = False
+                df_5min.loc[df_5min['bb_score_short'].between(0.566, 0.72), 'sell_signal'] = False
+                df_5min.loc[df_5min['ma_score_long'].between(0.165, 0.184), 'buy_signal'] = False
+                df_5min.loc[df_5min['ma_score_short'].between(0.0369, 0.0806), 'sell_signal'] = False
+                df_5min.loc[df_5min['ma_score_short'].between(0.13, 0.162), 'sell_signal'] = False
                 df_5min.loc[df_5min['ma_score_short'] > 0.25, 'sell_signal'] = False
-                df_5min.loc[df_5min['adx_score_long'].between(0.321, 0.395),'buy_signal'] = False
-                df_5min.loc[df_5min['adx_score_long'].between(0.468, 0.562),'buy_signal'] = False
-                df_5min.loc[df_5min['adx_score_short'].between(0.11, 0.145),'sell_signal'] = False
-                df_5min.loc[df_5min['adx_score_short'].between(0.217, 0.305),'sell_signal'] = False
-                df_5min.loc[df_5min['rsi_score_long'].between(0.3, 0.515),'buy_signal'] = False
-                df_5min.loc[df_5min['rsi_score_long'].between(0.446, 0.485),'buy_signal'] = False
-                df_5min.loc[df_5min['rsi_score_short'].between(0.12, 0.21),'sell_signal'] = False
-                df_5min.loc[df_5min['mfi_score_long'].between(0.15, 0.23),'buy_signal'] = False
-                df_5min.loc[df_5min['mfi_score_short'].between(0.18, 0.248),'sell_signal'] = False
-                df_5min.loc[df_5min['mfi_score_short'].between(0.424, 0.484),'sell_signal'] = False
-                df_5min.loc[df_5min['mfi_score_short'] > 0.71, 'sell_signal'] = False
+                df_5min.loc[df_5min['adx_score_long'].between(0.321, 0.395), 'buy_signal'] = False
+                df_5min.loc[df_5min['adx_score_long'].between(0.468, 0.562), 'buy_signal'] = False
+                df_5min.loc[df_5min['adx_score_short'].between(0.11, 0.145), 'sell_signal'] = False
+                df_5min.loc[df_5min['adx_score_short'].between(0.217, 0.305), 'sell_signal'] = False
 
             if symbol == 'eth_jpy':
-                df_5min.loc[df_5min['bb_score_long'].between(0.661, 0.795),'buy_signal'] = False
-                df_5min.loc[df_5min['bb_score_short'].between(0.422, 0.445),'sell_signal'] = False
+                df_5min.loc[df_5min['bb_score_short'].between(0.422, 0.445), 'sell_signal'] = False
                 df_5min.loc[df_5min['bb_score_short'] > 0.551, 'sell_signal'] = False
-                df_5min.loc[df_5min['mfi_score_long'].between(0.27, 0.33),'buy_signal'] = False
-                df_5min.loc[df_5min['mfi_score_short'].between(0.285, 0.31),'sell_signal'] = False
-                df_5min.loc[df_5min['ma_score_long'].between(0.0758, 0.09),'buy_signal'] = False
-                df_5min.loc[df_5min['ma_score_long'].between(0.187, 0.232),'buy_signal'] = False
-                df_5min.loc[df_5min['ma_score_short'].between(0.15, 0.17),'sell_signal'] = False
-                df_5min.loc[df_5min['atr_score_long'].between(0.0515, 0.139),'buy_signal'] = False
-                df_5min.loc[df_5min['atr_score_long'].between(0.712, 0.952),'buy_signal'] = False
-                df_5min.loc[df_5min['adx_score_long'].between(0.4, 0.5),'buy_signal'] = False
-                df_5min.loc[df_5min['rsi_score_long'].between(0.55, 0.575),'buy_signal'] = False
-                df_5min.loc[df_5min['rsi_score_short'].between(0.255, 0.393),'sell_signal'] = False
-                df_5min.loc[df_5min['mfi_score_long'].between(0.405, 0.44),'buy_signal'] = False
+                df_5min.loc[df_5min['mfi_score_long'].between(0.27, 0.29), 'buy_signal'] = False
+                df_5min.loc[df_5min['mfi_score_short'].between(0.285, 0.31), 'sell_signal'] = False
+                df_5min.loc[df_5min['ma_score_long'].between(0.0758, 0.09), 'buy_signal'] = False
+                df_5min.loc[df_5min['ma_score_short'].between(0.15, 0.17), 'sell_signal'] = False
+                df_5min.loc[df_5min['atr_score_long'].between(0.712, 0.952), 'buy_signal'] = False
+                df_5min.loc[df_5min['adx_score_long'].between(0.4, 0.5), 'buy_signal'] = False
                 df_5min.loc[df_5min['mfi_score_short'] > 0.54, 'sell_signal'] = False
 
             if symbol == 'xrp_jpy':
-                df_5min.loc[df_5min['atr_score_long'].between(0.15, 0.228),'buy_signal'] = False
-                df_5min.loc[df_5min['atr_score_long'].between(0.267, 0.44),'buy_signal'] = False
-                df_5min.loc[df_5min['atr_score_short'].between(0.013, 0.124),'sell_signal'] = False
-                df_5min.loc[df_5min['atr_score_short'].between(0.93, 0.989),'sell_signal'] = False
-                df_5min.loc[df_5min['rsi_score_long'] < 0.153, 'buy_signal'] = False
-                df_5min.loc[df_5min['rsi_score_long'].between(0.27, 0.295),'buy_signal'] = False
-                df_5min.loc[df_5min['rsi_score_long'].between(0.31, 0.42),'buy_signal'] = False
-                df_5min.loc[df_5min['rsi_score_long'].between(0.575, 0.612),'buy_signal'] = False
+                df_5min.loc[df_5min['atr_score_long'].between(0.15, 0.228), 'buy_signal'] = False
+                df_5min.loc[df_5min['atr_score_short'].between(0.013, 0.124), 'sell_signal'] = False
+                df_5min.loc[df_5min['atr_score_short'].between(0.93, 0.989), 'sell_signal'] = False
+                df_5min.loc[df_5min['rsi_score_long'].between(0.31, 0.42), 'buy_signal'] = False
+                df_5min.loc[df_5min['rsi_score_long'].between(0.575, 0.612), 'buy_signal'] = False
                 df_5min.loc[df_5min['rsi_score_long'] > 0.643, 'buy_signal'] = False
-                df_5min.loc[df_5min['rsi_score_short'].between(0.228, 0.5),'sell_signal'] = False
-                df_5min.loc[df_5min['rsi_score_short'].between(0.572, 0.593),'sell_signal'] = False
-                df_5min.loc[df_5min['rsi_score_short'].between(0.702, 0.724),'sell_signal'] = False
-                df_5min.loc[df_5min['mfi_score_long'].between(0.48, 0.54),'buy_signal'] = False
-                df_5min.loc[df_5min['cci_score_long'].between(0.0178, 0.121),'buy_signal'] = False
+                df_5min.loc[df_5min['rsi_score_short'].between(0.228, 0.5), 'sell_signal'] = False
+                df_5min.loc[df_5min['rsi_score_short'].between(0.572, 0.593), 'sell_signal'] = False
+                df_5min.loc[df_5min['rsi_score_short'].between(0.702, 0.724), 'sell_signal'] = False
+                df_5min.loc[df_5min['mfi_score_long'].between(0.48, 0.54), 'buy_signal'] = False
+                df_5min.loc[df_5min['cci_score_long'].between(0.0178, 0.121), 'buy_signal'] = False
                 df_5min.loc[df_5min['cci_score_short'] < 0.084, 'sell_signal'] = False
-                df_5min.loc[df_5min['cci_score_short'].between(0.61, 0.69),'sell_signal'] = False
-                df_5min.loc[df_5min['adx_score_long'].between(0.0348, 0.1),'buy_signal'] = False
-                df_5min.loc[df_5min['adx_score_long'].between(0.382, 0.481),'buy_signal'] = False
-                df_5min.loc[df_5min['adx_score_long'].between(0.66, 0.78),'buy_signal'] = False
+                df_5min.loc[df_5min['cci_score_short'].between(0.61, 0.69), 'sell_signal'] = False
+                df_5min.loc[df_5min['adx_score_long'].between(0.0348, 0.1), 'buy_signal'] = False
+                df_5min.loc[df_5min['adx_score_long'].between(0.382, 0.481), 'buy_signal'] = False
+                df_5min.loc[df_5min['adx_score_long'].between(0.66, 0.78), 'buy_signal'] = False
                 df_5min.loc[df_5min['adx_score_short'] < 0.155, 'sell_signal'] = False
-                df_5min.loc[df_5min['adx_score_short'].between(0.221, 0.306),'sell_signal'] = False
-                df_5min.loc[df_5min['adx_score_short'].between(0.7, 0.763),'sell_signal'] = False
-                df_5min.loc[df_5min['ma_score_long'].between(0.136, 0.16),'buy_signal'] = False
+                df_5min.loc[df_5min['adx_score_short'].between(0.221, 0.306), 'sell_signal'] = False
+                df_5min.loc[df_5min['adx_score_short'].between(0.7, 0.763), 'sell_signal'] = False
+                df_5min.loc[df_5min['ma_score_long'].between(0.175, 0.22), 'buy_signal'] = False
                 df_5min.loc[df_5min['ma_score_long'] > 0.293, 'buy_signal'] = False
-                df_5min.loc[df_5min['ma_score_short'].between(0.032, 0.077),'sell_signal'] = False
-                df_5min.loc[df_5min['bb_score_long'].between(0.251, 0.278),'buy_signal'] = False
-                df_5min.loc[df_5min['bb_score_long'].between(0.478, 0.573),'buy_signal'] = False
-                df_5min.loc[df_5min['bb_score_long'].between(0.67, 0.896),'buy_signal'] = False
+                df_5min.loc[df_5min['bb_score_long'].between(0.251, 0.278), 'buy_signal'] = False
+                df_5min.loc[df_5min['bb_score_long'].between(0.478, 0.573), 'buy_signal'] = False
+                df_5min.loc[df_5min['bb_score_long'].between(0.67, 0.896), 'buy_signal'] = False
                 df_5min.loc[df_5min['bb_score_short'] > 0.78, 'sell_signal'] = False
 
         else:
@@ -4767,7 +5591,7 @@ class CryptoTradingBot:
                                     order_size = self.adjust_order_size(symbol, order_size)
                                     entry_amount = order_size * entry_price
 
-                                    position = 'long'
+                                    position = 'short'
                                     entry_time = timestamp
                                     entry_rsi = prev1.get('RSI', None)  # 判定に使った直近確定バーの値を記録
                                     entry_cci = prev1.get('CCI', None)
@@ -4807,7 +5631,7 @@ class CryptoTradingBot:
                                         total_balance -= entry_amount
                                         balance_after_entry = total_balance
 
-                                    self.log_entry(symbol, 'long', entry_price, entry_time, entry_rsi, entry_cci,
+                                    self.log_entry(symbol, 'short', entry_price, entry_time, entry_rsi, entry_cci,
                                                 prev1.get('ATR', 0), prev1.get('ADX', 0), entry_sentiment)
 
                                 # ショートエントリー
@@ -4820,7 +5644,7 @@ class CryptoTradingBot:
                                     order_size = self.adjust_order_size(symbol, order_size)
                                     entry_amount = order_size * entry_price
 
-                                    position = 'short'
+                                    position = 'long'
                                     entry_time = timestamp
                                     entry_rsi = prev1.get('RSI', None)
                                     entry_cci = prev1.get('CCI', None)
@@ -4859,7 +5683,7 @@ class CryptoTradingBot:
                                         total_balance -= entry_amount
                                         balance_after_entry = total_balance
 
-                                    self.log_entry(symbol, 'short', entry_price, entry_time, entry_rsi, entry_cci,
+                                    self.log_entry(symbol, 'long', entry_price, entry_time, entry_rsi, entry_cci,
                                                 prev1.get('ATR', 0), prev1.get('ADX', 0), entry_sentiment)
 
                         # === イグジット判定 ===
@@ -5672,6 +6496,15 @@ class CryptoTradingBot:
             # バックテストにあわせてlast_sentiment_timeを初期化
             self.last_sentiment_time = None
 
+            # === 起動時にSRゾーンを一括更新 ==========================
+            try:
+                self.logger.info("起動時SRゾーン更新を実行します（直近30日・1時間足）")
+                for symbol in self.symbols:
+                    self.logger.info(f"{symbol}: 起動時SRゾーン更新を開始します")
+                    self.update_sr_zones_for_symbol(symbol, lookback_days=30)
+            except Exception as e:
+                self.logger.warning(f"起動時SRゾーン更新中にエラー: {e}", exc_info=True)
+
             # メインループ - より堅牢なエラーハンドリングを追加
             while True:
                 loop_start_time = now_jst()
@@ -5770,6 +6603,14 @@ class CryptoTradingBot:
                                 df_5min = df_5min.iloc[-96:].copy().reset_index(drop=True)
 
                             self._store_recent_candles(symbol, df_5min, df_hourly)
+
+                            # === SRゾーン更新：1時間に1回だけ ===
+                            try:
+                                if jst_now.minute == 0:
+                                    self.logger.info(f"{symbol}: SRゾーン更新を実行します（直近30日・1時間足）")
+                                    self.update_sr_zones_for_symbol(symbol, lookback_days=30)
+                            except Exception as e:
+                                self.logger.warning(f"{symbol}: SRゾーン更新中にエラー: {e}", exc_info=True)
                             
                             # 最新のシグナル情報を取得
                             latest_signals = df_5min.iloc[-2]
@@ -5795,11 +6636,11 @@ class CryptoTradingBot:
                                 else:
                                     # 解禁済みなら通常のエントリー判定
                                     if latest_signals.get('buy_signal', False) and previous_signals.get('buy_signal', False):
-                                        self._handle_entry(symbol, 'long', latest_signals, stats, trade_logs)
+                                        self._handle_entry(symbol, 'short', latest_signals, stats, trade_logs)
                                         # エントリーできたのでブロック情報は不要
                                         self.reentry_block_until[symbol] = None
                                     elif latest_signals.get('sell_signal', False) and previous_signals.get('sell_signal', False):
-                                        self._handle_entry(symbol, 'short', latest_signals, stats, trade_logs)
+                                        self._handle_entry(symbol, 'long', latest_signals, stats, trade_logs)
                                         self.reentry_block_until[symbol] = None
 
                             
@@ -6177,6 +7018,101 @@ class CryptoTradingBot:
             }
         }
         return thresholds_dict, explanation_text, signal_raw
+    
+    def _sr_entry_guard_params(self):
+        """
+        エントリー抑制のパラメータ。
+        とりあえず固定でOK。後で env 化しても良い。
+        """
+        return {
+            "enabled": True,
+            "timeframe": "1hour",
+            "lookback_days": 30,
+            # 「ゾーンの中」判定は price_low <= price <= price_high でOK
+            # 「近い」判定の許容率（例: 0.0015 = 0.15%）
+            "near_rate": 0.0015,
+            # strength が弱い帯は無視（build_zones側がMIN_STRENGTHを持ってますが念のため）
+            "min_strength": 5.0,
+            # 取得上限
+            "limit": 60,
+        }
+
+    def _should_block_entry_by_sr(self, symbol: str, position_type: str, price: float) -> tuple[bool, str]:
+        """
+        ロング：resistance に近い/中ならブロック
+        ショート：support    に近い/中ならブロック
+        戻り値: (block?, reason)
+        """
+        p = float(price or 0)
+        if p <= 0:
+            return False, ""
+
+        cfg = self._sr_entry_guard_params()
+        if not cfg.get("enabled", True):
+            return False, ""
+
+        src = default_source_from_env(self)  # live=real/backtest=backtest/それ以外sim :contentReference[oaicite:5]{index=5}
+        zones = fetch_sr_zones(
+            symbol,
+            timeframe=str(cfg["timeframe"]),
+            lookback_days=int(cfg["lookback_days"]),
+            user_id=None,
+            source=src,
+            min_strength=float(cfg["min_strength"]),
+            limit=int(cfg["limit"]),
+        )
+
+        if not zones:
+            return False, ""
+
+        near_rate = float(cfg["near_rate"])
+        pt = (position_type or "").lower().strip()
+
+        if pt == "long":
+            target_type = "resistance"
+            # ロングは「上の抵抗」が危険（天井付近で掴む）なので、price <= zone_low で近さを見る
+            for z in zones:
+                if (z.get("zone_type") or "").lower() != target_type:
+                    continue
+                zl = float(z.get("price_low"))
+                zh = float(z.get("price_high"))
+                strength = float(z.get("strength") or 0)
+
+                # 1) ゾーン内
+                if zl <= p <= zh:
+                    return True, f"SRブロック: priceがresistanceゾーン内 ({zl:.2f}-{zh:.2f}, strength={strength:.2f})"
+
+                # 2) ゾーン直下に近い（上端帯の手前で買うのを抑制）
+                if p < zl:
+                    dist_rate = (zl - p) / p
+                    if dist_rate <= near_rate:
+                        return True, f"SRブロック: resistance直下に近い (price={p:.2f}, zone_low={zl:.2f}, dist={dist_rate:.4%}, strength={strength:.2f})"
+
+            return False, ""
+
+        if pt == "short":
+            target_type = "support"
+            # ショートは「下の支持」が危険（底付近で売る）なので、price >= zone_high で近さを見る
+            for z in zones:
+                if (z.get("zone_type") or "").lower() != target_type:
+                    continue
+                zl = float(z.get("price_low"))
+                zh = float(z.get("price_high"))
+                strength = float(z.get("strength") or 0)
+
+                # 1) ゾーン内
+                if zl <= p <= zh:
+                    return True, f"SRブロック: priceがsupportゾーン内 ({zl:.2f}-{zh:.2f}, strength={strength:.2f})"
+
+                # 2) ゾーン直上に近い（下端帯の手前で売るのを抑制）
+                if p > zh:
+                    dist_rate = (p - zh) / p
+                    if dist_rate <= near_rate:
+                        return True, f"SRブロック: support直上に近い (price={p:.2f}, zone_high={zh:.2f}, dist={dist_rate:.4%}, strength={strength:.2f})"
+
+            return False, ""
+
+        return False, ""
 
     def _handle_entry(self, symbol, position_type, signal_data, stats, trade_logs):
         """エントリー処理を実行する（backtest関数と整合性あり）
@@ -6232,6 +7168,11 @@ class CryptoTradingBot:
         ):
             self.logger.warning(f"{symbol}の{position_type}エントリーに必要な資金が不足しています")
             return
+
+        block, reason = self._should_block_entry_by_sr(symbol, position_type, current_price)
+        if block:
+            self.logger.info(f"{symbol} {position_type} エントリー抑制: {reason}")
+            return
         
         # 注文実行
         self.logger.info(f"{symbol}の{position_type}エントリー注文を実行します: 価格 {current_price:.2f}, サイズ {order_size:.3f}, 金額 {order_amount:.0f}円")
@@ -6260,10 +7201,6 @@ class CryptoTradingBot:
 
         # バージョン
         version = self._current_strategy_version()  # 上で例示
-
-        thresholds_dict, explanation_text, signal_raw = self._build_entry_explanation(
-            symbol, position_type, signal_data, price=current_price
-        )
 
         order_result = self.execute_order_with_confirmation(
             symbol,
@@ -7362,11 +8299,11 @@ class CryptoTradingBot:
             # ========= ベースのTP/SL設定取得 =========
             base = self._get_dynamic_profit_loss_settings(symbol, df_5min)
             if position_type == 'long':
-                tp_ratio = base['long_profit_take']
-                sl_ratio = base['long_stop_loss']
+                tp_ratio = base['long_stop_loss']
+                sl_ratio = base['long_profit_take']
             else:
-                tp_ratio = base['short_profit_take']
-                sl_ratio = base['short_stop_loss']
+                tp_ratio = base['short_stop_loss']
+                sl_ratio = base['short_profit_take']
 
             base_tp_pct = abs(tp_ratio - 1.0)
             base_sl_pct = abs(sl_ratio - 1.0)
@@ -7486,29 +8423,31 @@ class CryptoTradingBot:
             # ========= 3-2: ロング専用のベースSL微修正 =========
             # ロングのみ、全体的にSLを少しタイトにする（損失圧縮）
             if position_type == 'long':
-                sl_pct *= 0.95  # ★ 例えば2.0%→1.9%のイメージ
+                sl_pct *= 0.95
 
-            # ========= ATRベース調整（TPのみ調整） =========
+            # ========= ATRベース調整（※反転後はSLのみ調整） =========
             if atr is not None:
                 if atr < config['low']:
-                    tp_pct *= config['low_mult_tp']  # ボラ低 → 少し早め利確
+                    sl_pct *= config['low_mult_tp']  # ボラ低 →（元はTP早め利確）→ 反転後はSLをややタイトに
                 elif atr > config['high']:
                     if position_type == 'long':
-                        # ★ ロングは基本的にTPを伸ばさない / やや抑えめ
-                        tp_pct *= config.get('high_mult_long_tp', 1.0)
+                        # ★ ロングは基本的に（元はTPを）伸ばさない / やや抑えめ
+                        # → 反転後はSLを緩めない（= SLを伸ばさない）
+                        sl_pct *= config.get('high_mult_long_tp', 1.0)
                     else:
-                        tp_pct *= config['high_mult_short_tp']
+                        sl_pct *= config['high_mult_short_tp']
 
-            # ========= ADXベース調整（TPのみ調整） =========
+            # ========= ADXベース調整（※反転後はSLのみ調整） =========
             if adx is not None:
                 if adx < adx_config['low']:
-                    tp_pct *= adx_config['low_mult_tp']   # トレンド弱 → 早め利確寄り
+                    sl_pct *= adx_config['low_mult_tp']   # トレンド弱 →（元はTP早め）→ 反転後はSLをややタイトに
                 elif adx > adx_config['high']:
                     if position_type == 'long':
-                        # ★ ロングはトレンド強でもTPをあまり伸ばさない
-                        tp_pct *= adx_config.get('high_mult_long_tp', 1.0)
+                        # ★ ロングはトレンド強でも（元はTPを）あまり伸ばさない
+                        # → 反転後はSLを緩めない
+                        sl_pct *= adx_config.get('high_mult_long_tp', 1.0)
                     else:
-                        tp_pct *= adx_config['high_mult_tp']  # ショートは伸ばす
+                        sl_pct *= adx_config['high_mult_tp']  # （元はショートTP伸ばす）→ 反転後はショートSLを緩める
 
             # ========= 早期警戒シグナル（ここだけSLも狭める） =========
             adx_decreasing = (adx is not None and adx_prev is not None and adx < adx_prev)
@@ -7521,17 +8460,17 @@ class CryptoTradingBot:
                     di_cross_signal = True
 
             if adx_decreasing or di_cross_signal:
-                tp_pct *= 0.85   # 利確幅を縮小（早期確定寄り）
-                sl_pct *= 0.95   # 損切りを少し手前に（広げることはしない）
+                tp_pct *= 0.95   # 利確幅を縮小（早期確定寄り）
+                sl_pct *= 0.85   # 損切りを少し手前に（広げることはしない）
 
             # ========= トレンド逆行時の微調整（これもSLは狭める方向のみ） =========
             if plus_di is not None and minus_di is not None:
                 if position_type == 'long' and plus_di < minus_di:
-                    tp_pct *= 0.95
-                    sl_pct *= 0.97
+                    tp_pct *= 0.97
+                    sl_pct *= 0.95
                 elif position_type == 'short' and minus_di < plus_di:
-                    tp_pct *= 0.95
-                    sl_pct *= 0.97
+                    tp_pct *= 0.97
+                    sl_pct *= 0.95
 
             # ========= 逆方向シグナル連続ロジック（SLのみタイト化） =========
             score_true_thresh = 0.5
@@ -7621,11 +8560,11 @@ class CryptoTradingBot:
             self.logger.error(f"{symbol}のATR利確損切計算中にエラー: {str(e)}", exc_info=True)
             default_settings = self._get_dynamic_profit_loss_settings(symbol, df_5min)
             if position_type == 'long':
-                tp_ratio = default_settings['long_profit_take']
-                sl_ratio = default_settings['long_stop_loss']
+                tp_ratio = default_settings['long_stop_loss']
+                sl_ratio = default_settings['long_profit_take']
             else:
-                tp_ratio = default_settings['short_profit_take']
-                sl_ratio = default_settings['short_stop_loss']
+                tp_ratio = default_settings['short_stop_loss']
+                sl_ratio = default_settings['short_profit_take']
 
             tp_pct = abs(tp_ratio - 1.0)
             sl_pct = abs(sl_ratio - 1.0)

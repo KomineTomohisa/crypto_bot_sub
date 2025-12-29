@@ -192,12 +192,12 @@ class ExcelReportGenerator:
                     # ★修正: スコア名からポジション種別を判定★
                     if col.endswith('_long'):
                         # ロング用スコアの場合、ロングポジションのみを対象
-                        position_filter = df_symbol['type'] == 'long'
-                        position_label = 'long'
-                    elif col.endswith('_short'):
-                        # ショート用スコアの場合、ショートポジションのみを対象
                         position_filter = df_symbol['type'] == 'short'
                         position_label = 'short'
+                    elif col.endswith('_short'):
+                        # ショート用スコアの場合、ショートポジションのみを対象
+                        position_filter = df_symbol['type'] == 'long'
+                        position_label = 'long'
                     else:
                         # その他のスコア（buy_score, sell_scoreなど）は全ポジション対象
                         position_filter = pd.Series([True] * len(df_symbol))
