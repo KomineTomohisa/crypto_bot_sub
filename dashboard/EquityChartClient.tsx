@@ -38,10 +38,21 @@ export default function EquityChartClient({
           />
 
           <Tooltip
-            formatter={(value: number, name: string) => {
-              if (name === "資産額") return [`¥${Math.round(value).toLocaleString("ja-JP")}`, name];
-              if (name === "勝率") return [`${value.toFixed(2)}%`, name];
-              return [String(value), name];
+            formatter={(value, name) => {
+              const v =
+                typeof value === "number"
+                  ? value
+                  : typeof value === "string"
+                    ? Number(value)
+                    : Array.isArray(value)
+                      ? Number(value[0])
+                      : undefined;
+
+              if (v == null || Number.isNaN(v)) return ["-", String(name)];
+
+              if (name === "資産額") return [`¥${Math.round(v).toLocaleString("ja-JP")}`, String(name)];
+              if (name === "勝率") return [`${v.toFixed(2)}%`, String(name)];
+              return [String(v), String(name)];
             }}
             labelFormatter={(label: string) => `日付: ${label}`}
           />

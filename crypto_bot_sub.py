@@ -5361,45 +5361,6 @@ class CryptoTradingBot:
         
         return order_size, base_order_amount
 
-    def _run_daily_backtest_worker(self, days_to_test: int = 30):
-        """
-        毎日0時にバックグラウンドで呼び出されるバックテスト専用ワーカー。
-        ライブ運用と分離するため、別インスタンスを使う。
-        """
-        try:
-            self.logger.info(f"[daily-backtest] {days_to_test}日バックテストをバックグラウンドで開始します")
-
-            # ライブボットとは独立したインスタンスを用意（設定ファイルは __init__ 内で読み込み）
-            bt_bot = type(self)(
-                initial_capital=self.initial_capital,
-                test_mode=True,
-                user_id=self.user_id,
-            )
-            # モードを明示しておく（default_source_from_env 内で参照される）:contentReference[oaicite:1]{index=1}
-            bt_bot.mode = "backtest"
-            bt_bot.is_backtest_mode = True  # source='backtest' でsignals/tradesを残すため
-
-            # 念のため live_trade を OFF にしておく（万一のAPI誤発注防止）
-            try:
-                if hasattr(self, "exchange_settings_gmo"):
-                    bt_bot.exchange_settings_gmo = dict(self.exchange_settings_gmo or {})
-                    bt_bot.exchange_settings_gmo["live_trade"] = False
-            except Exception:
-                bt_bot.logger.warning("[daily-backtest] exchange_settings_gmo のコピーに失敗しましたが、処理を続行します")
-
-            # シンボル・戦略周りの共通設定をコピー（必要に応じて増やしてOK）
-            for attr in ("symbols", "symbol_mapping", "entry_thresholds", "rules_version", "strategy_id"):
-                if hasattr(self, attr):
-                    setattr(bt_bot, attr, getattr(self, attr))
-
-            # 実際のバックテスト実行（Excelレポートや結果ファイルも従来通り生成される）:contentReference[oaicite:2]{index=2}
-            bt_bot.backtest(days_to_test, live_mode=False)
-
-            self.logger.info("[daily-backtest] バックテストが完了しました")
-
-        except Exception:
-            self.logger.exception("[daily-backtest] バックテスト実行中にエラーが発生しました")
-
     def backtest(self, days_to_test, live_mode=False):
         """複数通貨ペアのバックテスト実行（方式A: 直近2本True→次バー始値エントリー／スレッドセーフ）"""
         from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -6528,29 +6489,6 @@ class CryptoTradingBot:
                         self.logger.info("日次バックアップと増資チェックを実行します")
                         self.check_backup_needed()
                         self.check_monthly_increase()
-
-                        # === ここから: 日次バックテストのバックグラウンド起動 ===
-                        try:
-                            last_bt_date = getattr(self, "last_daily_backtest_date", None)
-                            # 同じ日付でまだ起動していなければ実行
-                            if last_bt_date != jst_now.date():
-                                # 既にスレッドが生きていれば二重起動を防ぐ
-                                t = getattr(self, "_daily_backtest_thread", None)
-                                if t is not None and t.is_alive():
-                                    self.logger.info("[daily-backtest] 前回のバックテストがまだ実行中のため、今回の起動はスキップします")
-                                else:
-                                    import threading
-                                    self.logger.info("[daily-backtest] 0時トリガーで30日バックテストをバックグラウンド開始します")
-                                    self._daily_backtest_thread = threading.Thread(
-                                        target=self._run_daily_backtest_worker,
-                                        args=(120,),
-                                        daemon=True,
-                                    )
-                                    self._daily_backtest_thread.start()
-                                    # 実行した日付を記録して、同日に2回以上走らないようにする
-                                    self.last_daily_backtest_date = jst_now.date()
-                        except Exception:
-                            self.logger.exception("[daily-backtest] バックグラウンドバックテスト起動に失敗しました")
                     
                     last_rep = stats.get('last_report_time')
                     try:

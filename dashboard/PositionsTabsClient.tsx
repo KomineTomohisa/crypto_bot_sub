@@ -445,14 +445,15 @@ export default function PositionsTabsClient({ positions }: Props) {
                       contentStyle={{
                         fontSize: 11,
                       }}
-                      formatter={(value: number | string, name: string) => {
+                      formatter={(value, name) => {
                         if (name === "close") {
-                          return [
-                            Number(value).toLocaleString("ja-JP"),
-                            "終値",
-                          ];
+                          const v = typeof value === "number" ? value : Number(value);
+                          if (value == null || Number.isNaN(v)) return ["-", "終値"];
+                          return [v.toLocaleString("ja-JP"), "終値"];
                         }
-                        return [String(value), name];
+
+                        if (value == null) return ["-", String(name)];
+                        return [String(value), String(name)];
                       }}
                       labelFormatter={(label: string) => `時刻: ${label}`}
                     />
