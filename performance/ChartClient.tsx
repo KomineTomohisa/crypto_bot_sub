@@ -15,7 +15,21 @@ export default function ChartClient({ data }: { data: { date: string; win_rate?:
           <XAxis dataKey="date" />
           <YAxis yAxisId="left" domain={[0, 100]} tickFormatter={(v)=>`${v}%`} />
           <YAxis yAxisId="right" orientation="right" tickFormatter={(v)=>`${v}%`} />
-          <Tooltip formatter={(v:number)=>`${v}%`} />
+          <Tooltip
+            formatter={(value) => {
+              const v =
+                typeof value === "number"
+                  ? value
+                  : typeof value === "string"
+                    ? Number(value)
+                    : Array.isArray(value)
+                      ? Number(value[0])
+                      : undefined;
+
+              if (v == null || Number.isNaN(v)) return "-%";
+              return `${v}%`;
+            }}
+          />
           <Legend />
           <Line yAxisId="left" type="monotone" dataKey="win_rate" name="Win Rate (%)" dot={false} />
           <Line yAxisId="right" type="monotone" dataKey="avg_pnl_pct" name="Avg PnL (%)" dot={false} />
