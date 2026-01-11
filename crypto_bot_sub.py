@@ -1107,7 +1107,7 @@ class CryptoTradingBot:
         candles_1hour テーブルから直近 lookback_days 日分の1時間足を取得（ATR対応）
         """
         try:
-            src = "sim"
+            src = "real"
             since = utcnow() - timedelta(days=lookback_days)
 
             self.logger.info(
