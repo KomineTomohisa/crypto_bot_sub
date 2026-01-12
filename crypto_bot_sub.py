@@ -809,15 +809,16 @@ class GMOCoinAPI:
             if method != "GET":
                 headers["Content-Type"] = "application/json"
 
+            r = None
             try:
                 if method == "GET":
-                    with HTTP_SESSION.get(url, headers=headers, timeout=timeout) as r:
-                        r.raise_for_status()
-                        return r.json()
+                    r = HTTP_SESSION.get(url, headers=headers, timeout=timeout)
                 else:
-                    with HTTP_SESSION.post(url, headers=headers, data=body_str, timeout=timeout) as r:
-                        r.raise_for_status()
-                        return r.json()
+                    # 注意: 元のコードは data=body_str なので合わせています
+                    r = HTTP_SESSION.post(url, headers=headers, data=body_str, timeout=timeout)
+
+                r.raise_for_status()
+                return r.json()
 
             except requests.exceptions.RequestException as e:
                 # DNS一時失敗は少し待って再試行
@@ -841,6 +842,15 @@ class GMOCoinAPI:
                 if attempt == 2:
                     return {"status": -1, "messages": [{"message_string": f"{type(e).__name__}: {e}"}]}
                 time.sleep(0.6 * (attempt + 1))
+                continue
+
+            finally:
+                # Responseはコンテキストマネージャ非保証なので、明示的にcloseする
+                try:
+                    if r is not None:
+                        r.close()
+                except Exception:
+                    pass
 
         # ここには基本来ない
         return {"status": -1, "messages": [{"message_string": "unknown error"}]}
@@ -1107,7 +1117,7 @@ class CryptoTradingBot:
         candles_1hour テーブルから直近 lookback_days 日分の1時間足を取得（ATR対応）
         """
         try:
-            src = "sim"
+            src = "real"
             since = utcnow() - timedelta(days=lookback_days)
 
             self.logger.info(
@@ -2685,26 +2695,36 @@ class CryptoTradingBot:
             # 最大3回の明示再試行（HTTP_SESSION側のRetryとは別にDNS対策）
             last_exc = None
             for attempt in range(3):
+                response = None
                 try:
-                    with HTTP_SESSION.get(url, headers=headers, timeout=10) as response:
-                        self.last_api_call = time.time()
-                        data = response.json()
-                        if data.get('status') == 0 and 'data' in data:
-                            ticker_data = data['data']
-                            if isinstance(ticker_data, list):
-                                for item in ticker_data:
-                                    if item.get('symbol') == gmo_symbol:
-                                        last_price = float(item.get('last', 0))
-                                        self.logger.info(f"{symbol} 現在価格: {last_price}")
-                                        return last_price
-                                self.logger.warning(f"{symbol}（{gmo_symbol}）の価格データが見つかりません")
-                                return 0.0
-                            else:
-                                return float(ticker_data.get('last', 0))
-                        else:
-                            err = data.get('messages', [{"message_string": "不明なエラー"}])[0].get("message_string", "不明なエラー") if data.get('messages') else "不明なエラー"
-                            self.logger.error(f"GMOコイン価格取得エラー: {err}")
+                    response = HTTP_SESSION.get(url, headers=headers, timeout=10)
+                    self.last_api_call = time.time()
+
+                    # HTTPエラーを明示的に例外化（4xx/5xx）
+                    response.raise_for_status()
+
+                    data = response.json()
+                    if data.get('status') == 0 and 'data' in data:
+                        ticker_data = data['data']
+                        if isinstance(ticker_data, list):
+                            for item in ticker_data:
+                                if item.get('symbol') == gmo_symbol:
+                                    last_price = float(item.get('last', 0))
+                                    self.logger.info(f"{symbol} 現在価格: {last_price}")
+                                    return last_price
+                            self.logger.warning(f"{symbol}（{gmo_symbol}）の価格データが見つかりません")
                             return 0.0
+                        else:
+                            return float(ticker_data.get('last', 0))
+                    else:
+                        # GMOエラー形式
+                        if data.get('messages'):
+                            err = data['messages'][0].get("message_string", "不明なエラー")
+                        else:
+                            err = "不明なエラー"
+                        self.logger.error(f"GMOコイン価格取得エラー: {err}")
+                        return 0.0
+
                 except requests.exceptions.RequestException as e:
                     last_exc = e
                     if _is_dns_temp_failure(e):
@@ -2712,6 +2732,14 @@ class CryptoTradingBot:
                         continue
                     time.sleep(0.6 * (attempt + 1))
                     continue
+
+                finally:
+                    # Responseはコンテキストマネージャ非保証なので明示close
+                    try:
+                        if response is not None:
+                            response.close()
+                    except Exception:
+                        pass
 
             if last_exc:
                 self.logger.error(f"価格取得APIリクエストエラー: {last_exc}")
@@ -8199,6 +8227,194 @@ class CryptoTradingBot:
         
         return settings
 
+    def _sr_exit_params(self) -> dict:
+        return {
+            "enabled": True,
+            "timeframe": "1hour",
+            # DB上のSRが30日生成でも、取得は広めでもOK（候補が無ければフォールバックするだけ）
+            "lookback_days": 60,
+            # strength フィルタ（primary=10、候補が無い場合のみfallback=8を許容）
+            "min_strength_primary": 10.0,
+            "min_strength_fallback": 8.0,
+            "limit": 200,
+
+            # ゾーン手前/外側に置くバッファ（大きい方を採用）
+            "buffer_atr_mult": 0.20,   # 0.20 * ATR
+            "buffer_rate": 0.0010,     # 0.10%
+
+            # TPが近すぎる場合はSR補正を適用しない
+            # min_profit = max(0.15%, 0.35*ATR/entry)
+            "min_profit_floor_rate": 0.0015,   # 0.15%
+            "min_profit_atr_mult": 0.35,
+
+            # SR SLが遠くなりすぎる場合は拒否（薄い通貨向けの安全弁）
+            "sl_far_reject_mult": 1.4,
+        }
+
+    def _apply_sr_exit_levels(
+        self,
+        *,
+        symbol: str,
+        df_5min: pd.DataFrame,
+        position_type: str,
+        entry_price: float,
+        base_take_profit: float,
+        base_stop_loss: float,
+        atr_value: float | None,
+    ) -> dict:
+        """
+        SRゾーンを用いて、ベースTP/SLに「追加条件」で補正をかける。
+        返却: {"take_profit_price": float, "stop_loss_price": float, "applied": bool}
+        """
+        cfg = self._sr_exit_params()
+        if not cfg.get("enabled", True):
+            return {
+                "take_profit_price": float(base_take_profit),
+                "stop_loss_price": float(base_stop_loss),
+                "applied": False,
+            }
+
+        # 現在値（候補選定にのみ使用。エグジット自体は別ロジックで判定される）
+        try:
+            current_price = float(df_5min["close"].dropna().iloc[-1])
+        except Exception:
+            current_price = float(entry_price)
+
+        atr = float(atr_value) if atr_value is not None else None
+        buffer = max(
+            (atr or 0.0) * float(cfg["buffer_atr_mult"]),
+            float(entry_price) * float(cfg["buffer_rate"]),
+        )
+
+        # min_profit（TP近すぎ除外）
+        min_profit_rate = max(
+            float(cfg["min_profit_floor_rate"]),
+            ((atr or 0.0) * float(cfg["min_profit_atr_mult"]) / float(entry_price)) if entry_price else float("inf"),
+        )
+
+        # SRゾーン取得（fetchはfallback(min_strength_fallback)で広めに取り、primaryを内部で優先）
+        src = default_source_from_env(self)  # live=real / backtest=backtest / それ以外sim
+        zones = fetch_sr_zones(
+            symbol,
+            timeframe=str(cfg["timeframe"]),
+            lookback_days=int(cfg["lookback_days"]),
+            user_id=None,
+            source=src,
+            min_strength=float(cfg["min_strength_fallback"]),
+            limit=int(cfg["limit"]),
+        ) or []
+
+        def _strength(z) -> float:
+            try:
+                return float(z.get("strength") or 0.0)
+            except Exception:
+                return 0.0
+
+        def _zt(z) -> str:
+            return (z.get("zone_type") or "").strip().lower()
+
+        # primary優先で候補を探し、無ければfallbackへ
+        def _pick_nearest_resistance_above(price: float) -> dict | None:
+            primary = [z for z in zones if _zt(z) == "resistance" and _strength(z) >= float(cfg["min_strength_primary"]) and float(z.get("price_low", 0)) > price]
+            if primary:
+                return min(primary, key=lambda z: float(z.get("price_low", 0)))
+            fallback = [z for z in zones if _zt(z) == "resistance" and float(z.get("price_low", 0)) > price]
+            return min(fallback, key=lambda z: float(z.get("price_low", 0))) if fallback else None
+
+        def _pick_nearest_support_below(price: float) -> dict | None:
+            primary = [z for z in zones if _zt(z) == "support" and _strength(z) >= float(cfg["min_strength_primary"]) and float(z.get("price_high", 0)) < price]
+            if primary:
+                return max(primary, key=lambda z: float(z.get("price_high", 0)))
+            fallback = [z for z in zones if _zt(z) == "support" and float(z.get("price_high", 0)) < price]
+            return max(fallback, key=lambda z: float(z.get("price_high", 0))) if fallback else None
+
+        pt = (position_type or "").strip().lower()
+        tp = float(base_take_profit)
+        sl = float(base_stop_loss)
+        applied = False
+
+        if entry_price <= 0:
+            return {"take_profit_price": tp, "stop_loss_price": sl, "applied": False}
+
+        if pt == "long":
+            # --- TP: 次のresistance手前（ただし近すぎは除外、ベースTPより遠くしない） ---
+            r = _pick_nearest_resistance_above(current_price)
+            if r:
+                try:
+                    zone_low = float(r.get("price_low"))
+                    tp_sr = zone_low - buffer
+                    profit_rate = (tp_sr - entry_price) / entry_price
+                    if tp_sr > entry_price and profit_rate >= min_profit_rate:
+                        # ベースTPより遠くしない（min）
+                        new_tp = min(tp, tp_sr)
+                        if new_tp != tp:
+                            tp = new_tp
+                            applied = True
+                except Exception:
+                    pass
+
+            # --- SL: 直近support外側（遠くなりすぎ拒否、タイト化方向のみ） ---
+            s = _pick_nearest_support_below(current_price)
+            if s:
+                try:
+                    zone_low = float(s.get("price_low"))
+                    sl_sr = zone_low - buffer
+                    # 現状維持方針：損失としてのSLを保ちたいので、エントリーを跨ぐSLは採用しない
+                    if sl_sr < entry_price:
+                        dist_base = abs(entry_price - float(base_stop_loss))
+                        dist_sr = abs(entry_price - sl_sr)
+                        if dist_base > 0 and dist_sr <= dist_base * float(cfg["sl_far_reject_mult"]):
+                            # ロングはSLが高いほどタイト
+                            new_sl = max(sl, sl_sr)
+                            if new_sl != sl:
+                                sl = new_sl
+                                applied = True
+                except Exception:
+                    pass
+
+        elif pt == "short":
+            # --- TP: 次のsupport手前（近すぎ除外、ベースTPより遠くしない=利幅を増やさない） ---
+            s = _pick_nearest_support_below(current_price)
+            if s:
+                try:
+                    zone_high = float(s.get("price_high"))
+                    tp_sr = zone_high + buffer
+                    profit_rate = (entry_price - tp_sr) / entry_price
+                    if tp_sr < entry_price and profit_rate >= min_profit_rate:
+                        # ショートはTPが高いほど近い（利幅が小さい）。
+                        # ベースTPより遠くしない=利幅を増やさない -> 価格としては max(base, sr)
+                        new_tp = max(tp, tp_sr)
+                        if new_tp != tp:
+                            tp = new_tp
+                            applied = True
+                except Exception:
+                    pass
+
+            # --- SL: 直近resistance外側（遠くなりすぎ拒否、タイト化方向のみ） ---
+            r = _pick_nearest_resistance_above(current_price)
+            if r:
+                try:
+                    zone_high = float(r.get("price_high"))
+                    sl_sr = zone_high + buffer
+                    # 現状維持方針：損失としてのSLを保ちたいので、エントリーを跨ぐSLは採用しない
+                    if sl_sr > entry_price:
+                        dist_base = abs(float(base_stop_loss) - entry_price)
+                        dist_sr = abs(sl_sr - entry_price)
+                        if dist_base > 0 and dist_sr <= dist_base * float(cfg["sl_far_reject_mult"]):
+                            # ショートはSLが低いほどタイト
+                            new_sl = min(sl, sl_sr)
+                            if new_sl != sl:
+                                sl = new_sl
+                                applied = True
+                except Exception:
+                    pass
+
+        return {
+            "take_profit_price": float(tp),
+            "stop_loss_price": float(sl),
+            "applied": bool(applied),
+        }
+
     def calculate_dynamic_exit_levels(self, symbol, df_5min, position_type, entry_price):
         """
         通貨ペア・ポジションタイプ別のATR & ADXに応じて、
@@ -8482,6 +8698,37 @@ class CryptoTradingBot:
                 stop_loss_price   = entry_price * (1 + sl_pct)
                 take_profit_ratio = 1 - tp_pct
                 stop_loss_ratio   = 1 + sl_pct
+
+            # ========= SRゾーンによるTP/SL補正（追加条件） =========
+            # ベースTP/SL（ATR/ADX等）を壊さない方針:
+            # - TP: long は min(base, SR)、short は max(base, SR)（=利幅を増やさない）
+            # - SL: 遠くなりすぎる場合は拒否し、タイト化方向のみ適用
+            try:
+                adj = self._apply_sr_exit_levels(
+                    symbol=symbol,
+                    df_5min=df_5min,
+                    position_type=position_type,
+                    entry_price=float(entry_price),
+                    base_take_profit=float(take_profit_price),
+                    base_stop_loss=float(stop_loss_price),
+                    atr_value=float(atr) if atr is not None else None,
+                )
+                take_profit_price = float(adj["take_profit_price"])
+                stop_loss_price = float(adj["stop_loss_price"])
+
+                # 補正後の比率（tp_pct/sl_pct）を再計算（risk_reward_ratio を正しくする）
+                if position_type == 'long':
+                    tp_pct = (take_profit_price - entry_price) / entry_price
+                    sl_pct = (entry_price - stop_loss_price) / entry_price
+                    take_profit_ratio = take_profit_price / entry_price
+                    stop_loss_ratio = stop_loss_price / entry_price
+                else:
+                    tp_pct = (entry_price - take_profit_price) / entry_price
+                    sl_pct = (stop_loss_price - entry_price) / entry_price
+                    take_profit_ratio = take_profit_price / entry_price
+                    stop_loss_ratio = stop_loss_price / entry_price
+            except Exception as e_sr:
+                self.logger.warning(f"{symbol}: SRイグジット補正に失敗: {e_sr}")
 
             risk_reward_ratio = tp_pct / sl_pct if sl_pct != 0 else float('inf')
 

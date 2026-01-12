@@ -354,29 +354,6 @@ def fetch_signal_rules(
         }).mappings().all()
     return [dict(r) for r in rows]
 
-def get_user_email_and_pw(user_id: int) -> Dict[str, Optional[str]]:
-    """
-    SIM通知用：user.id から宛先メールと（必要なら）暗号化済みメールパスワードを返す。
-    password_hash はここでは使わず、別用途（ログイン等）。
-    """
-    with begin() as conn:
-        row = conn.execute(text("""
-            SELECT
-              COALESCE(email, '') AS email,
-              COALESCE(email_password_encrypted, '') AS email_password_encrypted,
-              COALESCE(email_enabled, TRUE) AS email_enabled
-            FROM "user"
-            WHERE id = :uid
-            LIMIT 1
-        """), {"uid": user_id}).fetchone()
-        if not row:
-            return {"email": None, "email_password_encrypted": None, "email_enabled": None}
-        return {
-            "email": row[0] or None,
-            "email_password_encrypted": row[1] or None,
-            "email_enabled": bool(row[2]),
-        }
-
 def fetch_sr_zones(
     symbol: str,
     *,
@@ -1171,7 +1148,6 @@ def upsert_candles_from_df(
     required_cols = ["timestamp", "open", "high", "low", "close"]
     missing = [c for c in required_cols if c not in df.columns]
     if missing:
-        # 必要であれば logger を使ってもよい
         print(f"[upsert_candles_from_df] missing columns in df: {missing}")
         return
 
@@ -1180,11 +1156,9 @@ def upsert_candles_from_df(
     for _, r in df.iterrows():
         ts = r["timestamp"]
         if isinstance(ts, datetime):
-            # JST naive なら JST を付けてから UTC へ変換
             if ts.tzinfo is None:
                 ts = ts.replace(tzinfo=JST)
         else:
-            # 文字列などの場合は一応パースを試みる
             try:
                 ts = datetime.fromisoformat(str(ts))
                 if ts.tzinfo is None:
@@ -1196,7 +1170,7 @@ def upsert_candles_from_df(
             {
                 "symbol": symbol,
                 "timeframe": timeframe,
-                "ts": _as_utc(ts),  # DB には UTC で保存
+                "ts": _as_utc(ts),
                 "open": float(r["open"]),
                 "high": float(r["high"]),
                 "low": float(r["low"]),
@@ -1210,7 +1184,15 @@ def upsert_candles_from_df(
     if not rows:
         return
 
-    # ※ table_name は外部入力を通さず、呼び出し側で固定文字列を渡す前提
+    # --- table_name / timeframe を許可リストで検証（SQLインジェクション対策） ---
+    allowed_tables = {"candles_15min", "candles_1hour"}
+    if table_name not in allowed_tables:
+        raise ValueError(f"Invalid table_name: {table_name}")
+
+    allowed_timeframes = {"15min", "1hour"}
+    if timeframe not in allowed_timeframes:
+        raise ValueError(f"Invalid timeframe: {timeframe}")
+
     insert_sql = sa.text(
         f"""
         INSERT INTO {table_name} (
@@ -1246,13 +1228,10 @@ def upsert_candles_from_df(
         """
     )
 
-    # 既存の begin / _exec に合わせて Tx を扱う
     if conn is not None:
-        # 呼び出し側のトランザクションに参加
         conn.execute(insert_sql, rows)
         conn.execute(delete_sql, {"symbol": symbol, "timeframe": timeframe, "keep_days": keep_days})
     else:
-        # 単独でトランザクション開始
         with begin() as c:
             c.execute(insert_sql, rows)
             c.execute(delete_sql, {"symbol": symbol, "timeframe": timeframe, "keep_days": keep_days})
