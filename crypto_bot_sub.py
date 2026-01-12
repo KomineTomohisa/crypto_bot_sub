@@ -809,15 +809,16 @@ class GMOCoinAPI:
             if method != "GET":
                 headers["Content-Type"] = "application/json"
 
+            r = None
             try:
                 if method == "GET":
-                    with HTTP_SESSION.get(url, headers=headers, timeout=timeout) as r:
-                        r.raise_for_status()
-                        return r.json()
+                    r = HTTP_SESSION.get(url, headers=headers, timeout=timeout)
                 else:
-                    with HTTP_SESSION.post(url, headers=headers, data=body_str, timeout=timeout) as r:
-                        r.raise_for_status()
-                        return r.json()
+                    # 注意: 元のコードは data=body_str なので合わせています
+                    r = HTTP_SESSION.post(url, headers=headers, data=body_str, timeout=timeout)
+
+                r.raise_for_status()
+                return r.json()
 
             except requests.exceptions.RequestException as e:
                 # DNS一時失敗は少し待って再試行
@@ -841,6 +842,15 @@ class GMOCoinAPI:
                 if attempt == 2:
                     return {"status": -1, "messages": [{"message_string": f"{type(e).__name__}: {e}"}]}
                 time.sleep(0.6 * (attempt + 1))
+                continue
+
+            finally:
+                # Responseはコンテキストマネージャ非保証なので、明示的にcloseする
+                try:
+                    if r is not None:
+                        r.close()
+                except Exception:
+                    pass
 
         # ここには基本来ない
         return {"status": -1, "messages": [{"message_string": "unknown error"}]}
@@ -2685,26 +2695,36 @@ class CryptoTradingBot:
             # 最大3回の明示再試行（HTTP_SESSION側のRetryとは別にDNS対策）
             last_exc = None
             for attempt in range(3):
+                response = None
                 try:
-                    with HTTP_SESSION.get(url, headers=headers, timeout=10) as response:
-                        self.last_api_call = time.time()
-                        data = response.json()
-                        if data.get('status') == 0 and 'data' in data:
-                            ticker_data = data['data']
-                            if isinstance(ticker_data, list):
-                                for item in ticker_data:
-                                    if item.get('symbol') == gmo_symbol:
-                                        last_price = float(item.get('last', 0))
-                                        self.logger.info(f"{symbol} 現在価格: {last_price}")
-                                        return last_price
-                                self.logger.warning(f"{symbol}（{gmo_symbol}）の価格データが見つかりません")
-                                return 0.0
-                            else:
-                                return float(ticker_data.get('last', 0))
-                        else:
-                            err = data.get('messages', [{"message_string": "不明なエラー"}])[0].get("message_string", "不明なエラー") if data.get('messages') else "不明なエラー"
-                            self.logger.error(f"GMOコイン価格取得エラー: {err}")
+                    response = HTTP_SESSION.get(url, headers=headers, timeout=10)
+                    self.last_api_call = time.time()
+
+                    # HTTPエラーを明示的に例外化（4xx/5xx）
+                    response.raise_for_status()
+
+                    data = response.json()
+                    if data.get('status') == 0 and 'data' in data:
+                        ticker_data = data['data']
+                        if isinstance(ticker_data, list):
+                            for item in ticker_data:
+                                if item.get('symbol') == gmo_symbol:
+                                    last_price = float(item.get('last', 0))
+                                    self.logger.info(f"{symbol} 現在価格: {last_price}")
+                                    return last_price
+                            self.logger.warning(f"{symbol}（{gmo_symbol}）の価格データが見つかりません")
                             return 0.0
+                        else:
+                            return float(ticker_data.get('last', 0))
+                    else:
+                        # GMOエラー形式
+                        if data.get('messages'):
+                            err = data['messages'][0].get("message_string", "不明なエラー")
+                        else:
+                            err = "不明なエラー"
+                        self.logger.error(f"GMOコイン価格取得エラー: {err}")
+                        return 0.0
+
                 except requests.exceptions.RequestException as e:
                     last_exc = e
                     if _is_dns_temp_failure(e):
@@ -2712,6 +2732,14 @@ class CryptoTradingBot:
                         continue
                     time.sleep(0.6 * (attempt + 1))
                     continue
+
+                finally:
+                    # Responseはコンテキストマネージャ非保証なので明示close
+                    try:
+                        if response is not None:
+                            response.close()
+                    except Exception:
+                        pass
 
             if last_exc:
                 self.logger.error(f"価格取得APIリクエストエラー: {last_exc}")
