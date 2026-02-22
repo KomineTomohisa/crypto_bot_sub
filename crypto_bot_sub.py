@@ -4994,8 +4994,8 @@ class CryptoTradingBot:
         # ③ Short: RSI < 40 のsell_signalを無効化
         # ※ analysisで使っている rsi_sig は、ここでは df_5min['RSI'] の生値
         if 'RSI' in df_5min.columns:
-            df_5min.loc[df_5min['RSI'] < 50, 'buy_signal'] = False
-            df_5min.loc[df_5min['RSI'] < 40, 'sell_signal'] = False
+            df_5min.loc[df_5min['RSI'] < 40, 'buy_signal'] = False
+            df_5min.loc[df_5min['RSI'] < 50, 'sell_signal'] = False
 
         if self.exchange_settings_gmo.get("live_trade", False) or getattr(self, "is_backtest", False):
             if symbol == 'bcc_jpy':
