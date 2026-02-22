@@ -4990,6 +4990,13 @@ class CryptoTradingBot:
         df_5min['buy_signal'] = df_5min['buy_score_scaled'] >= buy_signal_threshold
         df_5min['sell_signal'] = df_5min['sell_score_scaled'] >= sell_signal_threshold
 
+        # ① Long: RSI < 50 のbuy_signalを無効化
+        # ③ Short: RSI < 40 のsell_signalを無効化
+        # ※ analysisで使っている rsi_sig は、ここでは df_5min['RSI'] の生値
+        if 'RSI' in df_5min.columns:
+            df_5min.loc[df_5min['RSI'] < 50, 'buy_signal'] = False
+            df_5min.loc[df_5min['RSI'] < 40, 'sell_signal'] = False
+
         if self.exchange_settings_gmo.get("live_trade", False) or getattr(self, "is_backtest", False):
             if symbol == 'bcc_jpy':
                 df_5min.loc[df_5min['adx_score_long'] < 0.00435, 'buy_signal'] = False
