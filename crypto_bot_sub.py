@@ -1826,9 +1826,9 @@ class CryptoTradingBot:
         
         # 取引サイズ設定
         if self.test_mode:
-            self.TRADE_SIZE = 20000  # テストモード
+            self.TRADE_SIZE = 40000  # テストモード
         else:
-            self.TRADE_SIZE = 20000  # 通常取引額
+            self.TRADE_SIZE = 40000  # 通常取引額
             
         # API呼び出し制限管理
         self.last_api_call = time.time() - 1
@@ -4990,12 +4990,21 @@ class CryptoTradingBot:
         df_5min['buy_signal'] = df_5min['buy_score_scaled'] >= buy_signal_threshold
         df_5min['sell_signal'] = df_5min['sell_score_scaled'] >= sell_signal_threshold
 
-        # ① Long: RSI < 50 のbuy_signalを無効化
-        # ③ Short: RSI < 40 のsell_signalを無効化
-        # ※ analysisで使っている rsi_sig は、ここでは df_5min['RSI'] の生値
-        if 'RSI' in df_5min.columns:
-            df_5min.loc[df_5min['RSI'] < 40, 'buy_signal'] = False
-            df_5min.loc[df_5min['RSI'] < 50, 'sell_signal'] = False
+        # ロング: 既存の CCI / RSI フィルターを維持
+        if {'RSI', 'CCI'}.issubset(df_5min.columns):
+            rsi = df_5min['RSI'].fillna(50)
+            cci = df_5min['CCI'].fillna(0)
+
+            sell_filter = (cci >= 0) & (rsi >= 60)
+            df_5min.loc[~sell_filter, 'sell_signal'] = False
+
+        # ショート: ATR + ADX フィルターに変更
+        if {'ADX', 'atr_score_short'}.issubset(df_5min.columns):
+            adx = df_5min['ADX'].fillna(0)
+            atr_score_buy = df_5min['atr_score_short'].fillna(0)
+
+            buy_filter = (atr_score_buy >= 0.7) & (adx >= 20)
+            df_5min.loc[~buy_filter, 'buy_signal'] = False
 
         if self.exchange_settings_gmo.get("live_trade", False) or getattr(self, "is_backtest", False):
             if symbol == 'bcc_jpy':
