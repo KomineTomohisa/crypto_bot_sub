@@ -5006,6 +5006,21 @@ class CryptoTradingBot:
             buy_filter = (atr_score_buy >= 0.7) & (adx >= 20)
             df_5min.loc[~buy_filter, 'buy_signal'] = False
 
+        # =========================
+        # Short改善フィルター v1
+        # 前提:
+        #   buy_signal  = Short
+        #   sell_signal = Long
+        # 目的:
+        #   MACDがショート方向を支持していないShortを除外する
+        # =========================
+        if 'macd_score_short' in df_5min.columns:
+            macd_short = df_5min['macd_score_short'].fillna(0)
+
+            # まずは安全運用なら 0.4
+            # 分析結果を強く反映するなら 0.5
+            df_5min.loc[macd_short < 0.4, 'buy_signal'] = False
+
         if self.exchange_settings_gmo.get("live_trade", False) or getattr(self, "is_backtest", False):
             if symbol == 'bcc_jpy':
                 df_5min.loc[df_5min['adx_score_long'] < 0.00435, 'buy_signal'] = False
