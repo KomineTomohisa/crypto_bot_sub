@@ -5019,7 +5019,7 @@ class CryptoTradingBot:
 
             # まずは安全運用なら 0.4
             # 分析結果を強く反映するなら 0.5
-            df_5min.loc[macd_short < 0.4, 'buy_signal'] = False
+            df_5min.loc[macd_short < 0.5, 'buy_signal'] = False
 
         if self.exchange_settings_gmo.get("live_trade", False) or getattr(self, "is_backtest", False):
             if symbol == 'bcc_jpy':
