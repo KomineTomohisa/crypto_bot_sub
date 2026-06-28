@@ -4997,6 +4997,28 @@ class CryptoTradingBot:
 
             sell_filter = (cci >= 0) & (rsi >= 60)
             df_5min.loc[~sell_filter, 'sell_signal'] = False
+            
+        if symbol in ['eth_jpy', 'bcc_jpy', 'xrp_jpy', 'ltc_jpy']:
+
+            # 1. ADX過熱時のLong禁止
+            if 'ADX' in df_5min.columns:
+                adx = df_5min['ADX'].fillna(0)
+                df_5min.loc[adx >= 50, 'sell_signal'] = False
+
+            # 2. 過熱スコアが複数重なったLongを禁止
+            overheat_count = pd.Series(0, index=df_5min.index)
+
+            if 'bb_score_short' in df_5min.columns:
+                overheat_count += (df_5min['bb_score_short'].fillna(0) > 0.66).astype(int)
+
+            if 'rsi_score_short' in df_5min.columns:
+                overheat_count += (df_5min['rsi_score_short'].fillna(0) > 0.66).astype(int)
+
+            if 'cci_score_short' in df_5min.columns:
+                overheat_count += (df_5min['cci_score_short'].fillna(0) > 0.66).astype(int)
+
+            # 3指標のうち2つ以上が過熱している場合だけLong禁止
+            df_5min.loc[overheat_count >= 2, 'sell_signal'] = False
 
         # ショート: ATR + ADX フィルターに変更
         if {'ADX', 'atr_score_short'}.issubset(df_5min.columns):
@@ -5193,6 +5215,26 @@ class CryptoTradingBot:
                 timeframe="15m",
                 version=getattr(self, "rules_version", None)  # 未定義なら None でOK
             )
+
+        # =========================
+        # Long改善フィルター v1
+        # 前提:
+        #   buy_signal  = Short
+        #   sell_signal = Long
+        # 目的:
+        #   MACDが強すぎ、かつADXスコアも反応している
+        #   上昇後半の飛び乗りLongを除外する
+        # =========================
+        if {'macd_score_long', 'adx_score_long'}.issubset(df_5min.columns):
+            macd_long = df_5min['macd_score_long'].fillna(0)
+            adx_score_long = df_5min['adx_score_long'].fillna(0)
+
+            overheated_long = (
+                (macd_long >= 0.8) &
+                (adx_score_long >= 0.1)
+            )
+
+            df_5min.loc[overheated_long, 'sell_signal'] = False
 
         if 'EMA_long' in df_5min.columns and len(df_5min) > 1:
             prev_price = df_5min['close'].shift(1)
