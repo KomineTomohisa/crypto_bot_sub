@@ -5269,6 +5269,15 @@ class CryptoTradingBot:
             )
 
         # =========================
+        # Long改善フィルター: MACDロングスコアが0.5以上0.8未満のLongを除外
+        # sell_signal が Long に対応するため、buy_signal は変更しない
+        # =========================
+        if 'macd_score_long' in df_5min.columns:
+            macd_long = df_5min['macd_score_long']
+            blocked_long = (macd_long >= 0.5) & (macd_long < 0.8)
+            df_5min.loc[blocked_long, 'sell_signal'] = False
+
+        # =========================
         # Long改善フィルター v1
         # 前提:
         #   buy_signal  = Short
