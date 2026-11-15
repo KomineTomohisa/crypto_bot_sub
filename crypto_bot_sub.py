@@ -27,6 +27,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import socket
+from urllib.parse import urlencode
+from live_execution import LiveExecutionMixin
+from trading_execution import ExchangeGateway, ExecutionError, fallback_exit
 from db import (
     begin, text,
     insert_order, upsert_fill,                 # ★ upsert_fill を追加
@@ -103,10 +106,11 @@ def _make_session():
     retry = Retry(
         total=5,
         read=5,
-        connect=5,
+        connect=0,
+        other=0,
         backoff_factor=0.8,
         status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=frozenset(['GET', 'POST']),
+        allowed_methods=frozenset(['GET']),
         raise_on_status=False,
     )
     s.mount("https://", HTTPAdapter(max_retries=retry))
@@ -793,13 +797,13 @@ class GMOCoinAPI:
         # GETクエリをURLへ付与（署名には含めない：pathのみでOK）
         url = base_url
         if method == "GET" and params:
-            q = "&".join(f"{k}={v}" for k, v in params.items())
+            q = urlencode(params)
             url = f"{base_url}?{q}"
 
         body_str = json.dumps(data, separators=(',', ':')) if data else ""
 
         # 最大3回リトライ（HTTP_SESSION側にもRetryはあるが、ここではtimestamp再生成のため明示）
-        for attempt in range(3):
+        for attempt in range(3 if method == "GET" else 1):
             ts = str(int(time.time() * 1000))  # ← 毎回作り直す（Timestamp too late対策）
             headers = {
                 "API-KEY": self.api_key,
@@ -815,7 +819,7 @@ class GMOCoinAPI:
                     r = HTTP_SESSION.get(url, headers=headers, timeout=timeout)
                 else:
                     # 注意: 元のコードは data=body_str なので合わせています
-                    r = HTTP_SESSION.post(url, headers=headers, data=body_str, timeout=timeout)
+                    r = HTTP_SESSION.post(url, headers=headers, data=body_str, timeout=timeout, allow_redirects=False)
 
                 r.raise_for_status()
                 return r.json()
@@ -854,6 +858,14 @@ class GMOCoinAPI:
 
         # ここには基本来ない
         return {"status": -1, "messages": [{"message_string": "unknown error"}]}
+
+    def _public_request(self, path, params=None):
+        response = HTTP_SESSION.get('https://api.coin.z.com/public' + path, params=params, timeout=8)
+        try:
+            response.raise_for_status()
+            return response.json()
+        finally:
+            response.close()
 
     def get_margin_positions(self, symbol):
         """信用取引のポジション情報を取得
@@ -920,7 +932,7 @@ class GMOCoinAPI:
         
         return self._request("POST", path, data=data)
 
-class CryptoTradingBot:
+class CryptoTradingBot(LiveExecutionMixin):
     def _is_live_mode(self) -> bool:
         """
         ランタイム状態から LIVE かどうかを堅牢に判定する。
@@ -1686,6 +1698,12 @@ class CryptoTradingBot:
         Returns:
         float: 総資産額（JPY）
         """
+        if self.exchange_settings_gmo.get("live_trade", False):
+            try:
+                return float(ExchangeGateway(self.gmo_api).margin()['actualProfitLoss'])
+            except Exception as exc:
+                self.logger.error("Equity unavailable (%s)", type(exc).__name__)
+                return 0.0
         try:
             # paper(=sim) モードでは API を使わず初期残高でフォールバック
             if not self.exchange_settings_gmo.get("live_trade", False):
@@ -2570,6 +2588,9 @@ class CryptoTradingBot:
                 self.short_profit_lock_armed[symbol] = bool(
                     data.get("short_profit_lock_armed", False)
                 )
+                if not hasattr(self, '_saved_short_lock_position_ids'):
+                    self._saved_short_lock_position_ids = {}
+                self._saved_short_lock_position_ids[symbol] = str(data.get('position_id'))
         except Exception as e:
             self.logger.warning(f"Short利益保護状態の復元に失敗: {e}")
 
@@ -2847,6 +2868,12 @@ class CryptoTradingBot:
         
     def verify_positions(self):
         """GMOコインの信用取引建玉を使用してポジションを検証する"""
+        if self.exchange_settings_gmo.get("live_trade", False):
+            self._execution()  # Fail before orders if the additive DB migration is absent.
+            self._restore_short_profit_lock_state("real")
+            self._recover_live_orders()
+            self._sync_live_positions()
+            return
         # SIM（paper）では取引所照合はしないが、DBのオープンポジションを反映して JSON を更新する
         if not self.exchange_settings_gmo.get("live_trade", False):
             self.logger.info("Paper mode: positions_* をロードし、DBのオープンポジションで上書きします")
@@ -3269,6 +3296,12 @@ class CryptoTradingBot:
         Returns:
         bool: 十分な資金がある場合はTrue
         """
+        if self.exchange_settings_gmo.get("live_trade", False):
+            try:
+                return self._live_funds_check(symbol, order_type, size)
+            except Exception as exc:
+                self.logger.error("Margin check failed (%s)", type(exc).__name__)
+                return False
         try:
             # 通貨ペアの分解
             base_coin, quote_coin = symbol.split('_')
@@ -3299,7 +3332,7 @@ class CryptoTradingBot:
                     
             elif order_type == 'sell':
                 # 売り注文の場合、base_coin（BTC,ETHなど）が必要
-                required_amount = size * 1.005  # 手数料を考慮
+                required_amount = price * size * 1.005  # JPY元本で売買を同じ単位で確認
                 
                 # バックテスト時は指定された残高を使用
                 if balance is not None:
@@ -3320,6 +3353,8 @@ class CryptoTradingBot:
         
     def place_order(self, symbol, order_type, size, margin=True):
         """GMOコインでの信用取引注文を実行する（paper時はAPIを呼ばず即約定＆DB upsert）。"""
+        if self.exchange_settings_gmo.get("live_trade", False):
+            raise ExecutionError("Live orders must use the persisted execution service")
         import uuid, time
 
         # ---- 共通：サイズ正規化（GMOの最小単位に揃える） -----------------------
@@ -3414,269 +3449,7 @@ class CryptoTradingBot:
             except Exception as e:
                 self.logger.error(f"[SIM ORDER] 例外: {e}", exc_info=True)
                 return {"success": False, "error": str(e), "executed_size": 0}  
-        try:
-            # GMO API が利用可能か確認
-            if not self.gmo_api:
-                self.logger.error("GMOコインAPIが初期化されていません")
-                return {'success': False, 'error': "GMO API not initialized", 'executed_size': 0}
-            
-            # 通貨ペアをGMO形式に変換
-            gmo_symbol = gmo_symbol
-            
-            # 最小注文量の調整（正規化値を使用）
-            size = norm_size            
-            
-            # 注文前の既存ポジションを記録（後で新規ポジションを判別するため）
-            existing_positions = set()
-            try:
-                positions_response = self._get_margin_positions_safe(gmo_symbol)
-                if positions_response.get("status") == 0:
-                    positions_data = positions_response.get("data", {})
-                    positions = positions_data.get("list", []) if isinstance(positions_data, dict) else positions_data
-                    
-                    for pos in positions:
-                        if pos.get("symbol") == gmo_symbol:
-                            pid = pos.get("positionId")
-                            if pid is not None:
-                                existing_positions.add(pid)
-
-            except Exception as e:
-                self.logger.warning(f"既存ポジション取得エラー: {e}")
-
-            # --- 銘柄別サイズフォーマッタ（小数桁の制約に合わせる） ---
-            from decimal import Decimal, ROUND_DOWN
-            def _format_size(sym: str, sz: float) -> str:
-                sym_l = sym.lower()
-                # 受け付け小数桁のマップ（必要に応じて拡張）
-                precision = {
-                    "xrp_jpy": 0, "doge_jpy": 0, "ltc_jpy": 0, "ada_jpy": 0,
-                    "eth_jpy": 2, "sol_jpy": 1, "bcc_jpy": 1, "bch_jpy": 1,
-                }.get(sym_l, 3)
-                q = Decimal(1).scaleb(-precision)
-                val = Decimal(str(sz)).quantize(q, rounding=ROUND_DOWN)
-                s = format(val, "f")
-                if precision == 0 and "." in s:
-                    s = s.split(".")[0]
-                return s
-
-            size_str = _format_size(symbol, size)
-
-            # 新規注文のみを扱う（ログも送信値もフォーマット後を表示）
-            self.logger.info(f"GMOコイン信用取引新規注文: {gmo_symbol} {side} {size_str}")
-
-            # 新規注文データ（サイズは必ず文字列）
-            order_data = {
-                "symbol": gmo_symbol,
-                "side": side,
-                "executionType": "MARKET",
-                "size": size_str,
-                "settlePosition": "OPEN"  # 常に新規
-            }
-            
-            # 新規注文の場合はmarginTradeTypeを指定
-            order_data["marginTradeType"] = "SHORT" if side == "SELL" else "LONG"
-            
-            response = self.gmo_api._request("POST", "/v1/order", data=order_data)
-            
-            if response.get("status") == 0:
-                # GMOの戻りが {"data": "...orderId..."} or {"data": {"orderId": "..."}}
-                data = response.get("data")
-                if isinstance(data, dict):
-                    order_id = str(data.get("orderId") or data.get("order_id") or data.get("id") or "")
-                else:
-                    order_id = str(data)
-                self.logger.info(f"注文成功: {gmo_symbol} {side} {size}, 注文ID: {order_id}")
-
-                # --- 直後のポジション同期で「建玉の建値」と「実約定サイズ」を取得する ---
-                position_id = None
-                avg_entry = 0.0              # 取得できたら更新
-                executed_size_pos = 0.0      # 建玉のサイズ（実約定合計）
-                max_retries = 5
-                retry_interval = 2  # 秒
-
-                for retry in range(max_retries):
-                    time.sleep(retry_interval)
-                    try:
-                        positions_response = self._get_margin_positions_safe(gmo_symbol)
-                        if positions_response.get("status") == 0:
-                            positions_data = positions_response.get("data", {})
-                            positions = positions_data.get("list", []) if isinstance(positions_data, dict) else positions_data
-
-                            # 既存ポジション集合にない「今回新規のポジション」を探索
-                            for pos in positions:
-                                if (
-                                    pos.get("symbol") == gmo_symbol and
-                                    pos.get("side") == side and
-                                    pos.get("positionId") not in existing_positions
-                                ):
-                                    position_id = pos.get("positionId")
-                                    # 建値（平均建玉価格）
-                                    try:
-                                        avg_entry = float(pos.get("price") or 0)
-                                    except Exception:
-                                        avg_entry = 0.0
-                                    # 建玉サイズ（実約定合計サイズ）
-                                    try:
-                                        executed_size_pos = float(pos.get("size") or 0)
-                                    except Exception:
-                                        executed_size_pos = 0.0
-
-                                    self.logger.info(
-                                        f"新規ポジション取得: id={position_id}, price={avg_entry}, size={executed_size_pos} "
-                                        f"(試行 {retry + 1}/{max_retries})"
-                                    )
-                                    break
-
-                            if position_id:
-                                # 見つかったら即ループ終了
-                                break
-
-                    except Exception as e:
-                        self.logger.warning(f"ポジション同期試行{retry + 1}失敗: {e}")
-
-                    if retry < max_retries - 1:
-                        self.logger.info(f"ポジション未同期。再試行... ({retry + 2}/{max_retries})")
-
-                # --- 取得できた情報を保存（建値・サイズ・ポジションID） ---
-                if position_id:
-                    self.position_ids[symbol] = position_id
-                    self.logger.info(f"ポジションID保存成功: {symbol} = {position_id}")
-                else:
-                    self.logger.warning(f"ポジションIDを取得できませんでした: {symbol}（後で verify_positions で同期）")
-
-                # --- DB: ポジションを upsert ---
-                if position_id and executed_size_pos > 0:
-                    # source は NOT NULL 想定：live は "real"
-                    default_source = "real"
-                    # --- UUID検証（不正ならNoneに落とす or 必要ならuuid4()を発行） ---
-                    def _to_uuid_or_none(v):
-                        if not v:
-                            return None
-                        try:
-                            import uuid
-                            return str(uuid.UUID(str(v)))
-                        except Exception:
-                            return None
-
-                    strategy_uuid = _to_uuid_or_none(getattr(self, "strategy_id", None))
-                    # 必須なら: strategy_uuid = strategy_uuid or str(uuid.uuid4())
-
-                    # --- DBUPSERT：握りつぶさずFail-Fastに変更（原因追跡のため） ---
-                    self.logger.info(
-                        "[DBHOOK] upsert_position: pos_id=%s size=%s avg=%s strat=%s src=%s user=%s",
-                        position_id, executed_size_pos, avg_entry, strategy_uuid,
-                        default_source, getattr(self, "user_id", None)
-                    )
-                    upsert_position(
-                        position_id=str(position_id),               # DB: varchar(80)
-                        symbol=symbol,                              # DB: varchar(32)
-                        side=("long" if side == "BUY" else "short"),# DB: varchar(8) 想定
-                        size=float(executed_size_pos),              # DB: numeric(24,8)
-                        avg_entry_price=float(avg_entry) if avg_entry else 0.0,
-                        opened_at=utcnow(),                         # DB: timestamptz
-                        updated_at=utcnow(),                        # DB: timestamptz
-                        raw={"order_response": response},
-                        strategy_id=strategy_uuid,
-                        source=default_source,                      # ← real を明示
-                        user_id=getattr(self, "user_id", None),     # DB: int8
-                    )
-
-                # 建玉から建値が取れたら entry_prices を更新
-                if avg_entry > 0:
-                    self.entry_prices[symbol] = avg_entry
-                    self.logger.info(f"[ENTRY] 建玉の建値で entry_price 更新: {symbol} = {avg_entry}")
-
-                # 建玉から実約定サイズが取れたら entry_sizes を上書き（部分約定対応）
-                if executed_size_pos > 0:
-                    self.entry_sizes[symbol] = executed_size_pos
-                    self.logger.info(f"[ENTRY] 建玉サイズで entry_size 更新: {symbol} = {executed_size_pos}")
-
-                # --- フォールバック: 建玉から price が取れない場合は注文照会→約定履歴から平均約定価格を試みる ---
-                if avg_entry <= 0:
-                    try:
-                        # 1) 注文照会で averagePrice 相当が取れればそれを使う
-                        od = self.gmo_api._request("GET", "/v1/orders", params={"orderId": str(order_id)})
-                        if od.get("status") == 0:
-                            lst = od.get("data", {}).get("list", [])
-                            if lst:
-                                od0 = lst[0]
-                                ap = float(od0.get("averagePrice") or 0)
-                                ex_sz = float(od0.get("executedSize") or 0)
-                                if ap > 0:
-                                    avg_entry = ap
-                                    self.entry_prices[symbol] = avg_entry
-                                    self.logger.info(f"[ENTRY] 注文照会の平均約定価格で更新: {symbol} = {avg_entry}")
-                                if ex_sz > 0 and (self.entry_sizes.get(symbol, 0) <= 0):
-                                    self.entry_sizes[symbol] = ex_sz
-                                    self.logger.info(f"[ENTRY] 注文照会の実行サイズで更新: {symbol} = {ex_sz}")
-
-                        # 2) まだ price が無ければ約定履歴から VWAP を算出
-                        if avg_entry <= 0:
-                            hist = self.gmo_api._request(
-                                "GET", "/v1/closedOrders",
-                                params={"symbol": gmo_symbol, "date": now_jst().strftime("%Y%m%d")}
-                            )
-                            if hist.get("status") == 0:
-                                for odr in hist.get("data", {}).get("list", []):
-                                    if str(odr.get("orderId")) == str(order_id):
-                                        # fills があれば VWAP（Σ p*s / Σ s）
-                                        fills = odr.get("fills") or []
-                                        num = 0.0
-                                        den = 0.0
-                                        for f in fills:
-                                            try:
-                                                p = float(f.get("price") or 0)
-                                                s = float(f.get("size") or 0)
-                                                num += p * s
-                                                den += s
-                                            except Exception:
-                                                continue
-                                        vwap = (num / den) if den > 0 else float(odr.get("averagePrice") or 0)
-                                        if vwap > 0:
-                                            avg_entry = vwap
-                                            self.entry_prices[symbol] = avg_entry
-                                            self.logger.info(f"[ENTRY] 約定履歴のVWAPで entry_price 更新: {symbol} = {avg_entry}")
-
-                                        # 実行サイズのフォールバック更新
-                                        try:
-                                            ex_sz = float(odr.get("executedSize") or 0)
-                                            if ex_sz > 0 and (self.entry_sizes.get(symbol, 0) <= 0):
-                                                self.entry_sizes[symbol] = ex_sz
-                                                self.logger.info(f"[ENTRY] 約定履歴の実行サイズで更新: {symbol} = {ex_sz}")
-                                        except Exception:
-                                            pass
-                                        break
-                    except Exception as e:
-                        self.logger.warning(f"[ENTRY] 平均約定価格のフォールバック取得に失敗: {e}")
-
-                # ここまでで avg_entry が取れなかった場合、旧ロジックの last を無理に入れない（ズレの原因）
-                if avg_entry <= 0:
-                    self.logger.warning("[ENTRY] 平均約定価格を取得できませんでした。entry_prices は未更新のままです。")
-
-                # 戻り値の executed_size は「建玉サイズ」 > 「注文サイズ」の優先で返す
-                executed_size_return = executed_size_pos if executed_size_pos > 0 else size
-
-                return {
-                    'success': True,
-                    'order_id': order_id,
-                    'executed_size': executed_size_return,
-                    'position_id': position_id
-                }
-
-            else:
-                # エラーハンドリング
-                error_messages = response.get("messages", [])
-                error_msg = error_messages[0].get("message_string", "Unknown error") if error_messages else "Unknown error"
-                error_code = error_messages[0].get("message_code", "Unknown") if error_messages else "Unknown"
-                
-                self.logger.error(f"GMO注文エラー: {error_msg} (コード: {error_code})")
-                self.logger.error(f"GMO注文レスポンス全体: {response}")
-                
-                return {'success': False, 'error': f"{error_msg} (Code: {error_code})", 'executed_size': 0}
-                    
-        except Exception as e:
-            self.logger.error(f"注文処理中の例外エラー: {str(e)}", exc_info=True)
-            return {'success': False, 'error': str(e), 'executed_size': 0}
+        raise ExecutionError('Live orders must use the persisted execution service')
 
     def verify_position_id(self, symbol):
         """特定の通貨ペアのポジションIDを検証・再取得する"""
@@ -3779,6 +3552,16 @@ class CryptoTradingBot:
         - SIM注文（order_idが 'SIM-' 始まり）は即時に内部状態から約定量を返す
         - REAL注文は /v1/orders → （必要なら）/v1/closedOrders → （最後に）建玉照会の順で確認
         """
+        if self.exchange_settings_gmo.get("live_trade", False):
+            # No position-based approximation, including for canceled close orders.
+            try:
+                data = ExchangeGateway(self.gmo_api).request("/v1/executions", {"orderId": str(order_id)})
+                rows = data.get("list", [])
+                if any(str(r.get("orderId")) != str(order_id) or r.get("symbol") != self.symbol_mapping[symbol] for r in rows):
+                    return 0.0
+                return float(sum(float(r["size"]) for r in {str(r["executionId"]): r for r in rows}.values()))
+            except Exception:
+                return 0.0
         try:
             # ---- 1) SIM（paper）なら即返す ----------------------------------
             if isinstance(order_id, str) and order_id.startswith("SIM-"):
@@ -3900,6 +3683,14 @@ class CryptoTradingBot:
         signal_raw: dict | None = None,
     ):
         """確実に注文を実行し、ポジションが実際に保有されていることを確認する"""
+
+        if self.exchange_settings_gmo.get("live_trade", False):
+            return self._execute_live_entry(
+                symbol, order_type, size, signal_raw=signal_raw, timeframe=timeframe,
+                strength_score=strength_score, rsi=rsi, adx=adx, atr=atr,
+                di_plus=di_plus, di_minus=di_minus, ema_fast=ema_fast, ema_slow=ema_slow,
+                strategy_id=strategy_id, version=version,
+            )
 
         # --- 追加: エントリー/決済フラグと signal_id 初期化 --------------------
         signal_id = ""
@@ -5450,7 +5241,8 @@ class CryptoTradingBot:
                 df_5min['ema_deviation'] = abs(((df_5min['close'] / df_5min['EMA_long']) - 1) * 100)
                 
                 # 有効なEMA値を持つレコードのみ処理（ゼロ除算防止）
-                valid_records = df_5min[df_5min['EMA_long'] > 0].index
+                valid_records = df_5min['EMA_long'].notna() & np.isfinite(df_5min['EMA_long']) & (df_5min['EMA_long'] > 0)
+                valid_records &= df_5min['close'].notna() & np.isfinite(df_5min['close']) & (df_5min['close'] > 0)
                 
                 # シグナルの元の状態を保存（ログ出力用）
                 original_buy_signals = df_5min['buy_signal'].copy()
@@ -5460,6 +5252,7 @@ class CryptoTradingBot:
                 mask = df_5min['ema_deviation'] > max_deviation
                 df_5min.loc[mask & valid_records, 'buy_signal'] = False
                 df_5min.loc[mask & valid_records, 'sell_signal'] = False
+                df_5min.loc[~valid_records, ['buy_signal', 'sell_signal']] = False
                 
                 # 変更されたシグナルをカウント（ログ出力用）
                 disabled_buy = ((original_buy_signals == True) & (df_5min['buy_signal'] == False)).sum()
@@ -5485,10 +5278,8 @@ class CryptoTradingBot:
             self.logger.error(f"{symbol}のシグナル生成中にエラーが発生: {e}", exc_info=True)
             
             # エラー発生時のフォールバック処理
-            if 'buy_signal' not in df_5min.columns:
-                df_5min['buy_signal'] = False
-            if 'sell_signal' not in df_5min.columns:
-                df_5min['sell_signal'] = False
+            df_5min['buy_signal'] = False
+            df_5min['sell_signal'] = False
                 
             return df_5min
     
@@ -5507,6 +5298,11 @@ class CryptoTradingBot:
         """
         # 基本注文額（通常のTRADE_SIZE）
         base_order_amount = self.TRADE_SIZE
+        if self.exchange_settings_gmo.get("live_trade", False):
+            from trading_execution import decimal
+            price = decimal(entry_price, positive=True)
+            quantity, _ = self._live_order_size(symbol, decimal(base_order_amount, positive=True) / price)
+            return float(quantity), float(quantity * price)
         
         # 注文サイズを計算（通貨単位）
         order_size = base_order_amount / entry_price
@@ -6645,6 +6441,12 @@ class CryptoTradingBot:
                     # 定期的なポジション検証
                     self.logger.info("定期ポジション検証を実行します")
                     self.verify_positions()
+
+                    if self.exchange_settings_gmo.get("live_trade", False):
+                        try:
+                            self._refresh_live_stats(stats)
+                        except Exception as exc:
+                            self.logger.error("Trade statistics not refreshed (%s)", type(exc).__name__)
                     
                     # バックアップと増資チェック（1日1回）
                     if jst_now.hour == 0 and jst_now.minute < 5:  # 深夜0時台の最初のサイクル
@@ -7233,6 +7035,14 @@ class CryptoTradingBot:
                 return nd
 
         # テクニカル指標値の取得
+        if self.exchange_settings_gmo.get("live_trade", False):
+            self._entry_decision_snapshot = signal_data.copy()
+            self.entry_scores[symbol] = {
+                key: (float(value) if value is not None and np.isfinite(float(value)) else None)
+                for key, value in signal_data.items()
+                if 'score' in key or key == 'ema_deviation'
+            }
+            self.entry_scores[symbol].update(entry_atr=float(signal_data['ATR']), entry_adx=float(signal_data['ADX']))
         entry_rsi = signal_data.get('RSI', None)
         entry_cci = signal_data.get('CCI', None)
         entry_atr = signal_data.get('ATR', None)
@@ -7298,6 +7108,7 @@ class CryptoTradingBot:
             signal_data=signal_data,
             price=current_price
         )
+        signal_raw.update(decision_bar=str(signal_data['timestamp']), decision_price=str(signal_data['close']))
 
         # バージョン
         version = self._current_strategy_version()  # 上で例示
@@ -7322,13 +7133,16 @@ class CryptoTradingBot:
 
         if order_result['success']:
             executed_size = order_result.get('executed_size', 0)
+            if self.exchange_settings_gmo.get("live_trade", False):
+                current_price = float(order_result['execution_price'])
+                self.position_ids[symbol] = order_result['position_ids'][0]
             # 実際に約定したサイズで金額を再計算
             final_order_amount = executed_size * current_price
             
             # ポジション情報を更新
             self.positions[symbol] = position_type
             self.entry_prices[symbol] = current_price
-            self.entry_times[symbol] = now_jst()
+            self.entry_times[symbol] = order_result.get('executed_at') or now_jst()
             self.entry_sizes[symbol] = executed_size
             self.short_profit_lock_armed[symbol] = False
 
@@ -7746,6 +7560,13 @@ class CryptoTradingBot:
         
         # イグジット条件を満たしている場合
         if exit_condition:
+            if self.exchange_settings_gmo.get("live_trade", False):
+                try:
+                    self._close_live_position(symbol, exit_reason, stats, trade_logs)
+                except Exception as exc:
+                    self.logger.error("%s: close not confirmed (%s)", symbol, type(exc).__name__)
+                    self.send_notification(f"{symbol} 決済未確認", "自動決済の結果を確定できません。建玉と注文状態を確認してください。", "error")
+                return
             # 決済注文の実行
             self.logger.info(f"{symbol}の{position}ポジションをイグジットします: {exit_reason}")
             
@@ -8958,7 +8779,7 @@ class CryptoTradingBot:
 
             risk_reward_ratio = tp_pct / sl_pct if sl_pct != 0 else float('inf')
 
-            return {
+            levels = {
                 'take_profit_price': take_profit_price,
                 'stop_loss_price': stop_loss_price,
                 'take_profit_ratio': take_profit_ratio,
@@ -8966,29 +8787,22 @@ class CryptoTradingBot:
                 'atr_value': atr,
                 'risk_reward_ratio': risk_reward_ratio,
             }
+            if not (np.isfinite(take_profit_price) and np.isfinite(stop_loss_price)):
+                raise ValueError('Non-finite exit levels')
+            if position_type == 'long' and not (0 < stop_loss_price < entry_price < take_profit_price):
+                raise ValueError('Invalid long exit levels')
+            if position_type == 'short' and not (0 < take_profit_price < entry_price < stop_loss_price):
+                raise ValueError('Invalid short exit levels')
+            if not hasattr(self, '_last_valid_exit_levels'):
+                self._last_valid_exit_levels = {}
+            self._last_valid_exit_levels[(symbol, position_type, entry_price)] = dict(levels)
+            return levels
 
         except Exception as e:
             self.logger.error(f"{symbol}のATR利確損切計算中にエラー: {str(e)}", exc_info=True)
             default_settings = self._get_dynamic_profit_loss_settings(symbol, df_5min)
-            if position_type == 'long':
-                tp_ratio = default_settings['long_stop_loss']
-                sl_ratio = default_settings['long_profit_take']
-            else:
-                tp_ratio = default_settings['short_stop_loss']
-                sl_ratio = default_settings['short_profit_take']
-
-            tp_pct = abs(tp_ratio - 1.0)
-            sl_pct = abs(sl_ratio - 1.0)
-            rr = tp_pct / sl_pct if sl_pct != 0 else float('inf')
-
-            return {
-                'take_profit_price': entry_price * tp_ratio,
-                'stop_loss_price': entry_price * sl_ratio,
-                'take_profit_ratio': tp_ratio,
-                'stop_loss_ratio': sl_ratio,
-                'atr_value': 0,
-                'risk_reward_ratio': rr,
-            }
+            previous = getattr(self, '_last_valid_exit_levels', {}).get((symbol, position_type, entry_price))
+            return dict(previous) if previous is not None else fallback_exit(default_settings, position_type, entry_price)
 
 # ================================
 # メイン実行部分（統一版・重複禁止）
