@@ -1813,6 +1813,12 @@ class CryptoTradingBot:
         self.entry_times = {symbol: None for symbol in self.symbols}
         self.entry_sizes = {symbol: 0 for symbol in self.symbols}  # 注文サイズ保存用
         self.entry_scores = {symbol: {} for symbol in self.symbols}
+
+        # Short利益保護 V1
+        # +0.75%の含み益に一度でも到達したら、以降は最低+0.25%を確保する
+        self.short_profit_lock_armed = {symbol: False for symbol in self.symbols}
+        self.SHORT_PROFIT_LOCK_TRIGGER_PCT = 0.75
+        self.SHORT_PROFIT_LOCK_LEVEL_PCT = 0.25
         
         # 運用資金増加の管理用変数
         self.monthly_increase = 500  # 月間増資額
@@ -1826,9 +1832,9 @@ class CryptoTradingBot:
         
         # 取引サイズ設定
         if self.test_mode:
-            self.TRADE_SIZE = 20000  # テストモード
+            self.TRADE_SIZE = 40000  # テストモード
         else:
-            self.TRADE_SIZE = 20000  # 通常取引額
+            self.TRADE_SIZE = 40000  # 通常取引額
             
         # API呼び出し制限管理
         self.last_api_call = time.time() - 1
@@ -2527,6 +2533,7 @@ class CryptoTradingBot:
                 "entry_time": self.entry_times[symbol].isoformat() if self.entry_times.get(symbol) else None,
                 "entry_size": self.entry_sizes.get(symbol, 0.0),
                 "position_id": self.position_ids.get(symbol),
+                "short_profit_lock_armed": self.short_profit_lock_armed.get(symbol, False),
             }
 
         # ディレクトリ確保
@@ -2546,6 +2553,26 @@ class CryptoTradingBot:
                 pass
             self.logger.error("ポジション情報の保存エラー（%s）: %s", positions_file, e)
 
+    def _restore_short_profit_lock_state(self, src: str = "real") -> None:
+        """positionsファイルからShort利益保護フラグだけを復元する。"""
+        try:
+            filename = "positions.json" if src == "real" else f"positions_{src}.json"
+            positions_file = os.path.join(self.base_dir, filename)
+            if not os.path.exists(positions_file):
+                return
+
+            with open(positions_file, "r", encoding="utf-8") as f:
+                positions_data = json.load(f)
+
+            for symbol, data in positions_data.items():
+                if symbol not in self.symbols:
+                    continue
+                self.short_profit_lock_armed[symbol] = bool(
+                    data.get("short_profit_lock_armed", False)
+                )
+        except Exception as e:
+            self.logger.warning(f"Short利益保護状態の復元に失敗: {e}")
+
     def load_positions(self):
         """保存されたポジション情報を読み込む（ポジションID含む・モード別ファイル対応）"""
         import os, json
@@ -2563,6 +2590,7 @@ class CryptoTradingBot:
             self.entry_sizes.setdefault(sym, 0.0)
             self.position_ids.setdefault(sym, None)
             self.entry_times.setdefault(sym, None)
+            self.short_profit_lock_armed.setdefault(sym, False)
 
         # 1) モード別ファイルがあればそのまま読む
         if os.path.exists(positions_file):
@@ -2577,6 +2605,9 @@ class CryptoTradingBot:
                     self.entry_prices[symbol] = data.get("entry_price")
                     self.entry_sizes[symbol] = data.get("entry_size", 0.0)
                     self.position_ids[symbol] = data.get("position_id")
+                    self.short_profit_lock_armed[symbol] = bool(
+                        data.get("short_profit_lock_armed", False)
+                    )
                     ts = data.get("entry_time")
                     if ts:
                         t = datetime.fromisoformat(ts)
@@ -2610,6 +2641,9 @@ class CryptoTradingBot:
                         self.entry_prices[symbol] = data.get("entry_price")
                         self.entry_sizes[symbol] = data.get("entry_size", 0.0)
                         self.position_ids[symbol] = data.get("position_id")
+                        self.short_profit_lock_armed[symbol] = bool(
+                            data.get("short_profit_lock_armed", False)
+                        )
                         ts = data.get("entry_time")
                         if ts:
                             t = datetime.fromisoformat(ts)
@@ -2829,11 +2863,13 @@ class CryptoTradingBot:
                     lst = resp.get("data", {}).get("list", [])
                     # いったん全通貨をクリア
                     prev_entry_times = dict(self.entry_times)
+                    prev_profit_locks = dict(self.short_profit_lock_armed)
                     for sym in self.symbols:
                         self.positions[sym] = None
                         self.entry_prices[sym] = 0.0
                         self.entry_sizes[sym] = 0.0
                         self.position_ids[sym] = None
+                        self.short_profit_lock_armed[sym] = False
                         # entry_times はここでクリアしない（openedAt で上書き or 既存温存）
 
                     # GMO表記 → bot表記へ逆引きして反映（逆引きマップを用意）
@@ -2858,6 +2894,9 @@ class CryptoTradingBot:
 
                         side = "long" if p.get("side") == "BUY" else "short"
                         self.positions[bot_symbol]     = side
+                        self.short_profit_lock_armed[bot_symbol] = (
+                            prev_profit_locks.get(bot_symbol, False) if side == "short" else False
+                        )
                         self.entry_prices[bot_symbol]  = float(p.get("price") or 0.0)
                         self.entry_sizes[bot_symbol]   = float(p.get("size") or 0.0)
                         self.position_ids[bot_symbol]  = p.get("positionId")
@@ -2881,6 +2920,9 @@ class CryptoTradingBot:
             except Exception as e:
                 self.logger.warning(f"Paper mode: DB→JSON反映に失敗: {e}")
             return False
+
+        # LIVEではAPI照合前に、前回保存した利益保護フラグだけ復元する
+        self._restore_short_profit_lock_state("real")
 
         # ローカルポジション情報のバックアップ
         local_positions_backup = {
@@ -2923,6 +2965,7 @@ class CryptoTradingBot:
                         self.entry_prices[symbol] = 0
                         self.entry_times[symbol] = None
                         self.entry_sizes[symbol] = 0
+                        self.short_profit_lock_armed[symbol] = False
                         inconsistencies += 1
                         resolved += 1
                     else:
@@ -2931,6 +2974,7 @@ class CryptoTradingBot:
                                 f"{symbol}: ポジションタイプの不一致。記録: {self.positions[symbol]}, 実際: {actual_side}"
                             )
                             self.positions[symbol] = actual_side
+                            self.short_profit_lock_armed[symbol] = False
                             inconsistencies += 1
                             resolved += 1
 
@@ -2981,6 +3025,9 @@ class CryptoTradingBot:
                     self.entry_prices[symbol] = avg_price
                     self.entry_times[symbol] = now_jst() - timedelta(hours=1)  # 1時間前からの保有と仮定
                     self.entry_sizes[symbol] = actual_size
+                    # 起動前から保有していたShortなら保存済みarmed状態を維持する
+                    if actual_side != "short":
+                        self.short_profit_lock_armed[symbol] = False
 
                     inconsistencies += 1
                     resolved += 1
@@ -3673,6 +3720,7 @@ class CryptoTradingBot:
                     self.entry_prices[symbol] = 0
                     self.entry_times[symbol] = None
                     self.entry_sizes[symbol] = 0
+                    self.short_profit_lock_armed[symbol] = False
                     self.save_positions()
                     return True
                 
@@ -3969,6 +4017,7 @@ class CryptoTradingBot:
                                 self.entry_prices[symbol] = 0
                                 self.entry_times[symbol] = None
                                 self.entry_sizes[symbol] = 0
+                                self.short_profit_lock_armed[symbol] = False
 
                         # 約定確認直後：DB書き込みを一体トランザクションで確定
                         try:
@@ -3980,6 +4029,7 @@ class CryptoTradingBot:
                                 self.entry_prices[symbol] = float(exec_price or 0.0)
                                 self.entry_times[symbol] = now_jst()
                                 self.entry_sizes[symbol] = float(executed_size)
+                                self.short_profit_lock_armed[symbol] = False
 
                             self.logger.info(
                                 "[DBTX] committing order+fill(+signal) atomically: order_id=%s exec_size=%s price=%s symbol=%s",
@@ -4100,6 +4150,7 @@ class CryptoTradingBot:
                                 self.entry_prices[symbol] = float(exec_price or 0.0)
                                 self.entry_times[symbol] = now_jst()
                                 self.entry_sizes[symbol] = float(abs(net_size))
+                                self.short_profit_lock_armed[symbol] = False
                             else:
                                 # フォールバック成立 = 決済成功とみなす
                                 _ot = str(order_type).lower()
@@ -4108,6 +4159,7 @@ class CryptoTradingBot:
                                     self.entry_prices[symbol] = 0
                                     self.entry_times[symbol] = None
                                     self.entry_sizes[symbol] = 0
+                                    self.short_profit_lock_armed[symbol] = False
                         except Exception as e:
                             insert_error(
                                 "execute_order_with_confirmation/fallback_fill",
@@ -4990,6 +5042,59 @@ class CryptoTradingBot:
         df_5min['buy_signal'] = df_5min['buy_score_scaled'] >= buy_signal_threshold
         df_5min['sell_signal'] = df_5min['sell_score_scaled'] >= sell_signal_threshold
 
+        # ロング: 既存の CCI / RSI フィルターを維持
+        if {'RSI', 'CCI'}.issubset(df_5min.columns):
+            rsi = df_5min['RSI'].fillna(50)
+            cci = df_5min['CCI'].fillna(0)
+
+            sell_filter = (cci >= 0) & (rsi >= 60)
+            df_5min.loc[~sell_filter, 'sell_signal'] = False
+            
+        if symbol in ['eth_jpy', 'bcc_jpy', 'xrp_jpy', 'ltc_jpy']:
+
+            # 1. ADX過熱時のLong禁止
+            if 'ADX' in df_5min.columns:
+                adx = df_5min['ADX'].fillna(0)
+                df_5min.loc[adx >= 50, 'sell_signal'] = False
+
+            # 2. 過熱スコアが複数重なったLongを禁止
+            overheat_count = pd.Series(0, index=df_5min.index)
+
+            if 'bb_score_short' in df_5min.columns:
+                overheat_count += (df_5min['bb_score_short'].fillna(0) > 0.66).astype(int)
+
+            if 'rsi_score_short' in df_5min.columns:
+                overheat_count += (df_5min['rsi_score_short'].fillna(0) > 0.66).astype(int)
+
+            if 'cci_score_short' in df_5min.columns:
+                overheat_count += (df_5min['cci_score_short'].fillna(0) > 0.66).astype(int)
+
+            # 3指標のうち2つ以上が過熱している場合だけLong禁止
+            df_5min.loc[overheat_count >= 2, 'sell_signal'] = False
+
+        # ショート: ATR + ADX フィルターに変更
+        if {'ADX', 'atr_score_short'}.issubset(df_5min.columns):
+            adx = df_5min['ADX'].fillna(0)
+            atr_score_buy = df_5min['atr_score_short'].fillna(0)
+
+            buy_filter = (atr_score_buy >= 0.7) & (adx >= 20)
+            df_5min.loc[~buy_filter, 'buy_signal'] = False
+
+        # =========================
+        # Short改善フィルター v1
+        # 前提:
+        #   buy_signal  = Short
+        #   sell_signal = Long
+        # 目的:
+        #   MACDがショート方向を支持していないShortを除外する
+        # =========================
+        if 'macd_score_short' in df_5min.columns:
+            macd_short = df_5min['macd_score_short'].fillna(0)
+
+            # まずは安全運用なら 0.4
+            # 分析結果を強く反映するなら 0.5
+            df_5min.loc[macd_short < 0.5, 'buy_signal'] = False
+
         if self.exchange_settings_gmo.get("live_trade", False) or getattr(self, "is_backtest", False):
             if symbol == 'bcc_jpy':
                 df_5min.loc[df_5min['adx_score_long'] < 0.00435, 'buy_signal'] = False
@@ -5162,6 +5267,35 @@ class CryptoTradingBot:
                 timeframe="15m",
                 version=getattr(self, "rules_version", None)  # 未定義なら None でOK
             )
+
+        # =========================
+        # Long改善フィルター: MACDロングスコアが0.5以上0.8未満のLongを除外
+        # sell_signal が Long に対応するため、buy_signal は変更しない
+        # =========================
+        if 'macd_score_long' in df_5min.columns:
+            macd_long = df_5min['macd_score_long']
+            blocked_long = (macd_long >= 0.5) & (macd_long < 0.8)
+            df_5min.loc[blocked_long, 'sell_signal'] = False
+
+        # =========================
+        # Long改善フィルター v1
+        # 前提:
+        #   buy_signal  = Short
+        #   sell_signal = Long
+        # 目的:
+        #   MACDが強すぎ、かつADXスコアも反応している
+        #   上昇後半の飛び乗りLongを除外する
+        # =========================
+        if {'macd_score_long', 'adx_score_long'}.issubset(df_5min.columns):
+            macd_long = df_5min['macd_score_long'].fillna(0)
+            adx_score_long = df_5min['adx_score_long'].fillna(0)
+
+            overheated_long = (
+                (macd_long >= 0.8) &
+                (adx_score_long >= 0.1)
+            )
+
+            df_5min.loc[overheated_long, 'sell_signal'] = False
 
         if 'EMA_long' in df_5min.columns and len(df_5min) > 1:
             prev_price = df_5min['close'].shift(1)
@@ -7196,6 +7330,7 @@ class CryptoTradingBot:
             self.entry_prices[symbol] = current_price
             self.entry_times[symbol] = now_jst()
             self.entry_sizes[symbol] = executed_size
+            self.short_profit_lock_armed[symbol] = False
 
             # GMOコインの場合、position_idを取得して保存
             time.sleep(3)  # 注文が約定するまで待機
@@ -7425,6 +7560,60 @@ class CryptoTradingBot:
             add = 15
         return ts + timedelta(minutes=add)
 
+    def _apply_short_profit_lock(
+        self,
+        symbol: str,
+        position: str,
+        entry_price: float,
+        current_price: float,
+        stop_loss_price: float,
+    ) -> float:
+        """
+        Short利益保護 V1。
+
+        Shortが一度でも +0.75% の含み益に到達したら、
+        以降は最低 +0.25% の利益を確保する位置までSLを引き下げる。
+        TPおよびLongには影響させない。
+        """
+        if position != "short":
+            return stop_loss_price
+        if entry_price <= 0 or current_price <= 0:
+            return stop_loss_price
+
+        self.short_profit_lock_armed.setdefault(symbol, False)
+
+        current_profit_pct = (entry_price - current_price) / entry_price * 100.0
+
+        if (
+            not self.short_profit_lock_armed[symbol]
+            and current_profit_pct >= self.SHORT_PROFIT_LOCK_TRIGGER_PCT
+        ):
+            self.short_profit_lock_armed[symbol] = True
+            self.logger.info(
+                f"{symbol}: Short利益保護ON "
+                f"(含み益={current_profit_pct:.2f}%, "
+                f"trigger={self.SHORT_PROFIT_LOCK_TRIGGER_PCT:.2f}%)"
+            )
+            # 再起動後もarmed状態を維持する
+            self.save_positions()
+
+        if self.short_profit_lock_armed[symbol]:
+            locked_sl_price = entry_price * (
+                1.0 - self.SHORT_PROFIT_LOCK_LEVEL_PCT / 100.0
+            )
+            original_sl = stop_loss_price
+            # ShortではSL価格を低くするほど利益を確保できる
+            stop_loss_price = min(stop_loss_price, locked_sl_price)
+
+            self.logger.debug(
+                f"{symbol}: Short利益保護SL "
+                f"original={original_sl:.8f}, "
+                f"locked={locked_sl_price:.8f}, "
+                f"applied={stop_loss_price:.8f}"
+            )
+
+        return stop_loss_price
+
     def _check_exit_conditions(self, symbol, stats, trade_logs, df_5min):
         """イグジット条件をチェックし、必要に応じて決済を実行する（backtest関数と整合性あり）
         
@@ -7461,9 +7650,19 @@ class CryptoTradingBot:
         exit_levels = self.calculate_dynamic_exit_levels(symbol, df_5min, position, entry_price)
         take_profit_price = float(exit_levels['take_profit_price'])
         stop_loss_price   = float(exit_levels['stop_loss_price'])
+        base_stop_loss_price = stop_loss_price
 
         # 現在値（通知や近接判定に使うだけ）
         current_price = self.get_current_price(symbol)
+
+        # Short利益保護: +0.75%到達後は最低+0.25%を確保
+        stop_loss_price = self._apply_short_profit_lock(
+            symbol=symbol,
+            position=position,
+            entry_price=float(entry_price),
+            current_price=float(current_price or 0.0),
+            stop_loss_price=float(stop_loss_price),
+        )
 
         # 最新5分バーの高値・安値で「一瞬タッチ」を検出
         last_bar = df_5min.iloc[-1] if len(df_5min) > 0 else None
@@ -7473,17 +7672,35 @@ class CryptoTradingBot:
         exit_condition = False
         exit_reason = ""
 
+        profit_lock_touch = False
+        base_sl_touch = False
+
         if position == 'long':
-            # 5分足の高値がTP以上、または安値がSL以下に触れていれば即EXIT
+            # Longは既存ロジックを変更しない
             tp_touch = (bar_high is not None and bar_high >= take_profit_price)
-            sl_touch = (bar_low  is not None and bar_low  <= stop_loss_price)
+            base_sl_touch = (bar_low is not None and bar_low <= base_stop_loss_price)
+            sl_touch = base_sl_touch
         else:  # short
-            tp_touch = (bar_low  is not None and bar_low  <= take_profit_price)   # 価格が下抜けたら利確
-            sl_touch = (bar_high is not None and bar_high >= stop_loss_price)     # 価格が上抜けたら損切
+            tp_touch = (bar_low is not None and bar_low <= take_profit_price)
+            # 既存SLは従来どおりバー高値で取りこぼしを検知する
+            base_sl_touch = (bar_high is not None and bar_high >= base_stop_loss_price)
+            # 利益保護SLは「armed前の同一バー高値」で誤決済しないよう現在価格で判定する
+            profit_lock_touch = bool(
+                self.short_profit_lock_armed.get(symbol, False)
+                and stop_loss_price < base_stop_loss_price
+                and current_price
+                and current_price >= stop_loss_price
+            )
+            sl_touch = base_sl_touch or profit_lock_touch
 
         if tp_touch or sl_touch:
             exit_condition = True
-            exit_reason = "利益確定" if tp_touch else "損切り"
+            if tp_touch:
+                exit_reason = "利益確定"
+            elif profit_lock_touch and not base_sl_touch:
+                exit_reason = "利益保護"
+            else:
+                exit_reason = "損切り"
         else:
             # バー更新タイミングの取りこぼし対策として、近接時だけ短時間の高頻度再確認（任意）
             # 例: 0.05% 以内に近づいたら最大3秒 100ms間隔で current_price を再チェック
@@ -7507,7 +7724,15 @@ class CryptoTradingBot:
                     else:
                         if cp <= take_profit_price or cp >= stop_loss_price:
                             exit_condition = True
-                            exit_reason = "利益確定" if cp <= take_profit_price else "損切り"
+                            if cp <= take_profit_price:
+                                exit_reason = "利益確定"
+                            elif (
+                                self.short_profit_lock_armed.get(symbol, False)
+                                and stop_loss_price < entry_price
+                            ):
+                                exit_reason = "利益保護"
+                            else:
+                                exit_reason = "損切り"
                     if not exit_condition:
                         time.sleep(0.1)
         
@@ -7931,6 +8156,7 @@ class CryptoTradingBot:
                 self.entry_sizes[symbol] = 0
                 self.position_ids[symbol] = None  # ポジションIDもクリア
                 self.entry_scores[symbol] = {}
+                self.short_profit_lock_armed[symbol] = False
 
                 now = now_jst()
                 unlock_time = self._ceil_to_next_15min(now)
