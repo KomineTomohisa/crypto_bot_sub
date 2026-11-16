@@ -30,6 +30,7 @@ import socket
 from urllib.parse import urlencode
 from live_execution import LiveExecutionMixin
 from trading_execution import ExchangeGateway, ExecutionError, fallback_exit
+from signal_scoring import MACD_SCORING_VERSION, causal_macd_scores, macd_scoring_spec
 from db import (
     begin, text,
     insert_order, upsert_fill,                 # ★ upsert_fill を追加
@@ -1399,6 +1400,7 @@ class CryptoTradingBot(LiveExecutionMixin):
         base = {
             "date": now_jst().strftime("%Y-%m-%d"),
             "thresholds": self.entry_thresholds,
+            "macd_scoring_version": MACD_SCORING_VERSION,
         }
         h = hashlib.sha1(json.dumps(base, sort_keys=True).encode()).hexdigest()[:7]
         return f"{base['date']}+{h}"
@@ -4456,11 +4458,11 @@ class CryptoTradingBot(LiveExecutionMixin):
                     elif col in ['EMA_short', 'EMA_long', 'MA25', 'BB_mid']:
                         df[col] = df[col].fillna(df['close'] if 'close' in df.columns else 0)
                     elif col == 'vol_avg':
-                        df[col] = df[col].fillna(df['volume'].mean() if 'volume' in df.columns else 0)
+                        df[col] = df[col].fillna(df['volume'].expanding(min_periods=1).mean() if 'volume' in df.columns else 0)
                     elif col == 'CCI':
                         df[col] = df[col].fillna(0)
                     elif col == 'ATR':
-                        df[col] = df[col].fillna(df['high'].mean() * 0.01 if 'high' in df.columns else 0)
+                        df[col] = df[col].fillna(tr.rolling(window=7, min_periods=1).mean())
                     elif col == 'BB_upper':
                         df[col] = df[col].fillna(df['close'] * 1.02 if 'close' in df.columns else 0)
                     elif col == 'BB_lower':
@@ -4492,7 +4494,7 @@ class CryptoTradingBot(LiveExecutionMixin):
                 df['EMA_long'] = df['close']
                 df['MA25'] = df['close']
                 if 'volume' in df.columns:
-                    df['vol_avg'] = df['volume'].mean()
+                    df['vol_avg'] = df['volume'].expanding(min_periods=1).mean()
                 else:
                     df['vol_avg'] = 0
                 df['CCI'] = 0
@@ -4569,6 +4571,7 @@ class CryptoTradingBot(LiveExecutionMixin):
                             'BB_upper', 'BB_lower', 'BB_mid', 'BB_width', 'ADX', 'plus_di14', 'minus_di14', 'MFI',
                             'MACD', 'MACD_signal', 'MACD_histogram']
         missing_columns = [col for col in required_columns if col not in df_5min.columns]
+        macd_inputs_complete = not {'MACD', 'MACD_signal', 'MACD_histogram'}.intersection(missing_columns)
 
         if missing_columns:
             self.logger.warning(f"{symbol}のデータに不足している列があります: {missing_columns}")
@@ -4579,7 +4582,7 @@ class CryptoTradingBot(LiveExecutionMixin):
                 elif col in ['EMA_short', 'EMA_long', 'MA25', 'BB_mid']:
                     df_5min[col] = df_5min['close'] if 'close' in df_5min.columns else 0
                 elif col == 'vol_avg':
-                    df_5min[col] = df_5min['volume'].mean() if 'volume' in df_5min.columns else 0
+                    df_5min[col] = df_5min['volume'].expanding(min_periods=1).mean() if 'volume' in df_5min.columns else 0
                 elif col == 'CCI':
                     df_5min[col] = 0  # 中間値
                 elif col == 'ATR':
@@ -4623,7 +4626,7 @@ class CryptoTradingBot(LiveExecutionMixin):
                     series = pd.Series(series)
                 
                 # NaN値を事前に処理（新しいpandas形式）
-                series_clean = series.ffill().bfill().fillna(0.5)
+                series_clean = series.replace([np.inf, -np.inf], np.nan).ffill().fillna(0.5)
                 
                 scaled = []
                 
@@ -4753,18 +4756,14 @@ class CryptoTradingBot(LiveExecutionMixin):
         # MACDスコア（トレンド転換と勢いを判断）
         # MACDヒストグラムを主に使用（勢いの変化を捉える）
         # ヒストグラムが正の値 = 上昇の勢い、負の値 = 下降の勢い
-        macd_score_long = calc_score(df_5min['MACD_histogram'], df_5min['MACD_histogram'].quantile(0.2), df_5min['MACD_histogram'].quantile(0.8))
-        macd_score_short = calc_score(df_5min['MACD_histogram'], df_5min['MACD_histogram'].quantile(0.8), df_5min['MACD_histogram'].quantile(0.2))
-
-        # MACDラインとシグナルラインのクロスオーバーも考慮
-        # MACD > シグナル = 買いシグナル、MACD < シグナル = 売りシグナル
-        macd_crossover = df_5min['MACD'] - df_5min['MACD_signal']
-        macd_crossover_score_long = calc_score(macd_crossover, macd_crossover.quantile(0.2), macd_crossover.quantile(0.8))
-        macd_crossover_score_short = calc_score(macd_crossover, macd_crossover.quantile(0.8), macd_crossover.quantile(0.2))
-
-        # ヒストグラムとクロスオーバーを組み合わせたMACDスコア
-        macd_score_long = (macd_score_long * 0.7 + macd_crossover_score_long * 0.3)
-        macd_score_short = (macd_score_short * 0.7 + macd_crossover_score_short * 0.3)
+        # 当該足より前の50本だけで正規化する。未来・未確定の後続足を参照しない。
+        macd_scores = causal_macd_scores(df_5min)
+        if not macd_inputs_complete:
+            macd_scores[['macd_score_long', 'macd_score_short']] = np.nan
+            macd_scores['macd_score_ready'] = False
+        macd_score_long = macd_scores['macd_score_long']
+        macd_score_short = macd_scores['macd_score_short']
+        df_5min['macd_score_ready'] = macd_scores['macd_score_ready']
 
         # 該当通貨ペアのロング/ショートの重みを取得（デフォルトあり）
         weights_long = indicator_weights_long.get(symbol, {
@@ -4805,7 +4804,7 @@ class CryptoTradingBot(LiveExecutionMixin):
             adx_score_long * weights_long['adx'] +
             mfi_score_long * weights_long['mfi'] +
             atr_score_long * weights_long['atr'] +
-            macd_score_long * weights_long['macd']  # 追加
+            macd_score_long.fillna(0.5) * weights_long['macd']  # 未確定値を0重みへ混入させない
         )
 
         # ショートスコア（売り）
@@ -4818,7 +4817,7 @@ class CryptoTradingBot(LiveExecutionMixin):
             adx_score_short * weights_short['adx'] +
             mfi_score_short * weights_short['mfi'] +
             atr_score_short * weights_short['atr'] +
-            macd_score_short * weights_short['macd']  # 追加
+            macd_score_short.fillna(0.5) * weights_short['macd']
         )
 
         df_5min['buy_score_scaled'] = rolling_minmax_scaler(df_5min['buy_score'], window=50)
@@ -5102,6 +5101,8 @@ class CryptoTradingBot(LiveExecutionMixin):
             sell_mask = (prev_price >= prev_ma).rolling(window).apply(lambda x: x.all(), raw=True).astype(bool)
             df_5min.loc[sell_mask, 'sell_signal'] = False
 
+        # 欠損・基準幅ゼロ・ウォームアップ不足は方向を推定せず新規エントリー不可。
+        df_5min.loc[~macd_scores['macd_score_ready'], ['buy_signal', 'sell_signal']] = False
         return df_5min
 
     def _apply_rule_thresholds(self, df: pd.DataFrame, symbol: str, timeframe: str = "5m", version: str | None = None):
@@ -5510,6 +5511,7 @@ class CryptoTradingBot(LiveExecutionMixin):
                                     order_size = self.adjust_order_size(symbol, order_size)
                                     entry_amount = order_size * entry_price
 
+                                    self._reset_exit_adjustments(symbol)
                                     position = 'short'
                                     entry_time = timestamp
                                     entry_rsi = prev1.get('RSI', None)  # 判定に使った直近確定バーの値を記録
@@ -5563,6 +5565,7 @@ class CryptoTradingBot(LiveExecutionMixin):
                                     order_size = self.adjust_order_size(symbol, order_size)
                                     entry_amount = order_size * entry_price
 
+                                    self._reset_exit_adjustments(symbol)
                                     position = 'long'
                                     entry_time = timestamp
                                     entry_rsi = prev1.get('RSI', None)
@@ -6331,6 +6334,7 @@ class CryptoTradingBot(LiveExecutionMixin):
                     'start_date': (now_jst() - timedelta(days=days_to_test)).strftime("%Y-%m-%d"),
                     'end_date': now_jst().strftime("%Y-%m-%d"),
                     'days_tested': days_to_test,
+                    'scoring': {'macd': macd_scoring_spec()},
                     'total_profit': backtest_profit,
                     'results': {k: {kk: float(vv) if isinstance(vv, (int, float)) else vv 
                                 for kk, vv in v.items()} 
@@ -6907,6 +6911,7 @@ class CryptoTradingBot(LiveExecutionMixin):
 
         # signal_raw：生情報＋使った設定・特徴量
         signal_raw = {
+            "scoring": {"macd": macd_scoring_spec()},
             "features": {
                 "rsi": rsi, "adx": adx, "atr": atr,
                 "di_plus": di_p, "di_minus": di_m,
@@ -7140,6 +7145,8 @@ class CryptoTradingBot(LiveExecutionMixin):
             final_order_amount = executed_size * current_price
             
             # ポジション情報を更新
+            if not self.exchange_settings_gmo.get("live_trade", False):
+                self._reset_exit_adjustments(symbol)
             self.positions[symbol] = position_type
             self.entry_prices[symbol] = current_price
             self.entry_times[symbol] = order_result.get('executed_at') or now_jst()
@@ -7971,6 +7978,7 @@ class CryptoTradingBot(LiveExecutionMixin):
                         )
                 
                 # ポジション情報をリセット
+                self._reset_exit_adjustments(symbol)
                 self.positions[symbol] = None
                 self.entry_prices[symbol] = 0
                 self.entry_times[symbol] = None
@@ -8488,14 +8496,18 @@ class CryptoTradingBot(LiveExecutionMixin):
 
             plus_di = None
             minus_di = None
-            if 'DI+' in df_5min.columns:
-                di_plus_series = df_5min['DI+'].dropna()
-                if len(di_plus_series) >= 1:
-                    plus_di = di_plus_series.iloc[-2] if len(di_plus_series) >= 2 else di_plus_series.iloc[-1]
-            if 'DI-' in df_5min.columns:
-                di_minus_series = df_5min['DI-'].dropna()
-                if len(di_minus_series) >= 1:
-                    minus_di = di_minus_series.iloc[-2] if len(di_minus_series) >= 2 else di_minus_series.iloc[-1]
+            # build_featuresの列を優先し、同じ確定足のDIをペアで参照する。
+            # dropnaしてから位置を選ぶと、欠損時に別時刻の値を混ぜてしまう。
+            plus_col = 'plus_di14' if 'plus_di14' in df_5min.columns else 'DI+'
+            minus_col = 'minus_di14' if 'minus_di14' in df_5min.columns else 'DI-'
+            if len(df_5min) >= 2 and plus_col in df_5min.columns and minus_col in df_5min.columns:
+                di_row = df_5min.iloc[-2]
+                try:
+                    di_pair = (float(di_row[plus_col]), float(di_row[minus_col]))
+                    if all(np.isfinite(value) and value >= 0 for value in di_pair):
+                        plus_di, minus_di = di_pair
+                except (TypeError, ValueError):
+                    pass  # DI未確定時も、ATR/ADXによる保護水準の計算は続ける。
 
             # ========= ベースのTP/SL設定取得 =========
             base = self._get_dynamic_profit_loss_settings(symbol, df_5min)
@@ -8709,11 +8721,12 @@ class CryptoTradingBot(LiveExecutionMixin):
                 return (seq is not None) and (len(seq) == 2) and bool(seq.iloc[0]) and bool(seq.iloc[1])
 
             if position_type == 'long':
-                opp_start   = is_three_of_four(sell_seq4)
-                same_unlock = is_two_streak_true(buy_seq2)
-            else:
+                # buy_signal=Short、sell_signal=Long。
                 opp_start   = is_three_of_four(buy_seq4)
                 same_unlock = is_two_streak_true(sell_seq2)
+            else:
+                opp_start   = is_three_of_four(sell_seq4)
+                same_unlock = is_two_streak_true(buy_seq2)
 
             if not hasattr(self, 'opposite_narrow_state'):
                 self.opposite_narrow_state = {}

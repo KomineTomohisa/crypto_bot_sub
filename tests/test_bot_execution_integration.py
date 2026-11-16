@@ -21,6 +21,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from trading_execution import ExchangeGateway, ExecutionError, fallback_exit
+from signal_scoring import MACD_SCORING_VERSION, causal_macd_scores, macd_scoring_spec
 from test_execution import service, FakeBot, records
 
 SOURCE = Path("crypto_bot_sub.py").read_text(encoding="utf-8-sig")
@@ -43,6 +44,9 @@ def method(owner, name):
         "ExchangeGateway": ExchangeGateway,
         "ExecutionError": ExecutionError,
         "fallback_exit": fallback_exit,
+        "MACD_SCORING_VERSION": MACD_SCORING_VERSION,
+        "causal_macd_scores": causal_macd_scores,
+        "macd_scoring_spec": macd_scoring_spec,
         "time": SimpleNamespace(sleep=lambda _: None, time=time.time),
         "json": json,
         "requests": requests,

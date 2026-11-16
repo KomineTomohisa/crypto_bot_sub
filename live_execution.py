@@ -129,6 +129,15 @@ class LiveExecutionMixin:
                     "Daily exchange fees not confirmed (%s)", type(exc).__name__
                 )
 
+    def _reset_exit_adjustments(self, symbol):
+        """Clear per-trade exit state without disturbing other symbols."""
+        if hasattr(self, "opposite_narrow_state"):
+            self.opposite_narrow_state[symbol] = {"long": False, "short": False}
+        cache = getattr(self, "_last_valid_exit_levels", {})
+        for key in list(cache):
+            if key[0] == symbol:
+                cache.pop(key, None)
+
     def _sync_live_positions(self, symbol=None):
         service = self._execution()
         for sym in [symbol] if symbol else self.symbols:
@@ -153,36 +162,38 @@ class LiveExecutionMixin:
                     self.position_ids[sym] = None
                     self.entry_scores[sym] = {}
                     self.short_profit_lock_armed[sym] = False
+                    self._reset_exit_adjustments(sym)
+                    getattr(self, "_exit_position_ids", {}).pop(sym, None)
                     if hasattr(self, "_position_sync_failed"):
                         self._position_sync_failed.discard(sym)
-                    if hasattr(self, "_last_valid_exit_levels"):
-                        self._last_valid_exit_levels = {
-                            k: v
-                            for k, v in self._last_valid_exit_levels.items()
-                            if k[0] != sym
-                        }
                     continue
                 size = sum(decimal(r["size"]) for r in rows)
                 price = (
                     sum(decimal(r["size"]) * decimal(r["price"]) for r in rows) / size
                 )
                 side = "long" if rows[0]["side"] == "BUY" else "short"
+                previous_side = self.positions.get(sym)
                 previous_pid = self.position_ids.get(sym)
                 saved_pid = getattr(self, "_saved_short_lock_position_ids", {}).get(sym)
-                if side != "short" or str(
-                    previous_pid if previous_pid is not None else saved_pid
-                ) != str(rows[0]["positionId"]):
+                current_ids = frozenset(str(row["positionId"]) for row in rows)
+                previous_ids = getattr(self, "_exit_position_ids", {}).get(sym)
+                if previous_ids is None:
+                    known_pid = previous_pid if previous_pid is not None else saved_pid
+                    previous_ids = (
+                        frozenset([str(known_pid)])
+                        if known_pid is not None
+                        else frozenset()
+                    )
+                continuous = bool(
+                    previous_ids.intersection(current_ids)
+                ) and previous_side in (None, side)
+                if not continuous:
+                    self._reset_exit_adjustments(sym)
+                if side != "short" or not continuous:
                     self.short_profit_lock_armed[sym] = False
-                if (
-                    previous_pid is not None
-                    and str(previous_pid) != str(rows[0]["positionId"])
-                    and hasattr(self, "_last_valid_exit_levels")
-                ):
-                    self._last_valid_exit_levels = {
-                        k: v
-                        for k, v in self._last_valid_exit_levels.items()
-                        if k[0] != sym
-                    }
+                if not hasattr(self, "_exit_position_ids"):
+                    self._exit_position_ids = {}
+                self._exit_position_ids[sym] = current_ids
                 self.positions[sym] = side
                 self.entry_sizes[sym] = float(size)
                 self.entry_prices[sym] = float(price)
