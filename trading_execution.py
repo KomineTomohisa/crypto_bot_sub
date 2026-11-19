@@ -114,6 +114,8 @@ class ExchangeGateway:
         seen_positions = set()
         for page in range(1, 1001):
             data = self.request(path, {**params, "page": page, "count": 100})
+            if path == '/v1/openPositions' and data == {}:
+                return result
             # GMO can omit list for an empty, successful paginated position response.
             # Require the exact requested pagination; malformed/null lists stay unconfirmed.
             if (path == '/v1/openPositions' and isinstance(data, dict)
