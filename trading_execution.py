@@ -100,7 +100,13 @@ class ExchangeGateway:
     def request(self, path, params=None):
         response = self.api._request("GET", path, params=params)
         if not isinstance(response, dict) or response.get("status") != 0:
-            raise ExecutionError("Exchange read not confirmed: " + path)
+            codes = []
+            if isinstance(response, dict):
+                for message in response.get('messages', []):
+                    code = message.get('message_code') if isinstance(message, dict) else None
+                    if isinstance(code, str) and code.startswith('ERR-') and code[4:].isdigit():
+                        codes.append(code)
+            raise ExecutionError("Exchange read not confirmed: " + path + " codes=" + ','.join(codes))
         return response.get("data")
 
     def pages(self, path, params):
@@ -109,7 +115,8 @@ class ExchangeGateway:
         for page in range(1, 1001):
             data = self.request(path, {**params, "page": page, "count": 100})
             if not isinstance(data, dict) or not isinstance(data.get("list"), list):
-                raise ExecutionError("Invalid exchange list")
+                raise ExecutionError("Invalid exchange list: data_type=" + type(data).__name__ +
+                                     " list_type=" + type(data.get('list') if isinstance(data, dict) else None).__name__)
             rows = data["list"]
             if path == "/v1/openPositions":
                 ids = [str(row.get("positionId")) for row in rows]

@@ -219,7 +219,8 @@ class LiveExecutionMixin:
             except Exception as exc:
                 # Missing data is not proof that a position has disappeared.
                 self.logger.error(
-                    "%s: position reconciliation failed (%s)", sym, type(exc).__name__
+                    "%s: position reconciliation failed (%s): %s", sym, type(exc).__name__,
+                    str(exc) if isinstance(exc, ExecutionError) else "details suppressed"
                 )
                 if not hasattr(self, "_position_sync_failed"):
                     self._position_sync_failed = set()
