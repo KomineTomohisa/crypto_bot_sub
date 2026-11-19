@@ -22,6 +22,10 @@ from urllib3.util.retry import Retry
 
 from trading_execution import ExchangeGateway, ExecutionError, fallback_exit
 from signal_scoring import MACD_SCORING_VERSION, causal_macd_scores, macd_scoring_spec
+from backtest_data import backtest_state, load_backtest_candles, excel_backtest_inputs
+from strategy_decisions import DECISION_VERSION, entry_side, exit_decision, short_profit_stop, jst_timestamp, next_entry_time, symbol_priority
+from strategy_inputs import FEATURE_HISTORY_VERSION, feature_history_spec, prepare_strategy_inputs, historical_observation, candle_api_dates, candle_cache_valid, candle_partition_complete, entry_input_quality
+from strategy_recording import record_bot_event, close_recorder
 from test_execution import service, FakeBot, records
 
 SOURCE = Path("crypto_bot_sub.py").read_text(encoding="utf-8-sig")
@@ -47,6 +51,29 @@ def method(owner, name):
         "MACD_SCORING_VERSION": MACD_SCORING_VERSION,
         "causal_macd_scores": causal_macd_scores,
         "macd_scoring_spec": macd_scoring_spec,
+        "backtest_state": backtest_state,
+        "load_backtest_candles": load_backtest_candles,
+        "excel_backtest_inputs": excel_backtest_inputs,
+        "DECISION_VERSION": DECISION_VERSION,
+        "entry_side": entry_side,
+        "exit_decision": exit_decision,
+        "short_profit_stop": short_profit_stop,
+        "jst_timestamp": jst_timestamp,
+        "next_entry_time": next_entry_time,
+        "symbol_priority": symbol_priority,
+        "FEATURE_HISTORY_VERSION": FEATURE_HISTORY_VERSION,
+        "feature_history_spec": feature_history_spec,
+        "prepare_strategy_inputs": prepare_strategy_inputs,
+        "historical_observation": historical_observation,
+        "candle_api_dates": candle_api_dates,
+        "candle_cache_valid": candle_cache_valid,
+        "candle_partition_complete": candle_partition_complete,
+        "entry_input_quality": entry_input_quality,
+        "os": __import__('os'),
+        "random": __import__('random'),
+        "datetime": datetime,
+        "record_bot_event": record_bot_event,
+        "close_recorder": close_recorder,
         "time": SimpleNamespace(sleep=lambda _: None, time=time.time),
         "json": json,
         "requests": requests,
@@ -334,7 +361,10 @@ def test_main_dispatches_live_exit_to_execution_service():
         get_current_price=lambda *a: 111,
         _apply_short_profit_lock=lambda **kw: kw["stop_loss_price"],
         _close_live_position=lambda *a: called.append(a),
+        short_profit_lock_armed={},
     )
+    evaluate, _ = method(BOT, "_evaluate_exit_event")
+    bot._evaluate_exit_event = lambda *a, **kw: evaluate(bot, *a, **kw)
     fn(bot, "ltc_jpy", {}, [], pd.DataFrame({"high": [112], "low": [100]}))
     assert len(called) == 1
 

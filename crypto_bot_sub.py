@@ -31,6 +31,10 @@ from urllib.parse import urlencode
 from live_execution import LiveExecutionMixin
 from trading_execution import ExchangeGateway, ExecutionError, fallback_exit
 from signal_scoring import MACD_SCORING_VERSION, causal_macd_scores, macd_scoring_spec
+from backtest_data import backtest_state, load_backtest_candles, excel_backtest_inputs
+from strategy_decisions import DECISION_VERSION, entry_side, exit_decision, short_profit_stop, jst_timestamp, next_entry_time, symbol_priority
+from strategy_inputs import FEATURE_HISTORY_VERSION, feature_history_spec, prepare_strategy_inputs, historical_observation, candle_api_dates, candle_cache_valid, candle_partition_complete, entry_input_quality
+from strategy_recording import record_bot_event, close_recorder
 from db import (
     begin, text,
     insert_order, upsert_fill,                 # ★ upsert_fill を追加
@@ -1401,6 +1405,8 @@ class CryptoTradingBot(LiveExecutionMixin):
             "date": now_jst().strftime("%Y-%m-%d"),
             "thresholds": self.entry_thresholds,
             "macd_scoring_version": MACD_SCORING_VERSION,
+            "decision_version": DECISION_VERSION,
+            "feature_history_version": FEATURE_HISTORY_VERSION,
         }
         h = hashlib.sha1(json.dumps(base, sort_keys=True).encode()).hexdigest()[:7]
         return f"{base['date']}+{h}"
@@ -2761,6 +2767,12 @@ class CryptoTradingBot(LiveExecutionMixin):
                     response.raise_for_status()
 
                     data = response.json()
+                    rows = data.get('data', [])
+                    rows = rows if isinstance(rows, list) else [rows]
+                    record_bot_event(self, 'ticker_response', {
+                        'symbol': symbol, 'status': data.get('status'),
+                        'tickers': [{key: item.get(key) for key in ('symbol', 'timestamp', 'bid', 'ask', 'last')} for item in rows if isinstance(item, dict)],
+                    }, now_jst())
                     if data.get('status') == 0 and 'data' in data:
                         ticker_data = data['data']
                         if isinstance(ticker_data, list):
@@ -2784,6 +2796,7 @@ class CryptoTradingBot(LiveExecutionMixin):
 
                 except requests.exceptions.RequestException as e:
                     last_exc = e
+                    record_bot_event(self, 'input_error', {'symbol': symbol, 'source': 'gmo_ticker', 'attempt': attempt + 1, 'error_type': type(e).__name__}, now_jst())
                     if _is_dns_temp_failure(e):
                         time.sleep(1.2 * (attempt + 1))
                         continue
@@ -3997,30 +4010,31 @@ class CryptoTradingBot(LiveExecutionMixin):
         # date_strがNoneの場合、有効な日付を検索
         if date_str is None:
             # 直接今日の日付を使用してみる
-            date_str = now_jst().strftime('%Y%m%d')
+            date_str = jst_timestamp(now_jst()).tz_convert('UTC').strftime('%Y%m%d')
             self.logger.info(f"15分足データの日付として本日の日付 {date_str} を試行")
                 
+        observed_at = now_jst()
+        if timeframe in ('1min', '5min', '15min', '30min', '1hour'):
+            api_day = pd.to_datetime(date_str, format='%Y%m%d', utc=True)
+            if api_day > jst_timestamp(observed_at).tz_convert('UTC').normalize():
+                return pd.DataFrame()
         cache_file = os.path.join(self.cache_dir, f"{symbol}_{timeframe}_{date_str}.json")
         
         # キャッシュの有効期限チェック（追加）
         cache_valid = False
         if os.path.exists(cache_file):
             file_mtime = os.path.getmtime(cache_file)
-            cache_age_hours = (time.time() - file_mtime) / 3600
-            
-            # 時間枠に応じた有効期限設定
-            if timeframe == '5min' and cache_age_hours < 1:  # 5分足は1時間有効
-                cache_valid = True
-            elif timeframe == '1hour' and cache_age_hours < 3:  # 1時間足は3時間有効
-                cache_valid = True
-            elif timeframe == '1day' and cache_age_hours < 24:  # 日足は24時間有効
-                cache_valid = True
+            cache_valid = candle_cache_valid(timeframe, date_str, observed_at, file_mtime)
         
         # キャッシュから読み込み試行
         if cache_valid:
             try:
                 with open(cache_file, 'r') as f:
                     data = json.load(f)
+                if (timeframe in ('1min', '5min', '15min', '30min', '1hour')
+                        and api_day + pd.Timedelta(days=1) <= jst_timestamp(observed_at).tz_convert('UTC')
+                        and not candle_partition_complete(data, timeframe, date_str)):
+                    data = {'success': 0}
                     
                 # キャッシュデータの検証を追加
                 if data.get('success') != 1 or 'candlestick' not in data.get('data', {}):
@@ -4140,37 +4154,13 @@ class CryptoTradingBot(LiveExecutionMixin):
                             (df['low'] > df['open']) | 
                             (df['low'] > df['close']))
                 
-                inconsistent_count = inconsistent.sum()
-                if inconsistent_count > 0:
-                    self.logger.warning(f"整合性のない価格データ: {inconsistent_count}件")
-                    
-                    # 整合性エラーの修正
-                    for i in df.index[inconsistent]:
-                        row = df.loc[i]
-                        # 高値を最大値に、安値を最小値に修正
-                        values = [row['open'], row['close'], row['high'], row['low']]
-                        df.loc[i, 'high'] = max(values)
-                        df.loc[i, 'low'] = min(values)
-                
-                # NaN値のチェックと修正
-                nan_counts = df.isna().sum()
-                if nan_counts.sum() > 0:
-                    self.logger.warning(f"NaN値検出: {nan_counts.to_dict()}")
-                    
-                    # 前方値補完（修正版）
-                    df = df.ffill()
-                    
-                    # それでも残るNaN値は後方値補完（修正版）
-                    df = df.bfill()
-                    
-                    # それでも残るNaN値（両端など）は列の平均値で補完
-                    for col in ['open', 'high', 'low', 'close', 'volume']:
-                        if df[col].isna().any():
-                            df[col] = df[col].fillna(df[col].mean() if not df[col].empty else 0)
-                
+                if inconsistent.any() or df.isna().any().any() or not np.isfinite(df[['open','high','low','close','volume']].to_numpy()).all():
+                    raise ValueError('Invalid candle values; refusing synthetic repairs')
                 return df
             except Exception as e:
                 self.logger.error(f"データ変換エラー: {e}", exc_info=True)
+                if os.path.exists(cache_file):
+                    os.remove(cache_file)
                 return pd.DataFrame()
         
         # フォールバック処理（前日のデータを試す）
@@ -5321,14 +5311,23 @@ class CryptoTradingBot(LiveExecutionMixin):
         return order_size, base_order_amount
 
     def backtest(self, days_to_test, live_mode=False):
-        """複数通貨ペアのバックテスト実行（方式A: 直近2本True→次バー始値エントリー／スレッドセーフ）"""
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        """検証専用の状態で実行し、終了・例外時には実行前の状態へ戻す。"""
+        if isinstance(days_to_test, bool) or not isinstance(days_to_test, int) or days_to_test <= 0:
+            raise ValueError("days_to_test must be a positive integer")
+        with backtest_state(self):
+            return self._run_backtest(days_to_test, live_mode=live_mode)
+
+    def _run_backtest(self, days_to_test, live_mode=False):
+        """銘柄ごとにウォームアップを含む全期間を連続再生する。"""
+        import heapq
         import threading
         import pandas as pd
-        from datetime import timedelta
 
         self.logger.info(f"=== バックテスト開始 ({days_to_test}日間) ===")
 
+        test_end = pd.Timestamp(now_jst()).normalize()
+        test_start = test_end - pd.Timedelta(days=days_to_test)
+        self._backtest_period = {"start": test_start.isoformat(), "end_exclusive": test_end.isoformat()}
         results = {}
         start_profit = self.total_profit  # バックテスト開始時の利益
 
@@ -5345,7 +5344,7 @@ class CryptoTradingBot(LiveExecutionMixin):
         signal_rows = {symbol: [] for symbol in self.symbols}
 
         def run_backtest(symbol):
-            nonlocal total_balance  # ← 外側スコープの total_balance を更新するために必要
+            nonlocal total_balance
 
             # 各通貨ペア専用の変数（スレッドローカル）
             total_trades = 0
@@ -5363,449 +5362,415 @@ class CryptoTradingBot(LiveExecutionMixin):
 
             self.logger.info(f"=== {symbol.upper()} のバックテスト ===")
 
-            # 日付範囲の設定（live_mode でも同一のロジック）
-            day_range = range(days_to_test, 0, -1)
+            # 日別の足を時間軸へ結合し、各観測で共通の履歴範囲から特徴量を計算する。
+            intraday, hourly = load_backtest_candles(
+                self.get_cached_data, symbol, test_start, test_end
+            )
+            if intraday.empty or hourly.empty:
+                raise ValueError(f"{symbol}: バックテストに必要な足データがありません")
+            df_5min = intraday.sort_values('timestamp').reset_index(drop=True)
+            selected = df_5min['timestamp'].ge(test_start) & df_5min['timestamp'].lt(test_end)
+            if not selected.any():
+                raise ValueError(f"{symbol}: 指定期間内の足データがありません")
+            first_bar = int(df_5min.index[selected][0])
 
-            for day_offset in day_range:
-                current_date = now_jst() - timedelta(days=day_offset)
-                date_str = current_date.strftime('%Y%m%d')
+            position = None
+            entry_price = 0.0
+            entry_time = None
+            entry_rsi = None
+            entry_cci = None
+            entry_sentiment = {}
+            entry_scores = {}
+            order_size = 0.0
+            reentry_block_until = None
 
-                # 前日
-                previous_date = current_date - timedelta(days=1)
-                previous_date_str = previous_date.strftime('%Y%m%d')
+            for i in range(first_bar, len(df_5min)):
+                row = df_5min.iloc[i]
+                price_close = row.get('close', None)
+                price_open  = row.get('open', price_close)  # open欠損時はclose代用
+                timestamp   = row['timestamp'] if 'timestamp' in df_5min.columns else df_5min.index[i]
 
-                # 15分足データの取得（当日分）
-                df_5min_current = self.get_cached_data(symbol, '15min', date_str)
-                if df_5min_current.empty:
-                    self.logger.warning(f"{date_str}の{symbol}の15分足データを取得できませんでした。")
-                    continue
+                current_rsi = row.get('RSI', None)
+                current_cci = row.get('CCI', None)
 
-                # 前日の15分足
-                df_5min_previous = self.get_cached_data(symbol, '15min', previous_date_str)
+                # 口座全体で次に観測するイベントを先に提示する。処理はschedulerが再開した時だけ。
+                event_at = pd.Timestamp(timestamp) + (pd.Timedelta(minutes=15) if position else pd.Timedelta(0))
+                yield event_at, symbol_priority(symbol, position)[0]
 
-                # 前日＋当日の結合→ソート→重複除去→特徴量
-                if not df_5min_previous.empty:
-                    df_5min_combined = pd.concat([df_5min_previous, df_5min_current])
-                    df_5min_combined = df_5min_combined.sort_values('timestamp')
-                    df_5min_combined = df_5min_combined.drop_duplicates(subset=['timestamp'])
-                    self.logger.info(f"{symbol}の結合データ: 前日={len(df_5min_previous)}本 + 当日={len(df_5min_current)}本 = 合計{len(df_5min_combined)}本")
-                    df_5min_full = self.build_features(df_5min_combined.copy())
-                else:
-                    self.logger.warning(f"{previous_date_str}の{symbol}の前日データが欠損のため、当日データのみで処理します。")
-                    df_5min_full = self.build_features(df_5min_current.copy())
+                # Historical OHLC is known only at close; opening observations use
+                # the open alone. Feature calculation itself is shared with live.
+                feature_at = event_at - pd.Timedelta(nanoseconds=1) if position else event_at
+                event_raw = historical_observation(df_5min, timestamp, at_open=position is None)
+                event_hourly = hourly.loc[hourly['timestamp'] + pd.Timedelta(hours=1) <= feature_at].copy()
+                event_history, _ = prepare_strategy_inputs(self, symbol, event_raw, event_hourly, feature_at)
+                if not {'buy_signal', 'sell_signal'}.issubset(event_history.columns):
+                    raise ValueError(f"{symbol}: シグナル列がありません")
+                visible = event_history.loc[event_history['timestamp'].ge(test_start)].tail(3)
+                signal_rows[symbol].append(visible[['timestamp', 'buy_signal', 'sell_signal']].copy())
 
-                # 1時間足データの取得（3日分）
-                hourly_candles = []
-                for h_offset in range(2, -1, -1):
-                    hourly_date = (current_date - timedelta(days=h_offset)).strftime('%Y%m%d')
-                    df_hourly_day = self.get_cached_data(symbol, '1hour', hourly_date)
-                    if not df_hourly_day.empty:
-                        hourly_candles.append(df_hourly_day)
+                # === エントリー判定（方式A：直近2本がTrue → 次バーで入る） ===
+                if position is None:
+                    # 実運用同等：決済直後は「次の15分足始値」まで再エントリー禁止
+                    if reentry_block_until is not None:
+                        now_ts = pd.to_datetime(timestamp)
+                        if now_ts < reentry_block_until:
+                            # クールダウン中はこのバーのエントリー判定をスキップ
+                            continue
+                    # i-2, i-1（確定済バー）を見る。i は「約定バー」
+                    if len(event_history) >= 3:
+                        prev1 = event_history.iloc[-2]
+                        prev2 = event_history.iloc[-3]
 
-                if not hourly_candles:
-                    self.logger.warning(f"{date_str}の{symbol}の時間足データを取得できませんでした。")
-                    continue
+                        if (timestamp - prev1["timestamp"] != pd.Timedelta(minutes=15)
+                                or prev1["timestamp"] - prev2["timestamp"] != pd.Timedelta(minutes=15)):
+                            continue
 
-                expected_records = 96  # 24時間分の15分足（4本/時 × 24）
+                        # 直近2本で同方向 buy が点灯、かつ反対シグナルは消灯
+                        direction = entry_side(prev1, prev2, timestamp, reentry_block_until)
+                        enter_short = direction == 'short'
+                        enter_long = direction == 'long'
 
-                self.is_backtest = True
+                        # ロングエントリー
+                        if enter_short:
+                            entry_price = price_open  # 次バーの始値で約定
+                            if entry_price is None or entry_price <= 0:
+                                # openもcloseも欠損の場合はスキップ
+                                continue
 
-                try:
-                    df_hourly = pd.concat(hourly_candles).sort_values('timestamp')
-                    df_hourly = self.build_features(df_hourly)
+                            order_size = self.TRADE_SIZE / entry_price
+                            order_size = self.adjust_order_size(symbol, order_size)
+                            if not np.isfinite(order_size) or order_size <= 0:
+                                continue
+                            entry_amount = order_size * entry_price
+                            if total_balance < entry_amount:
+                                continue
 
-                    # シグナル生成（※この時点で buy/sell_signal が確定している想定）
-                    df_5min_full = self.generate_signals_with_sentiment(symbol, df_5min_full, df_hourly)
+                            self._reset_exit_adjustments(symbol)
+                            self.short_profit_lock_armed[symbol] = False
+                            position = 'short'
+                            entry_time = timestamp
+                            entry_rsi = prev1.get('RSI', None)  # 判定に使った直近確定バーの値を記録
+                            entry_cci = prev1.get('CCI', None)
+                            entry_sentiment = self.sentiment.copy() if hasattr(self, 'sentiment') else {}
 
-                    # 時間順ソート→最新24h（96本）を抽出
-                    if 'timestamp' in df_5min_full.columns:
-                        df_5min_full = df_5min_full.sort_values('timestamp').reset_index(drop=True)
-                        if len(df_5min_full) > expected_records:
-                            df_5min = df_5min_full.iloc[-expected_records:].copy().reset_index(drop=True)
-                            self.logger.info(f"シグナル生成後の最新24時間分データ: {len(df_5min)}本（合計{len(df_5min_full)}本から抽出）")
+                            # スコア類も prev1 から記録
+                            entry_scores = {
+                                'buy_score_scaled': prev1.get('buy_score_scaled', 0),
+                                'sell_score_scaled': prev1.get('sell_score_scaled', 0),
+                                'rsi_score_long': prev1.get('rsi_score_long', 0),
+                                'rsi_score_short': prev1.get('rsi_score_short', 0),
+                                'cci_score_long': prev1.get('cci_score_long', 0),
+                                'cci_score_short': prev1.get('cci_score_short', 0),
+                                'volume_score': prev1.get('volume_score', 0),
+                                'bb_score_long': prev1.get('bb_score_long', 0),
+                                'bb_score_short': prev1.get('bb_score_short', 0),
+                                'ma_score_long': prev1.get('ma_score_long', 0),
+                                'ma_score_short': prev1.get('ma_score_short', 0),
+                                'adx_score_long': prev1.get('adx_score_long', 0),
+                                'adx_score_short': prev1.get('adx_score_short', 0),
+                                'mfi_score_long': prev1.get('mfi_score_long', 0),
+                                'mfi_score_short': prev1.get('mfi_score_short', 0),
+                                'atr_score_long': prev1.get('atr_score_long', 0),
+                                'atr_score_short': prev1.get('atr_score_short', 0),
+                                'macd_score_long': prev1.get('macd_score_long', 0),
+                                'macd_score_short': prev1.get('macd_score_short', 0),
+                                'ema_deviation': prev1.get('ema_deviation', 0),
+                                'entry_atr': prev1.get('ATR', 0),
+                                'entry_adx': prev1.get('ADX', 0)
+                            }
+
+                            with entry_sizes_lock:
+                                self.entry_sizes[symbol] = order_size
+
+                            with balance_lock:
+                                balance_before_entry = total_balance
+                                total_balance -= entry_amount
+                                balance_after_entry = total_balance
+
+                            self.log_entry(symbol, 'short', entry_price, entry_time, entry_rsi, entry_cci,
+                                        prev1.get('ATR', 0), prev1.get('ADX', 0), entry_sentiment)
+
+                        # ショートエントリー
+                        elif enter_long:
+                            entry_price = price_open
+                            if entry_price is None or entry_price <= 0:
+                                continue
+
+                            order_size = self.TRADE_SIZE / entry_price
+                            order_size = self.adjust_order_size(symbol, order_size)
+                            if not np.isfinite(order_size) or order_size <= 0:
+                                continue
+                            entry_amount = order_size * entry_price
+                            if total_balance < entry_amount:
+                                continue
+
+                            self._reset_exit_adjustments(symbol)
+                            self.short_profit_lock_armed[symbol] = False
+                            position = 'long'
+                            entry_time = timestamp
+                            entry_rsi = prev1.get('RSI', None)
+                            entry_cci = prev1.get('CCI', None)
+                            entry_sentiment = self.sentiment.copy() if hasattr(self, 'sentiment') else {}
+
+                            entry_scores = {
+                                'buy_score_scaled': prev1.get('buy_score_scaled', 0),
+                                'sell_score_scaled': prev1.get('sell_score_scaled', 0),
+                                'rsi_score_long': prev1.get('rsi_score_long', 0),
+                                'rsi_score_short': prev1.get('rsi_score_short', 0),
+                                'cci_score_long': prev1.get('cci_score_long', 0),
+                                'cci_score_short': prev1.get('cci_score_short', 0),
+                                'volume_score': prev1.get('volume_score', 0),
+                                'bb_score_long': prev1.get('bb_score_long', 0),
+                                'bb_score_short': prev1.get('bb_score_short', 0),
+                                'ma_score_long': prev1.get('ma_score_long', 0),
+                                'ma_score_short': prev1.get('ma_score_short', 0),
+                                'adx_score_long': prev1.get('adx_score_long', 0),
+                                'adx_score_short': prev1.get('adx_score_short', 0),
+                                'mfi_score_long': prev1.get('mfi_score_long', 0),
+                                'mfi_score_short': prev1.get('mfi_score_short', 0),
+                                'atr_score_long': prev1.get('atr_score_long', 0),
+                                'atr_score_short': prev1.get('atr_score_short', 0),
+                                'macd_score_long': prev1.get('macd_score_long', 0),
+                                'macd_score_short': prev1.get('macd_score_short', 0),
+                                'ema_deviation': prev1.get('ema_deviation', 0),
+                                'entry_atr': prev1.get('ATR', 0),
+                                'entry_adx': prev1.get('ADX', 0)
+                            }
+
+                            with entry_sizes_lock:
+                                self.entry_sizes[symbol] = order_size
+
+                            with balance_lock:
+                                balance_before_entry = total_balance
+                                total_balance -= entry_amount
+                                balance_after_entry = total_balance
+
+                            self.log_entry(symbol, 'long', entry_price, entry_time, entry_rsi, entry_cci,
+                                        prev1.get('ATR', 0), prev1.get('ADX', 0), entry_sentiment)
+
+                # === イグジット判定 ===
+                elif position == 'long':
+                    # 足内の観測系列はないため、足の終了時刻でOHLCと終値を観測する近似。
+                    observed_at = pd.Timestamp(timestamp) + pd.Timedelta(minutes=15)
+                    decision = self._evaluate_exit_event(
+                        symbol, event_history, position, entry_price, entry_time,
+                        observed_at, price_close,
+                    )
+                    if decision.reason is not None:
+                        timestamp = observed_at
+                        # liveは成行決済。閾値で約定したことにせず観測価格を代理値にする。
+                        exit_price = float(price_close)
+                        profit = (exit_price - entry_price) * order_size
+                        profit_pct = (exit_price - entry_price) / entry_price * 100.0
+
+                        entry_amount = order_size * entry_price
+                        exit_amount = order_size * exit_price
+
+                        with balance_lock:
+                            balance_before_exit = total_balance
+                            total_balance += exit_amount
+                            balance_after_exit = total_balance
+
+                        # 保有時間
+                        if isinstance(timestamp, pd.Timestamp) and isinstance(entry_time, pd.Timestamp):
+                            holding_time = timestamp - entry_time
+                            hours = holding_time.total_seconds() / 3600.0
                         else:
-                            df_5min = df_5min_full.copy().reset_index(drop=True)
-                            self.logger.info(f"データ総数が96レコード未満のため全データを使用: {len(df_5min)}本")
-                    else:
-                        df_5min_full = df_5min_full.reset_index(drop=True)
-                        if len(df_5min_full) > expected_records:
-                            df_5min = df_5min_full.iloc[-expected_records:].copy().reset_index(drop=True)
+                            hours = 0.0
+
+                        exit_reason = decision.reason
+                        self.log_exit(symbol, 'long', exit_price, entry_price, timestamp, profit, profit_pct,
+                                    exit_reason, hours, entry_sentiment)
+
+                        buy5, sell5 = self._last5_flags_str(event_history, len(event_history) - 1)
+
+                        trade_data = {
+                            'symbol': symbol,
+                            'type': 'long',
+                            'entry_price': entry_price,
+                            'entry_time': entry_time,
+                            'entry_rsi': entry_rsi,
+                            'entry_cci': entry_cci,
+                            'entry_atr': entry_scores.get('entry_atr', 0),
+                            'entry_adx': entry_scores.get('entry_adx', 0),
+                            'buy_score': entry_scores.get('buy_score_scaled', 0),
+                            'sell_score': entry_scores.get('sell_score_scaled', 0),
+                            'exit_price': exit_price,
+                            'exit_time': timestamp,
+                            'size': order_size,
+                            'entry_amount': entry_amount,
+                            'balance_after_entry': balance_after_entry,
+                            'balance_after_exit': balance_after_exit,
+                            'profit': profit,
+                            'profit_pct': profit_pct,
+                            'exit_reason': exit_reason,
+                            'holding_hours': hours,
+                            'exit_buy_last5': buy5,
+                            'exit_sell_last5': sell5,
+                            'sentiment_bullish': entry_sentiment.get('bullish', 0),
+                            'sentiment_bearish': entry_sentiment.get('bearish', 0),
+                            'sentiment_volatility': entry_sentiment.get('volatility', 0),
+                            'rsi_score_long': entry_scores.get('rsi_score_long', 0),
+                            'rsi_score_short': entry_scores.get('rsi_score_short', 0),
+                            'cci_score_long': entry_scores.get('cci_score_long', 0),
+                            'cci_score_short': entry_scores.get('cci_score_short', 0),
+                            'volume_score': entry_scores.get('volume_score', 0),
+                            'bb_score_long': entry_scores.get('bb_score_long', 0),
+                            'bb_score_short': entry_scores.get('bb_score_short', 0),
+                            'ma_score_long': entry_scores.get('ma_score_long', 0),
+                            'ma_score_short': entry_scores.get('ma_score_short', 0),
+                            'adx_score_long': entry_scores.get('adx_score_long', 0),
+                            'adx_score_short': entry_scores.get('adx_score_short', 0),
+                            'mfi_score_long': entry_scores.get('mfi_score_long', 0),
+                            'mfi_score_short': entry_scores.get('mfi_score_short', 0),
+                            'atr_score_long': entry_scores.get('atr_score_long', 0),
+                            'atr_score_short': entry_scores.get('atr_score_short', 0),
+                            'macd_score_long': entry_scores.get('macd_score_long', 0),
+                            'macd_score_short': entry_scores.get('macd_score_short', 0),
+                            'ema_deviation': entry_scores.get('ema_deviation', 0)
+                        }
+                        thread_trade_logs.append(trade_data)
+
+                        # 統計更新
+                        symbol_profit += profit
+                        long_profit += profit
+                        total_trades += 1
+                        long_trades += 1
+                        wins += (profit > 0)
+                        long_wins += (profit > 0)
+
+                        # リセット
+                        position = None
+                        entry_scores = {}
+
+                        # 実運用同等：次の15分足始値まで再エントリー禁止
+                        ts = pd.to_datetime(timestamp)
+                        reentry_block_until = next_entry_time(ts)
+
+                elif position == 'short':
+                    # 足内の観測系列はないため、足の終了時刻でOHLCと終値を観測する近似。
+                    observed_at = pd.Timestamp(timestamp) + pd.Timedelta(minutes=15)
+                    decision = self._evaluate_exit_event(
+                        symbol, event_history, position, entry_price, entry_time,
+                        observed_at, price_close,
+                    )
+                    if decision.reason is not None:
+                        timestamp = observed_at
+                        # liveは成行決済。閾値で約定したことにせず観測価格を代理値にする。
+                        exit_price = float(price_close)
+                        profit = (entry_price - exit_price) * order_size
+                        profit_pct = (entry_price - exit_price) / entry_price * 100.0
+
+                        entry_amount = order_size * entry_price
+
+                        with balance_lock:
+                            balance_before_exit = total_balance
+                            # 既存仕様：ショートは entry_amount + profit を現金側に反映
+                            total_balance += (entry_amount + profit)
+                            balance_after_exit = total_balance
+
+                        if isinstance(timestamp, pd.Timestamp) and isinstance(entry_time, pd.Timestamp):
+                            holding_time = timestamp - entry_time
+                            hours = holding_time.total_seconds() / 3600.0
                         else:
-                            df_5min = df_5min_full.copy().reset_index(drop=True)
-                        self.logger.warning(f"タイムスタンプカラムがないため、インデックスで最新データを抽出: {len(df_5min)}本")
+                            hours = 0.0
 
-                    if df_5min.empty:
-                        self.logger.error(f"データ抽出後にデータフレームが空になりました: {symbol}")
-                        continue
+                        exit_reason = decision.reason
+                        self.log_exit(symbol, 'short', exit_price, entry_price, timestamp, profit, profit_pct,
+                                    exit_reason, hours, entry_sentiment)
 
-                    required_columns = ['buy_signal', 'sell_signal']
-                    missing_columns = [c for c in required_columns if c not in df_5min.columns]
-                    if missing_columns:
-                        self.logger.error(f"必要なカラムが不足しています ({symbol}): {missing_columns}")
-                        continue
+                        buy5, sell5 = self._last5_flags_str(event_history, len(event_history) - 1)
 
-                    # NaN 安全化
-                    df_5min['buy_signal'] = df_5min['buy_signal'].fillna(False).astype(bool)
-                    df_5min['sell_signal'] = df_5min['sell_signal'].fillna(False).astype(bool)
+                        trade_data = {
+                            'symbol': symbol,
+                            'type': 'short',
+                            'entry_price': entry_price,
+                            'entry_time': entry_time,
+                            'entry_rsi': entry_rsi,
+                            'entry_cci': entry_cci,
+                            'entry_atr': entry_scores.get('entry_atr', 0),
+                            'entry_adx': entry_scores.get('entry_adx', 0),
+                            'buy_score': entry_scores.get('buy_score_scaled', 0),
+                            'sell_score': entry_scores.get('sell_score_scaled', 0),
+                            'exit_price': exit_price,
+                            'exit_time': timestamp,
+                            'size': order_size,
+                            'entry_amount': entry_amount,
+                            'balance_after_entry': balance_after_entry,
+                            'balance_after_exit': balance_after_exit,
+                            'profit': profit,
+                            'profit_pct': profit_pct,
+                            'exit_reason': exit_reason,
+                            'holding_hours': hours,
+                            'exit_buy_last5': buy5,
+                            'exit_sell_last5': sell5,
+                            'sentiment_bullish': entry_sentiment.get('bullish', 0),
+                            'sentiment_bearish': entry_sentiment.get('bearish', 0),
+                            'sentiment_volatility': entry_sentiment.get('volatility', 0),
+                            'rsi_score_long': entry_scores.get('rsi_score_long', 0),
+                            'rsi_score_short': entry_scores.get('rsi_score_short', 0),
+                            'cci_score_long': entry_scores.get('cci_score_long', 0),
+                            'cci_score_short': entry_scores.get('cci_score_short', 0),
+                            'volume_score': entry_scores.get('volume_score', 0),
+                            'bb_score_long': entry_scores.get('bb_score_long', 0),
+                            'bb_score_short': entry_scores.get('bb_score_short', 0),
+                            'ma_score_long': entry_scores.get('ma_score_long', 0),
+                            'ma_score_short': entry_scores.get('ma_score_short', 0),
+                            'adx_score_long': entry_scores.get('adx_score_long', 0),
+                            'adx_score_short': entry_scores.get('adx_score_short', 0),
+                            'mfi_score_long': entry_scores.get('mfi_score_long', 0),
+                            'mfi_score_short': entry_scores.get('mfi_score_short', 0),
+                            'atr_score_long': entry_scores.get('atr_score_long', 0),
+                            'atr_score_short': entry_scores.get('atr_score_short', 0),
+                            'macd_score_long': entry_scores.get('macd_score_long', 0),
+                            'macd_score_short': entry_scores.get('macd_score_short', 0),
+                            'ema_deviation': entry_scores.get('ema_deviation', 0)
+                        }
+                        thread_trade_logs.append(trade_data)
 
-                    self.logger.info(f"データ抽出完了: {symbol}, 最終データ数: {len(df_5min)}")
+                        # 統計更新
+                        symbol_profit += profit
+                        short_profit += profit
+                        total_trades += 1
+                        short_trades += 1
+                        wins += (profit > 0)
+                        short_wins += (profit > 0)
 
-                    # その日のシグナルを蓄積（Excel側での集計用）
-                    if 'timestamp' in df_5min.columns:
-                        sig_day = df_5min[['timestamp', 'buy_signal', 'sell_signal']].copy()
-                    else:
-                        sig_day = df_5min.reset_index().rename(columns={'index': 'timestamp'})[['timestamp', 'buy_signal', 'sell_signal']]
-                    sig_day['timestamp'] = pd.to_datetime(sig_day['timestamp'], errors='coerce')
-                    signal_rows[symbol].append(sig_day)
+                        position = None
+                        entry_scores = {}
 
-                    # バックテストの主要ループ
-                    position = None
-                    entry_price = 0.0
-                    entry_time = None
-                    entry_rsi = None
-                    entry_cci = None
-                    entry_sentiment = {}
-                    entry_scores = {}
-                    order_size = 0.0  # スレッドローカルな注文サイズ
-                    reentry_block_until = None  # type: ignore  # pd.Timestamp | None
+                        # 実運用同等：次の15分足始値まで再エントリー禁止
+                        ts = pd.to_datetime(timestamp)
+                        reentry_block_until = next_entry_time(ts)
 
-                    for i in range(len(df_5min)):
-                        row = df_5min.iloc[i]
-                        price_close = row.get('close', None)
-                        price_open  = row.get('open', price_close)  # open欠損時はclose代用
-                        timestamp   = row['timestamp'] if 'timestamp' in df_5min.columns else df_5min.index[i]
-
-                        current_rsi = row.get('RSI', None)
-                        current_cci = row.get('CCI', None)
-
-                        # === エントリー判定（方式A：直近2本がTrue → 次バーで入る） ===
-                        if position is None:
-                            # 実運用同等：決済直後は「次の15分足始値」まで再エントリー禁止
-                            if reentry_block_until is not None:
-                                now_ts = pd.to_datetime(timestamp)
-                                if now_ts < reentry_block_until:
-                                    # クールダウン中はこのバーのエントリー判定をスキップ
-                                    continue
-                            # i-2, i-1（確定済バー）を見る。i は「約定バー」
-                            if i >= 2:
-                                prev1 = df_5min.iloc[i-1]
-                                prev2 = df_5min.iloc[i-2]
-
-                                prev_buy_1  = bool(prev1.get('buy_signal', False))
-                                prev_buy_2  = bool(prev2.get('buy_signal', False))
-                                prev_sell_1 = bool(prev1.get('sell_signal', False))
-                                prev_sell_2 = bool(prev2.get('sell_signal', False))
-
-                                # 直近2本で同方向 buy が点灯、かつ反対シグナルは消灯
-                                cond_long = (prev_buy_1 and prev_buy_2 and not prev_sell_1 and not prev_sell_2)
-                                cond_short = (prev_sell_1 and prev_sell_2 and not prev_buy_1 and not prev_buy_2)
-
-                                # ロングエントリー
-                                if cond_long:
-                                    entry_price = price_open  # 次バーの始値で約定
-                                    if entry_price is None or entry_price <= 0:
-                                        # openもcloseも欠損の場合はスキップ
-                                        continue
-
-                                    order_size = self.TRADE_SIZE / entry_price
-                                    order_size = self.adjust_order_size(symbol, order_size)
-                                    entry_amount = order_size * entry_price
-
-                                    self._reset_exit_adjustments(symbol)
-                                    position = 'short'
-                                    entry_time = timestamp
-                                    entry_rsi = prev1.get('RSI', None)  # 判定に使った直近確定バーの値を記録
-                                    entry_cci = prev1.get('CCI', None)
-                                    entry_sentiment = self.sentiment.copy() if hasattr(self, 'sentiment') else {}
-
-                                    # スコア類も prev1 から記録
-                                    entry_scores = {
-                                        'buy_score_scaled': prev1.get('buy_score_scaled', 0),
-                                        'sell_score_scaled': prev1.get('sell_score_scaled', 0),
-                                        'rsi_score_long': prev1.get('rsi_score_long', 0),
-                                        'rsi_score_short': prev1.get('rsi_score_short', 0),
-                                        'cci_score_long': prev1.get('cci_score_long', 0),
-                                        'cci_score_short': prev1.get('cci_score_short', 0),
-                                        'volume_score': prev1.get('volume_score', 0),
-                                        'bb_score_long': prev1.get('bb_score_long', 0),
-                                        'bb_score_short': prev1.get('bb_score_short', 0),
-                                        'ma_score_long': prev1.get('ma_score_long', 0),
-                                        'ma_score_short': prev1.get('ma_score_short', 0),
-                                        'adx_score_long': prev1.get('adx_score_long', 0),
-                                        'adx_score_short': prev1.get('adx_score_short', 0),
-                                        'mfi_score_long': prev1.get('mfi_score_long', 0),
-                                        'mfi_score_short': prev1.get('mfi_score_short', 0),
-                                        'atr_score_long': prev1.get('atr_score_long', 0),
-                                        'atr_score_short': prev1.get('atr_score_short', 0),
-                                        'macd_score_long': prev1.get('macd_score_long', 0),
-                                        'macd_score_short': prev1.get('macd_score_short', 0),
-                                        'ema_deviation': prev1.get('ema_deviation', 0),
-                                        'entry_atr': prev1.get('ATR', 0),
-                                        'entry_adx': prev1.get('ADX', 0)
-                                    }
-
-                                    with entry_sizes_lock:
-                                        self.entry_sizes[symbol] = order_size
-
-                                    with balance_lock:
-                                        balance_before_entry = total_balance
-                                        total_balance -= entry_amount
-                                        balance_after_entry = total_balance
-
-                                    self.log_entry(symbol, 'short', entry_price, entry_time, entry_rsi, entry_cci,
-                                                prev1.get('ATR', 0), prev1.get('ADX', 0), entry_sentiment)
-
-                                # ショートエントリー
-                                elif cond_short:
-                                    entry_price = price_open
-                                    if entry_price is None or entry_price <= 0:
-                                        continue
-
-                                    order_size = self.TRADE_SIZE / entry_price
-                                    order_size = self.adjust_order_size(symbol, order_size)
-                                    entry_amount = order_size * entry_price
-
-                                    self._reset_exit_adjustments(symbol)
-                                    position = 'long'
-                                    entry_time = timestamp
-                                    entry_rsi = prev1.get('RSI', None)
-                                    entry_cci = prev1.get('CCI', None)
-                                    entry_sentiment = self.sentiment.copy() if hasattr(self, 'sentiment') else {}
-
-                                    entry_scores = {
-                                        'buy_score_scaled': prev1.get('buy_score_scaled', 0),
-                                        'sell_score_scaled': prev1.get('sell_score_scaled', 0),
-                                        'rsi_score_long': prev1.get('rsi_score_long', 0),
-                                        'rsi_score_short': prev1.get('rsi_score_short', 0),
-                                        'cci_score_long': prev1.get('cci_score_long', 0),
-                                        'cci_score_short': prev1.get('cci_score_short', 0),
-                                        'volume_score': prev1.get('volume_score', 0),
-                                        'bb_score_long': prev1.get('bb_score_long', 0),
-                                        'bb_score_short': prev1.get('bb_score_short', 0),
-                                        'ma_score_long': prev1.get('ma_score_long', 0),
-                                        'ma_score_short': prev1.get('ma_score_short', 0),
-                                        'adx_score_long': prev1.get('adx_score_long', 0),
-                                        'adx_score_short': prev1.get('adx_score_short', 0),
-                                        'mfi_score_long': prev1.get('mfi_score_long', 0),
-                                        'mfi_score_short': prev1.get('mfi_score_short', 0),
-                                        'atr_score_long': prev1.get('atr_score_long', 0),
-                                        'atr_score_short': prev1.get('atr_score_short', 0),
-                                        'macd_score_long': prev1.get('macd_score_long', 0),
-                                        'macd_score_short': prev1.get('macd_score_short', 0),
-                                        'ema_deviation': prev1.get('ema_deviation', 0),
-                                        'entry_atr': prev1.get('ATR', 0),
-                                        'entry_adx': prev1.get('ADX', 0)
-                                    }
-
-                                    with entry_sizes_lock:
-                                        self.entry_sizes[symbol] = order_size
-
-                                    with balance_lock:
-                                        balance_before_entry = total_balance
-                                        total_balance -= entry_amount
-                                        balance_after_entry = total_balance
-
-                                    self.log_entry(symbol, 'long', entry_price, entry_time, entry_rsi, entry_cci,
-                                                prev1.get('ATR', 0), prev1.get('ADX', 0), entry_sentiment)
-
-                        # === イグジット判定 ===
-                        elif position == 'long':
-                            # 先読みを避けるため、利用可能なデータは i までに限定
-                            exit_levels = self.calculate_dynamic_exit_levels(symbol, df_5min.iloc[:i+1], 'long', entry_price)
-
-                            tp = exit_levels['take_profit_price']
-                            sl = exit_levels['stop_loss_price']
-                            price = price_close if price_close is not None else price_open
-
-                            # 旧仕様に合わせて「close 判定」のまま（OHLC貫通は別パッチで用意可能）
-                            do_exit = (price >= tp) or (price <= sl)
-                            if do_exit:
-                                exit_price = tp if price >= tp else sl
-                                profit = (exit_price - entry_price) / entry_price * self.TRADE_SIZE
-                                profit_pct = (exit_price - entry_price) / entry_price * 100.0
-
-                                entry_amount = order_size * entry_price
-                                exit_amount = order_size * exit_price
-
-                                with balance_lock:
-                                    balance_before_exit = total_balance
-                                    total_balance += exit_amount
-                                    balance_after_exit = total_balance
-
-                                # 保有時間
-                                if isinstance(timestamp, pd.Timestamp) and isinstance(entry_time, pd.Timestamp):
-                                    holding_time = timestamp - entry_time
-                                    hours = holding_time.total_seconds() / 3600.0
-                                else:
-                                    hours = 0.0
-
-                                exit_reason = "利益確定" if profit > 0 else "損切り"
-                                self.log_exit(symbol, 'long', exit_price, entry_price, timestamp, profit, profit_pct,
-                                            exit_reason, hours, entry_sentiment)
-
-                                buy5, sell5 = self._last5_flags_str(df_5min, i)
-
-                                trade_data = {
-                                    'symbol': symbol,
-                                    'type': 'long',
-                                    'entry_price': entry_price,
-                                    'entry_time': entry_time,
-                                    'entry_rsi': entry_rsi,
-                                    'entry_cci': entry_cci,
-                                    'entry_atr': entry_scores.get('entry_atr', 0),
-                                    'entry_adx': entry_scores.get('entry_adx', 0),
-                                    'buy_score': entry_scores.get('buy_score_scaled', 0),
-                                    'sell_score': entry_scores.get('sell_score_scaled', 0),
-                                    'exit_price': exit_price,
-                                    'exit_time': timestamp,
-                                    'size': order_size,
-                                    'entry_amount': entry_amount,
-                                    'balance_after_entry': balance_after_entry,
-                                    'balance_after_exit': balance_after_exit,
-                                    'profit': profit,
-                                    'profit_pct': profit_pct,
-                                    'exit_reason': exit_reason,
-                                    'holding_hours': hours,
-                                    'exit_buy_last5': buy5,
-                                    'exit_sell_last5': sell5,
-                                    'sentiment_bullish': entry_sentiment.get('bullish', 0),
-                                    'sentiment_bearish': entry_sentiment.get('bearish', 0),
-                                    'sentiment_volatility': entry_sentiment.get('volatility', 0),
-                                    'rsi_score_long': entry_scores.get('rsi_score_long', 0),
-                                    'rsi_score_short': entry_scores.get('rsi_score_short', 0),
-                                    'cci_score_long': entry_scores.get('cci_score_long', 0),
-                                    'cci_score_short': entry_scores.get('cci_score_short', 0),
-                                    'volume_score': entry_scores.get('volume_score', 0),
-                                    'bb_score_long': entry_scores.get('bb_score_long', 0),
-                                    'bb_score_short': entry_scores.get('bb_score_short', 0),
-                                    'ma_score_long': entry_scores.get('ma_score_long', 0),
-                                    'ma_score_short': entry_scores.get('ma_score_short', 0),
-                                    'adx_score_long': entry_scores.get('adx_score_long', 0),
-                                    'adx_score_short': entry_scores.get('adx_score_short', 0),
-                                    'mfi_score_long': entry_scores.get('mfi_score_long', 0),
-                                    'mfi_score_short': entry_scores.get('mfi_score_short', 0),
-                                    'atr_score_long': entry_scores.get('atr_score_long', 0),
-                                    'atr_score_short': entry_scores.get('atr_score_short', 0),
-                                    'macd_score_long': entry_scores.get('macd_score_long', 0),
-                                    'macd_score_short': entry_scores.get('macd_score_short', 0),
-                                    'ema_deviation': entry_scores.get('ema_deviation', 0)
-                                }
-                                thread_trade_logs.append(trade_data)
-
-                                # 統計更新
-                                symbol_profit += profit
-                                long_profit += profit
-                                total_trades += 1
-                                long_trades += 1
-                                wins += (profit > 0)
-                                long_wins += (profit > 0)
-
-                                # リセット
-                                position = None
-                                entry_scores = {}
-
-                                # 実運用同等：次の15分足始値まで再エントリー禁止
-                                ts = pd.to_datetime(timestamp)
-                                reentry_block_until = ts.floor('15min') + pd.Timedelta(minutes=15)
-
-                        elif position == 'short':
-                            exit_levels = self.calculate_dynamic_exit_levels(symbol, df_5min.iloc[:i+1], 'short', entry_price)
-
-                            tp = exit_levels['take_profit_price']
-                            sl = exit_levels['stop_loss_price']
-                            price = price_close if price_close is not None else price_open
-
-                            do_exit = (price <= tp) or (price >= sl)
-                            if do_exit:
-                                exit_price = tp if price <= tp else sl
-                                profit = (entry_price - exit_price) / entry_price * self.TRADE_SIZE
-                                profit_pct = (entry_price - exit_price) / entry_price * 100.0
-
-                                entry_amount = order_size * entry_price
-
-                                with balance_lock:
-                                    balance_before_exit = total_balance
-                                    # 既存仕様：ショートは entry_amount + profit を現金側に反映
-                                    total_balance += (entry_amount + profit)
-                                    balance_after_exit = total_balance
-
-                                if isinstance(timestamp, pd.Timestamp) and isinstance(entry_time, pd.Timestamp):
-                                    holding_time = timestamp - entry_time
-                                    hours = holding_time.total_seconds() / 3600.0
-                                else:
-                                    hours = 0.0
-
-                                exit_reason = "利益確定" if profit > 0 else "損切り"
-                                self.log_exit(symbol, 'short', exit_price, entry_price, timestamp, profit, profit_pct,
-                                            exit_reason, hours, entry_sentiment)
-
-                                buy5, sell5 = self._last5_flags_str(df_5min, i)
-
-                                trade_data = {
-                                    'symbol': symbol,
-                                    'type': 'short',
-                                    'entry_price': entry_price,
-                                    'entry_time': entry_time,
-                                    'entry_rsi': entry_rsi,
-                                    'entry_cci': entry_cci,
-                                    'entry_atr': entry_scores.get('entry_atr', 0),
-                                    'entry_adx': entry_scores.get('entry_adx', 0),
-                                    'buy_score': entry_scores.get('buy_score_scaled', 0),
-                                    'sell_score': entry_scores.get('sell_score_scaled', 0),
-                                    'exit_price': exit_price,
-                                    'exit_time': timestamp,
-                                    'size': order_size,
-                                    'entry_amount': entry_amount,
-                                    'balance_after_entry': balance_after_entry,
-                                    'balance_after_exit': balance_after_exit,
-                                    'profit': profit,
-                                    'profit_pct': profit_pct,
-                                    'exit_reason': exit_reason,
-                                    'holding_hours': hours,
-                                    'exit_buy_last5': buy5,
-                                    'exit_sell_last5': sell5,
-                                    'sentiment_bullish': entry_sentiment.get('bullish', 0),
-                                    'sentiment_bearish': entry_sentiment.get('bearish', 0),
-                                    'sentiment_volatility': entry_sentiment.get('volatility', 0),
-                                    'rsi_score_long': entry_scores.get('rsi_score_long', 0),
-                                    'rsi_score_short': entry_scores.get('rsi_score_short', 0),
-                                    'cci_score_long': entry_scores.get('cci_score_long', 0),
-                                    'cci_score_short': entry_scores.get('cci_score_short', 0),
-                                    'volume_score': entry_scores.get('volume_score', 0),
-                                    'bb_score_long': entry_scores.get('bb_score_long', 0),
-                                    'bb_score_short': entry_scores.get('bb_score_short', 0),
-                                    'ma_score_long': entry_scores.get('ma_score_long', 0),
-                                    'ma_score_short': entry_scores.get('ma_score_short', 0),
-                                    'adx_score_long': entry_scores.get('adx_score_long', 0),
-                                    'adx_score_short': entry_scores.get('adx_score_short', 0),
-                                    'mfi_score_long': entry_scores.get('mfi_score_long', 0),
-                                    'mfi_score_short': entry_scores.get('mfi_score_short', 0),
-                                    'atr_score_long': entry_scores.get('atr_score_long', 0),
-                                    'atr_score_short': entry_scores.get('atr_score_short', 0),
-                                    'macd_score_long': entry_scores.get('macd_score_long', 0),
-                                    'macd_score_short': entry_scores.get('macd_score_short', 0),
-                                    'ema_deviation': entry_scores.get('ema_deviation', 0)
-                                }
-                                thread_trade_logs.append(trade_data)
-
-                                # 統計更新
-                                symbol_profit += profit
-                                short_profit += profit
-                                total_trades += 1
-                                short_trades += 1
-                                wins += (profit > 0)
-                                short_wins += (profit > 0)
-
-                                position = None
-                                entry_scores = {}
-
-                                # 実運用同等：次の15分足始値まで再エントリー禁止
-                                ts = pd.to_datetime(timestamp)
-                                reentry_block_until = ts.floor('15min') + pd.Timedelta(minutes=15)
-
-                except Exception as e:
-                    self.logger.error(f"{date_str}の{symbol}バックテスト中にエラー: {e}")
-                    continue
+            # 最終足での強制決済はしない。残建玉は最終観測終値でgross評価する。
+            open_position = None
+            unrealized_profit = 0.0
+            reserved_capital = 0.0
+            mark_row = df_5min.iloc[-1]
+            mark_time = (mark_row['timestamp'] + pd.Timedelta(minutes=15)).isoformat()
+            if position is not None:
+                mark_price = float(mark_row['close'])
+                direction = 1 if position == 'long' else -1
+                unrealized_profit = float(direction * order_size * (mark_price - entry_price))
+                reserved_capital = float(order_size * entry_price)
+                open_position = {
+                    'side': position,
+                    'size': float(order_size),
+                    'entry_price': float(entry_price),
+                    'entry_time': pd.Timestamp(entry_time).isoformat(),
+                    'mark_price': mark_price,
+                    'mark_time': mark_time,
+                    'unrealized_profit': unrealized_profit,
+                    'reserved_capital': reserved_capital,
+                }
+            valuation = {
+                'open_position': open_position,
+                'unrealized_profit': unrealized_profit,
+                'reserved_capital': reserved_capital,
+                'valuation_time': mark_time,
+                'processed_bars': int(selected.sum()),
+            }
 
             # スレッドローカルの取引ログをグローバルに統合
             with trade_logs_lock:
@@ -5830,6 +5795,7 @@ class CryptoTradingBot(LiveExecutionMixin):
                 self.logger.info(f"・トータル利益: {symbol_profit:.2f} 円（ロング: {long_profit:.2f}円、ショート: {short_profit:.2f}円）")
 
                 return {
+                    **valuation,
                     'trades': total_trades,
                     'win_rate': win_rate,
                     'avg_profit': avg_profit,
@@ -5843,19 +5809,27 @@ class CryptoTradingBot(LiveExecutionMixin):
                 }
             else:
                 self.logger.info("😅 トレードが発生しませんでした")
-                return {'trades': 0}
+                return {**valuation, 'trades': 0, 'symbol_profit': 0.0, 'long_profit': 0.0, 'short_profit': 0.0}
 
-        # ===== マルチスレッディングでバックテストを並列実行 =====
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        with ThreadPoolExecutor() as executor:
-            futures = {executor.submit(run_backtest, symbol): symbol for symbol in self.symbols}
-            for future in as_completed(futures):
-                symbol = futures[future]
+        # 全銘柄の観測時刻を一列にする。同時刻は決済→新規、銘柄名順で決定的に処理する。
+        streams = {symbol: run_backtest(symbol) for symbol in sorted(self.symbols)}
+        pending_events = []
+        try:
+            for symbol, stream in streams.items():
+                at, priority = next(stream)
+                heapq.heappush(pending_events, (at, priority, symbol))
+            while pending_events:
+                _, _, symbol = heapq.heappop(pending_events)
                 try:
-                    result = future.result()
-                    results[symbol] = result
-                except Exception as e:
-                    self.logger.error(f"{symbol}のバックテスト中にエラー: {e}")
+                    at, priority = next(streams[symbol])
+                except StopIteration as finished:
+                    results[symbol] = finished.value
+                else:
+                    heapq.heappush(pending_events, (at, priority, symbol))
+        finally:
+            for stream in streams.values():
+                stream.close()
+        trade_logs.sort(key=lambda trade: (trade['exit_time'], trade['symbol']))
 
         # 取引詳細の最終サマリー出力
         self.output_trade_summary(trade_logs)
@@ -5877,8 +5851,9 @@ class CryptoTradingBot(LiveExecutionMixin):
 
         # Excelファイルに取引ログを保存
         if trade_logs:
+            excel_trade_logs, excel_signal_history = excel_backtest_inputs(trade_logs, signal_history)
             try:
-                self.save_trade_logs_to_excel(trade_logs, signal_history)  # ← 変更点：signal_history を渡す
+                self.save_trade_logs_to_excel(excel_trade_logs, excel_signal_history)
             except Exception as e:
                 self.logger.error(f"取引ログExcelの保存に失敗: {e}")
 
@@ -5887,6 +5862,27 @@ class CryptoTradingBot(LiveExecutionMixin):
         self.logger.info(f"\n=== バックテスト全体結果 ===")
         self.logger.info(f"・バックテスト収益: {backtest_profit:,.2f} 円")
 
+        self._backtest_summary = {
+            "valuation_method": "last_available_close_gross",
+            "decision_version": DECISION_VERSION,
+            "feature_history": feature_history_spec(),
+            "execution_model": "15min_ohlc_market_close_proxy",
+            "account_model": "chronological_1x_notional_reservation",
+            "ending_available_cash": float(total_balance),
+            "live_equivalent": False,
+            "limitations": ["intrabar_quotes_unavailable", "historical_sr_not_replayed", "exchange_rules_and_costs_not_replayed"],
+
+            "costs_included": False,
+            "realized_profit": float(backtest_profit),
+            "unrealized_profit": sum(r["unrealized_profit"] for r in results.values()),
+            "reserved_capital": sum(r["reserved_capital"] for r in results.values()),
+        }
+        self.logger.info(
+            "・未決済評価損益（最終観測終値・費用控除前）: %.2f 円、拘束元本: %.2f 円",
+            self._backtest_summary["unrealized_profit"],
+            self._backtest_summary["reserved_capital"],
+        )
+
         # バックテスト結果をファイルに保存
         self.save_backtest_result(results, days_to_test, start_profit)
 
@@ -5894,7 +5890,7 @@ class CryptoTradingBot(LiveExecutionMixin):
         if trade_logs:
             self.logger.info("Excel評価レポートを生成中...")
             try:
-                excel_report_path = self._generate_excel_report_from_trade_logs(trade_logs, days_to_test)
+                excel_report_path = self._generate_excel_report_from_trade_logs(excel_trade_logs, days_to_test)
                 if excel_report_path:
                     self.logger.info(f"Excel評価レポートが生成されました: {excel_report_path}")
                     # OSごとの自動オープン（失敗しても致命ではない）
@@ -6327,13 +6323,22 @@ class CryptoTradingBot(LiveExecutionMixin):
     def save_backtest_result(self, results, days_to_test, start_profit):
         """バックテスト結果をJSONファイルに保存"""
         backtest_profit = self.total_profit - start_profit
+        period = getattr(self, '_backtest_period', None)
+        if period:
+            start_date = pd.Timestamp(period['start']).date().isoformat()
+            end_date = (pd.Timestamp(period['end_exclusive']) - pd.Timedelta(days=1)).date().isoformat()
+        else:
+            start_date = (now_jst() - timedelta(days=days_to_test)).strftime("%Y-%m-%d")
+            end_date = now_jst().strftime("%Y-%m-%d")
         backtest_result_file = os.path.join(self.log_dir, f'backtest_result_{now_jst().strftime("%Y%m%d_%H%M%S")}.json')
         try:
             with open(backtest_result_file, 'w') as f:
                 json.dump({
-                    'start_date': (now_jst() - timedelta(days=days_to_test)).strftime("%Y-%m-%d"),
-                    'end_date': now_jst().strftime("%Y-%m-%d"),
+                    'start_date': start_date,
+                    'end_date': end_date,
                     'days_tested': days_to_test,
+                    'period': period,
+                    'valuation': getattr(self, '_backtest_summary', None),
                     'scoring': {'macd': macd_scoring_spec()},
                     'total_profit': backtest_profit,
                     'results': {k: {kk: float(vv) if isinstance(vv, (int, float)) else vv 
@@ -6353,6 +6358,13 @@ class CryptoTradingBot(LiveExecutionMixin):
         - 詳細なレポート生成と監視
         """
         self.logger.info("=== 本番環境最適化版リアルタイムトレーディング開始 ===")
+        self._record_inputs = True
+        record_bot_event(self, 'runtime_start', {
+            'positions': self.positions, 'entry_prices': self.entry_prices,
+            'entry_times': self.entry_times, 'entry_sizes': self.entry_sizes,
+            'short_profit_lock_armed': self.short_profit_lock_armed,
+            'reentry_block_until': self.reentry_block_until,
+        }, now_jst())
     
         # 初期化
         start_date = now_jst()
@@ -6485,28 +6497,15 @@ class CryptoTradingBot(LiveExecutionMixin):
                     self._display_current_positions()
                         
                     # 各通貨ペアを順番に処理（バックテストと同様、同期処理にして確実性を高める）
-                    for symbol in self.symbols:
+                    for symbol in sorted(self.symbols, key=lambda item: symbol_priority(item, self.positions.get(item))):
                         try:
                             self.logger.info(f"\n{symbol}の分析開始...")
                             
                             # データ取得（バックテストと同じデータ取得方法を使用）
-                            df_5min, df_hourly = self._get_market_data(symbol)
-                            if df_5min is None or df_hourly is None:
+                            df_5min, df_hourly = self._prepare_live_inputs(symbol, stats, trade_logs)
+                            if df_5min is None:
                                 continue
-                            
-                            # 特徴量計算
-                            df_5min = self.build_features(df_5min)
-                            df_hourly = self.build_features(df_hourly)
-                            
-                            # 処理中のDataFrameを一時的に保存 - バックテストと同様
                             self.df_5min = df_5min
-                            
-                            # シグナル生成（センチメント考慮版）
-                            df_5min = self.generate_signals_with_sentiment(symbol, df_5min, df_hourly)
-
-                            df_5min = df_5min.sort_values('timestamp').reset_index(drop=True)
-                            if len(df_5min) > 96:
-                                df_5min = df_5min.iloc[-96:].copy().reset_index(drop=True)
 
                             self._store_recent_candles(symbol, df_5min, df_hourly)
 
@@ -6529,27 +6528,12 @@ class CryptoTradingBot(LiveExecutionMixin):
                             
                             # ポジションがない場合のエントリー判断
                             if position is None:
-                                # ★ ここから追加: 再エントリー解禁時刻のチェック
-                                unlock_time = self.reentry_block_until.get(symbol)
-                                if unlock_time is not None and now_jst() < unlock_time:
-                                    remain = (unlock_time - now_jst()).total_seconds()
-                                    self.logger.info(
-                                        f"{symbol}: 決済直後のクールダウン中（次の15分足待ち）。残り {remain:.0f} 秒は新規エントリー判定をスキップ"
-                                    )
-                                    # このシンボルの残処理をスキップ
-                                    continue
+                                decision_at = now_jst()
+                                direction = self._entry_direction(symbol, latest_signals, previous_signals, decision_at)
+                                if direction is not None:
+                                    self._handle_entry(symbol, direction, latest_signals, stats, trade_logs)
+                                    self.reentry_block_until[symbol] = None
 
-                                else:
-                                    # 解禁済みなら通常のエントリー判定
-                                    if latest_signals.get('buy_signal', False) and previous_signals.get('buy_signal', False):
-                                        self._handle_entry(symbol, 'short', latest_signals, stats, trade_logs)
-                                        # エントリーできたのでブロック情報は不要
-                                        self.reentry_block_until[symbol] = None
-                                    elif latest_signals.get('sell_signal', False) and previous_signals.get('sell_signal', False):
-                                        self._handle_entry(symbol, 'long', latest_signals, stats, trade_logs)
-                                        self.reentry_block_until[symbol] = None
-
-                            
                             # ポジションがある場合のイグジット判断
                             elif position is not None:
                                 self._check_exit_conditions(symbol, stats, trade_logs, df_5min)
@@ -6559,6 +6543,7 @@ class CryptoTradingBot(LiveExecutionMixin):
                                 del self.df_5min
                             
                         except Exception as e:
+                            record_bot_event(self, 'input_error', {'symbol': symbol, 'source': 'symbol_processing', 'error_type': type(e).__name__}, now_jst())
                             self.logger.error(f"{symbol}の処理中にエラーが発生: {str(e)}", exc_info=True)
                             error_states['error_log'].append(f"{now_jst()}: {symbol}処理エラー - {str(e)}")
                             continue
@@ -6666,6 +6651,7 @@ class CryptoTradingBot(LiveExecutionMixin):
             self.logger.info("キーボード割り込みを受け取りました。プログラムを安全に終了します。")
         
         finally:
+            close_recorder(self)
             self.is_backtest = False
             # 稼働状況のレポートを出力
             self._generate_final_report(start_date, start_balance, stats, trade_logs)
@@ -6752,29 +6738,51 @@ class CryptoTradingBot(LiveExecutionMixin):
         if not has_positions:
             self.logger.info("現在ポジションはありません")
 
+    def _prepare_live_inputs(self, symbol, stats, trade_logs):
+        """Data failures block entries while quote-based position protection continues."""
+        feature_at = now_jst()
+        try:
+            raw15, raw60 = self._get_market_data(symbol)
+            feature_at = now_jst()
+            quality = entry_input_quality(raw15, raw60, feature_at)
+            if quality['ready']:
+                signals, hours = prepare_strategy_inputs(self, symbol, raw15, raw60, feature_at)
+                if len(signals) >= 3:
+                    getattr(self, '_market_quality_state', {}).pop(symbol, None)
+                    return signals, hours
+                quality = {'ready': False, 'reason': 'insufficient_features'}
+        except Exception as exc:
+            quality = {'ready': False, 'reason': 'input_exception', 'error_type': type(exc).__name__}
+        record_bot_event(self, 'input_error', {'symbol': symbol, 'source': 'candles', **quality}, feature_at)
+        if not hasattr(self, '_market_quality_state'):
+            self._market_quality_state = {}
+        if self._market_quality_state.get(symbol) != quality['reason']:
+            self.logger.warning('%s: entry data unavailable (%s); retaining position monitoring', symbol, quality['reason'])
+            self._market_quality_state[symbol] = quality['reason']
+        if self.positions.get(symbol):
+            self._check_exit_conditions(symbol, stats, trade_logs, pd.DataFrame())
+        return None, None
+
     def _get_market_data(self, symbol):
         """
-        市場データを取得する（15分足: 前日＋当日＋必要に応じて前々日を結合し、timestampで一意化）
-        ※ここでは「96本へのトリムは行わない」。この後段（build_features → シグナル判定の後）で
-        バックテストと同じタイミングでトリムする想定。
+        JSTで前々日0時からの共通履歴を確保するため、最大4つのAPI日付を取得する。
+        timestampで一意化し、後段のprepare_strategy_inputsで観測時刻と履歴範囲を制限する。
 
         Returns:
             tuple[pd.DataFrame, pd.DataFrame]: (15分足データ, 1時間足データ)
-                - 15分足: timestampでソート・重複排除済み
-                - 1時間足: 直近3日を結合、timestampでソート・重複排除済み
+                - 15分足・1時間足: timestampでソート・重複排除済み
             取得不能時は (None, None)
         """
         try:
             current_date = now_jst()
+            api_dates = candle_api_dates(current_date)
 
             # ========= 15分足（直近最大3日分を結合 → ソート → 重複排除。ここではトリムしない） =========
-            self.logger.info(f"{symbol}の15分足データ取得を開始します（前日＋当日＋必要に応じて前々日を結合）")
+            self.logger.info(f"{symbol}の15分足データ取得を開始します（JST共通履歴用に最大4API日付を結合）")
 
             fifteen_parts = []
-            for day_offset in (1, 0, 2):  # 優先順: 前日 → 当日 → 前々日（不足時の補完）
-                d = current_date - timedelta(days=day_offset)
-                dstr = d.strftime('%Y%m%d')
-                df_day = self.get_cached_data(symbol, '15min', dstr)
+            for dstr in api_dates:
+                df_day = self.get_cached_data(symbol, '15min', dstr, fallback_days=0)
                 if df_day is None or df_day.empty:
                     continue
 
@@ -6806,10 +6814,8 @@ class CryptoTradingBot(LiveExecutionMixin):
 
             # ========= 1時間足（直近3日分を結合 → ソート → 重複排除） =========
             hourly_parts = []
-            for h_offset in range(2, -1, -1):
-                d = current_date - timedelta(days=h_offset)
-                dstr = d.strftime('%Y%m%d')
-                df_h = self.get_cached_data(symbol, '1hour', dstr)
+            for dstr in api_dates:
+                df_h = self.get_cached_data(symbol, '1hour', dstr, fallback_days=0)
                 if df_h is None or df_h.empty:
                     continue
 
@@ -6968,6 +6974,10 @@ class CryptoTradingBot(LiveExecutionMixin):
             min_strength=float(cfg["min_strength"]),
             limit=int(cfg["limit"]),
         )
+        record_bot_event(self, 'sr_snapshot', {
+            'symbol': symbol, 'purpose': 'entry', 'config': cfg,
+            'zones': [{key: zone.get(key) for key in ('zone_type', 'price_low', 'price_high', 'strength', 'touches', 'last_touched_at')} for zone in (zones or [])],
+        }, now_jst())
 
         if not zones:
             return False, ""
@@ -7375,65 +7385,80 @@ class CryptoTradingBot(LiveExecutionMixin):
 
     def _ceil_to_next_15min(self, ts):
         """ts の次の15分境界（:00/:15/:30/:45 の“次”）を返す"""
-        ts = ts.replace(second=0, microsecond=0)
-        add = 15 - (ts.minute % 15)
-        if add == 0:
-            add = 15
-        return ts + timedelta(minutes=add)
+        return next_entry_time(ts).to_pydatetime()
+
+    def _entry_direction(self, symbol, latest, previous, observed_at):
+        blocked_until = self.reentry_block_until.get(symbol)
+        direction = entry_side(latest, previous, observed_at, blocked_until)
+        record_bot_event(self, 'entry_decision', {
+            'symbol': symbol, 'latest': latest.to_dict(), 'previous': previous.to_dict(),
+            'blocked_until': blocked_until, 'direction': direction,
+        }, observed_at)
+        return direction
 
     def _apply_short_profit_lock(
-        self,
-        symbol: str,
-        position: str,
-        entry_price: float,
-        current_price: float,
-        stop_loss_price: float,
+        self, symbol: str, position: str, entry_price: float,
+        current_price: float, stop_loss_price: float,
     ) -> float:
-        """
-        Short利益保護 V1。
+        """同じ状態遷移をlive/paper/backtestで使い、永続化だけを分離する。"""
+        if not hasattr(self, 'short_profit_lock_armed'):
+            self.short_profit_lock_armed = {}
+        previous = self.short_profit_lock_armed.get(symbol, False)
+        stop, armed = short_profit_stop(
+            position, entry_price, current_price, stop_loss_price, previous,
+            getattr(self, 'SHORT_PROFIT_LOCK_TRIGGER_PCT', 0.75),
+            getattr(self, 'SHORT_PROFIT_LOCK_LEVEL_PCT', 0.25),
+        )
+        self.short_profit_lock_armed[symbol] = armed
+        if armed and not previous:
+            self.logger.info("%s: Short利益保護ON", symbol)
+            if not getattr(self, 'is_backtest', False):
+                self.save_positions()
+        return stop
 
-        Shortが一度でも +0.75% の含み益に到達したら、
-        以降は最低 +0.25% の利益を確保する位置までSLを引き下げる。
-        TPおよびLongには影響させない。
-        """
-        if position != "short":
-            return stop_loss_price
-        if entry_price <= 0 or current_price <= 0:
-            return stop_loss_price
-
-        self.short_profit_lock_armed.setdefault(symbol, False)
-
-        current_profit_pct = (entry_price - current_price) / entry_price * 100.0
-
-        if (
-            not self.short_profit_lock_armed[symbol]
-            and current_profit_pct >= self.SHORT_PROFIT_LOCK_TRIGGER_PCT
-        ):
-            self.short_profit_lock_armed[symbol] = True
-            self.logger.info(
-                f"{symbol}: Short利益保護ON "
-                f"(含み益={current_profit_pct:.2f}%, "
-                f"trigger={self.SHORT_PROFIT_LOCK_TRIGGER_PCT:.2f}%)"
-            )
-            # 再起動後もarmed状態を維持する
-            self.save_positions()
-
-        if self.short_profit_lock_armed[symbol]:
-            locked_sl_price = entry_price * (
-                1.0 - self.SHORT_PROFIT_LOCK_LEVEL_PCT / 100.0
-            )
-            original_sl = stop_loss_price
-            # ShortではSL価格を低くするほど利益を確保できる
-            stop_loss_price = min(stop_loss_price, locked_sl_price)
-
-            self.logger.debug(
-                f"{symbol}: Short利益保護SL "
-                f"original={original_sl:.8f}, "
-                f"locked={locked_sl_price:.8f}, "
-                f"applied={stop_loss_price:.8f}"
-            )
-
-        return stop_loss_price
+    def _evaluate_exit_event(
+        self, symbol, df_5min, position, entry_price, entry_time,
+        observed_at, current_price, levels=None,
+    ):
+        """入力の観測時刻・価格・建玉だけで決済意図を決める共通経路。"""
+        observed_at = jst_timestamp(observed_at)
+        entry_time = jst_timestamp(entry_time)
+        if observed_at < entry_time:
+            raise ValueError('Exit observation precedes position entry')
+        if levels is None:
+            levels = self.calculate_dynamic_exit_levels(symbol, df_5min, position, entry_price)
+        tp = float(levels['take_profit_price'])
+        base_sl = float(levels['stop_loss_price'])
+        armed_before = self.short_profit_lock_armed.get(symbol, False)
+        sl = self._apply_short_profit_lock(
+            symbol=symbol, position=position, entry_price=float(entry_price),
+            current_price=float(current_price or 0), stop_loss_price=base_sl,
+        )
+        last = df_5min.iloc[-1] if len(df_5min) else None
+        high = last.get('high') if last is not None else None
+        low = last.get('low') if last is not None else None
+        # 建玉前の同一足高安は、その建玉が到達した価格として利用しない。
+        if last is not None and last.get('timestamp') is not None:
+            if entry_time > jst_timestamp(last['timestamp']):
+                high = low = current_price
+        inputs = dict(
+            side=position, take_profit=tp, base_stop=base_sl, stop_loss=sl,
+            current_price=current_price, high=high, low=low,
+            holding_hours=(observed_at - entry_time).total_seconds() / 3600,
+            profit_lock_armed=self.short_profit_lock_armed.get(symbol, False),
+        )
+        decision = exit_decision(**inputs)
+        record_bot_event(self, 'exit_decision', {
+            'symbol': symbol, 'inputs': inputs,
+            'short_lock_input': {
+                'side': position, 'entry_price': entry_price, 'current_price': current_price,
+                'stop': base_sl, 'armed': armed_before,
+                'trigger': getattr(self, 'SHORT_PROFIT_LOCK_TRIGGER_PCT', 0.75),
+                'level': getattr(self, 'SHORT_PROFIT_LOCK_LEVEL_PCT', 0.25),
+            },
+            'expected': decision,
+        }, observed_at)
+        return decision
 
     def _check_exit_conditions(self, symbol, stats, trade_logs, df_5min):
         """イグジット条件をチェックし、必要に応じて決済を実行する（backtest関数と整合性あり）
@@ -7458,113 +7483,35 @@ class CryptoTradingBot(LiveExecutionMixin):
             self.entry_times[symbol] = entry_time
 
         entry_size = self.entry_sizes[symbol]
-        
-        # 保有時間の計算
-        holding_time = now_jst() - entry_time
-        hours = holding_time.total_seconds() / 3600
-        
-        # イグジット条件の計算
-        exit_condition = False
-        exit_reason = ""
-
-        # --- ここから判定ブロック置き換え（指値なし・バー内タッチ検出） ---
-        exit_levels = self.calculate_dynamic_exit_levels(symbol, df_5min, position, entry_price)
-        take_profit_price = float(exit_levels['take_profit_price'])
-        stop_loss_price   = float(exit_levels['stop_loss_price'])
-        base_stop_loss_price = stop_loss_price
-
-        # 現在値（通知や近接判定に使うだけ）
         current_price = self.get_current_price(symbol)
-
-        # Short利益保護: +0.75%到達後は最低+0.25%を確保
-        stop_loss_price = self._apply_short_profit_lock(
-            symbol=symbol,
-            position=position,
-            entry_price=float(entry_price),
-            current_price=float(current_price or 0.0),
-            stop_loss_price=float(stop_loss_price),
+        observed_at = now_jst()
+        decision = self._evaluate_exit_event(
+            symbol, df_5min, position, entry_price, entry_time, observed_at, current_price
         )
-
-        # 最新5分バーの高値・安値で「一瞬タッチ」を検出
-        last_bar = df_5min.iloc[-1] if len(df_5min) > 0 else None
-        bar_high = float(last_bar['high']) if last_bar is not None else None
-        bar_low  = float(last_bar['low'])  if last_bar is not None else None
-
-        exit_condition = False
-        exit_reason = ""
-
-        profit_lock_touch = False
-        base_sl_touch = False
-
-        if position == 'long':
-            # Longは既存ロジックを変更しない
-            tp_touch = (bar_high is not None and bar_high >= take_profit_price)
-            base_sl_touch = (bar_low is not None and bar_low <= base_stop_loss_price)
-            sl_touch = base_sl_touch
-        else:  # short
-            tp_touch = (bar_low is not None and bar_low <= take_profit_price)
-            # 既存SLは従来どおりバー高値で取りこぼしを検知する
-            base_sl_touch = (bar_high is not None and bar_high >= base_stop_loss_price)
-            # 利益保護SLは「armed前の同一バー高値」で誤決済しないよう現在価格で判定する
-            profit_lock_touch = bool(
-                self.short_profit_lock_armed.get(symbol, False)
-                and stop_loss_price < base_stop_loss_price
-                and current_price
-                and current_price >= stop_loss_price
-            )
-            sl_touch = base_sl_touch or profit_lock_touch
-
-        if tp_touch or sl_touch:
-            exit_condition = True
-            if tp_touch:
-                exit_reason = "利益確定"
-            elif profit_lock_touch and not base_sl_touch:
-                exit_reason = "利益保護"
-            else:
-                exit_reason = "損切り"
-        else:
-            # バー更新タイミングの取りこぼし対策として、近接時だけ短時間の高頻度再確認（任意）
-            # 例: 0.05% 以内に近づいたら最大3秒 100ms間隔で current_price を再チェック
-            band = 0.0005  # 0.05%
-            near = False
-            if current_price:
-                if position == 'long':
-                    near = (abs(current_price - take_profit_price) <= take_profit_price * band) or \
-                        (abs(current_price - stop_loss_price)   <= stop_loss_price   * band)
-                else:
-                    near = (abs(current_price - take_profit_price) <= take_profit_price * band) or \
-                        (abs(current_price - stop_loss_price)   <= stop_loss_price   * band)
+        # 近接時の価格観測も、同じ判定関数へ入れる。閾値での架空約定はしない。
+        if decision.reason is None and current_price:
+            band = 0.0005
+            near = any(abs(float(current_price) - level) <= level * band
+                       for level in (decision.take_profit, decision.stop_loss))
             if near:
                 deadline = time.time() + 3.0
-                while time.time() < deadline and not exit_condition:
-                    cp = self.get_current_price(symbol) or current_price
-                    if position == 'long':
-                        if cp >= take_profit_price or cp <= stop_loss_price:
-                            exit_condition = True
-                            exit_reason = "利益確定" if cp >= take_profit_price else "損切り"
-                    else:
-                        if cp <= take_profit_price or cp >= stop_loss_price:
-                            exit_condition = True
-                            if cp <= take_profit_price:
-                                exit_reason = "利益確定"
-                            elif (
-                                self.short_profit_lock_armed.get(symbol, False)
-                                and stop_loss_price < entry_price
-                            ):
-                                exit_reason = "利益保護"
-                            else:
-                                exit_reason = "損切り"
-                    if not exit_condition:
+                levels = {'take_profit_price': decision.take_profit, 'stop_loss_price': decision.base_stop}
+                while time.time() < deadline and decision.reason is None:
+                    current_price = self.get_current_price(symbol) or current_price
+                    decision = self._evaluate_exit_event(
+                        symbol, df_5min, position, entry_price, entry_time,
+                        now_jst(), current_price, levels=levels,
+                    )
+                    if decision.reason is None:
                         time.sleep(0.1)
-        
-        # 長時間保有の処理（48時間以上で警告、72時間以上で強制決済）- これはlive固有の機能
-        if hours >= 72:
-            self.logger.warning(f"{symbol}のポジションが72時間以上保有されています。強制決済します。")
-            exit_condition = True
-            exit_reason = "長時間保有による強制決済"
-        elif hours >= 48:
-            self.logger.warning(f"{symbol}のポジションが48時間以上保有されています。監視を強化してください。")
-        
+        hours = decision.holding_hours
+        take_profit_price = decision.take_profit
+        stop_loss_price = decision.stop_loss
+        if hours >= 48:
+            self.logger.warning("%s: ポジション保有時間 %.2f時間", symbol, hours)
+        exit_condition = decision.reason is not None
+        exit_reason = decision.reason or ''
+
         # イグジット条件を満たしている場合
         if exit_condition:
             if self.exchange_settings_gmo.get("live_trade", False):
@@ -8358,6 +8305,10 @@ class CryptoTradingBot(LiveExecutionMixin):
             min_strength=float(cfg["min_strength_fallback"]),
             limit=int(cfg["limit"]),
         ) or []
+        record_bot_event(self, 'sr_snapshot', {
+            'symbol': symbol, 'purpose': 'exit', 'config': cfg,
+            'zones': [{key: zone.get(key) for key in ('zone_type', 'price_low', 'price_high', 'strength', 'touches', 'last_touched_at')} for zone in (zones or [])],
+        }, now_jst())
 
         def _strength(z) -> float:
             try:

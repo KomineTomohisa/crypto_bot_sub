@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import os
 import time
+from strategy_recording import record_bot_event
 
 from trading_execution import (
     ExchangeGateway,
@@ -46,23 +47,33 @@ class LiveExecutionMixin:
         service = self._execution()
         if service.store.pending(service.account):
             # An unconfirmed account order may already have consumed margin.
+            record_bot_event(self, "funds_blocked", {"symbol": symbol, "reason": "pending_order"})
             return False
         quantity, rule = self._live_order_size(symbol, size)
         response = self.gmo_api._public_request(
             "/v1/ticker", {"symbol": self.symbol_mapping[symbol]}
         )
         if response.get("status") != 0:
+            record_bot_event(self, "funds_blocked", {"symbol": symbol, "reason": "ticker_status", "status": response.get("status")})
             return False
         row = next(
             r for r in response["data"] if r["symbol"] == self.symbol_mapping[symbol]
         )
         age = (datetime.now(timezone.utc) - timestamp(row["timestamp"])).total_seconds()
         if not 0 <= age <= 90:
+            record_bot_event(self, "funds_blocked", {"symbol": symbol, "reason": "stale_ticker", "timestamp": row.get("timestamp"), "age_seconds": age})
             return False
         price = decimal(row["ask"] if side == "buy" else row["bid"], positive=True)
         leverage = decimal(os.getenv("GMO_MARGIN_LEVERAGE", "1"), positive=True)
         required = required_margin(quantity, price, leverage, rule["takerFee"])
         margin = service.gateway.margin()
+        record_bot_event(self, "funds_snapshot", {
+            "symbol": symbol, "side": side, "quantity": quantity,
+            "rule": {key: rule.get(key) for key in ("sizeStep", "minOrderSize", "maxOrderSize", "takerFee")},
+            "ticker": {key: row.get(key) for key in ("symbol", "timestamp", "bid", "ask", "last")},
+            "leverage": leverage, "required": required,
+            "margin": {key: margin.get(key) for key in ("availableAmount", "actualProfitLoss", "margin")},
+        })
         if margin["availableAmount"] < required:
             self.logger.warning(
                 "%s: insufficient margin: required=%s available=%s",
@@ -275,6 +286,11 @@ class LiveExecutionMixin:
             decision_key=key,
             context=context,
         )
+        record_bot_event(self, "order_result", {
+            "symbol": symbol, "purpose": "entry", "side": side,
+            "requested_size": quantity, "decision_bar": str(bar),
+            "result": {key: result.get(key) for key in ("success", "finalized", "executed_size", "execution_price", "executed_at", "position_ids", "client_order_id")},
+        })
         if result.get("already_submitted"):
             return {
                 **result,
@@ -314,6 +330,11 @@ class LiveExecutionMixin:
                 context=context,
             )
             results.append(result)
+            record_bot_event(self, "order_result", {
+                "symbol": symbol, "purpose": "close", "reason": reason,
+                "result": {key: result.get(key) for key in ("success", "finalized", "executed_size", "execution_price", "executed_at", "position_ids", "client_order_id")},
+                "trades": [{key: trade.get(key) for key in ("entry_price", "exit_price", "size", "pnl", "entry_fee", "exit_fee", "net_pnl_before_carry", "cost_status")} for trade in result.get("trades", [])],
+            })
             if not result["finalized"]:
                 break
         self._sync_live_positions(symbol)
