@@ -137,7 +137,8 @@ class LiveExecutionMixin:
                 service.sync_fees(today)
             except Exception as exc:
                 self.logger.error(
-                    "Daily exchange fees not confirmed (%s)", type(exc).__name__
+                    "Daily exchange fees not confirmed (%s): %s", type(exc).__name__,
+                    str(exc) if isinstance(exc, ExecutionError) else "details suppressed"
                 )
 
     def _reset_exit_adjustments(self, symbol):

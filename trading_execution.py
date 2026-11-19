@@ -114,9 +114,21 @@ class ExchangeGateway:
         seen_positions = set()
         for page in range(1, 1001):
             data = self.request(path, {**params, "page": page, "count": 100})
+            # GMO can omit list for an empty, successful paginated position response.
+            # Require the exact requested pagination; malformed/null lists stay unconfirmed.
+            if (path == '/v1/openPositions' and isinstance(data, dict)
+                    and set(data) == {'pagination'}
+                    and isinstance(data['pagination'], dict)
+                    and type(data['pagination'].get('currentPage')) is int
+                    and type(data['pagination'].get('count')) is int
+                    and data['pagination'] == {'currentPage': page, 'count': 100}):
+                return result
             if not isinstance(data, dict) or not isinstance(data.get("list"), list):
                 raise ExecutionError("Invalid exchange list: data_type=" + type(data).__name__ +
-                                     " list_type=" + type(data.get('list') if isinstance(data, dict) else None).__name__)
+                                     " list_type=" + type(data.get('list') if isinstance(data, dict) else None).__name__ +
+                                     " list_present=" + str(isinstance(data, dict) and 'list' in data) +
+                                     " pagination_type=" + type(data.get('pagination') if isinstance(data, dict) else None).__name__ +
+                                     " pagination=" + str({key: value for key, value in (data.get('pagination', {}).items() if isinstance(data, dict) and isinstance(data.get('pagination'), dict) else []) if key in ('currentPage','count','totalPage') and type(value) is int}))
             rows = data["list"]
             if path == "/v1/openPositions":
                 ids = [str(row.get("positionId")) for row in rows]
