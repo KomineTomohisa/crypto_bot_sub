@@ -117,6 +117,7 @@ class LiveExecutionMixin:
             self.logger.error(
                 "Order ledger unavailable; new orders blocked (%s)", type(exc).__name__
             )
+            self._queue_close_alerts()
             return
         for intent in pending:
             try:
@@ -168,6 +169,7 @@ class LiveExecutionMixin:
                     "Close batch not completed (%s): %s", type(exc).__name__,
                     str(exc) if isinstance(exc, ExecutionError) else "details suppressed",
                 )
+        self._queue_close_alerts()
         now = time.monotonic()
         if now >= getattr(self, "_next_fee_sync", 0):
             self._next_fee_sync = now + 3600
@@ -181,6 +183,26 @@ class LiveExecutionMixin:
                     "Daily exchange fees not confirmed (%s): %s", type(exc).__name__,
                     str(exc) if isinstance(exc, ExecutionError) else "details suppressed"
                 )
+
+    def _queue_close_alerts(self):
+        settings = getattr(self, 'notification_settings', {}) or {}
+        if not settings.get('enabled', False) or not settings.get('send_on_error', False):
+            return
+        if not callable(getattr(self, 'send_notification', None)):
+            return
+        try:
+            from close_alerts import CloseAlertPolicy, CloseAlertWorker
+            service = self._execution()
+            worker = getattr(self, '_close_alert_worker', None)
+            if worker is None or not worker.thread.is_alive():
+                policy = CloseAlertPolicy.from_environment(self.logger)
+                worker = CloseAlertWorker(service.store, service.account, self.send_notification, self.logger, policy)
+                self._close_alert_worker = worker
+            for job in service.store.claim_close_alerts(service.account, worker.policy):
+                if not worker.submit(job):
+                    service.store.finish_close_alert(service.account, job, False)
+        except Exception as exc:
+            self.logger.error('Close stall monitoring unavailable (%s)', type(exc).__name__)
 
     def _reset_exit_adjustments(self, symbol):
         """Clear per-trade exit state without disturbing other symbols."""

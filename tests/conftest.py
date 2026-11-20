@@ -4,6 +4,7 @@ from pathlib import Path
 import uuid
 import pytest
 import requests
+import smtplib
 from sqlalchemy import create_engine
 from execution_store import ExecutionStore
 
@@ -21,6 +22,7 @@ def no_exchange_network(monkeypatch):
         )
 
     monkeypatch.setattr(requests.sessions.Session, "request", forbidden)
+    monkeypatch.setattr(smtplib, "SMTP", forbidden)
 
 
 @pytest.fixture
@@ -45,6 +47,9 @@ def store():
         )
         conn.exec_driver_sql(
             (ROOT / "migrations/002_durable_close_batches.sql").read_text()
+        )
+        conn.exec_driver_sql(
+            (ROOT / "migrations/003_close_stall_notifications.sql").read_text()
         )
     yield ExecutionStore(engine)
     engine.dispose()

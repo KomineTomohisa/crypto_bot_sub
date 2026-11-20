@@ -256,7 +256,8 @@ def test_migration_can_use_app_role_without_altering_old_table_ownership(store):
         conn.exec_driver_sql(f'GRANT USAGE,CREATE ON SCHEMA {schema} TO {role}')
         conn.exec_driver_sql('GRANT SELECT ON bot_order_intents TO ' + role)
     try:
-        script = MIGRATION.read_text().removeprefix('BEGIN;').removesuffix('COMMIT;\n')
+        script = '\n'.join(path.read_text().removeprefix('BEGIN;').removesuffix('COMMIT;\n')
+                           for path in (MIGRATION, Path('migrations/003_close_stall_notifications.sql')))
         with store.engine.connect().execution_options(isolation_level='AUTOCOMMIT') as conn:
             conn.exec_driver_sql(f'BEGIN; SET LOCAL ROLE {role};\n' + script + '\nCOMMIT;')
         with store.engine.connect() as conn:

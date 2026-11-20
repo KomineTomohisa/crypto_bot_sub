@@ -2033,7 +2033,7 @@ class CryptoTradingBot(LiveExecutionMixin):
         notification_type (str): 通知の種類 ('info', 'entry', 'exit', 'error')
         """
         if not self.notification_settings['enabled']:
-            return
+            return False
             
         # 通知タイプに基づいて送信するかどうかを判断
         should_send = False
@@ -2049,16 +2049,20 @@ class CryptoTradingBot(LiveExecutionMixin):
             should_send = True
         
         if not should_send:
-            return
-            
-        try:
-            # 1) メール
-            self._send_email(subject, message)
-            # 2) LINE（Messaging API）
-            self._send_line(subject, message)
+            return False
+
+        sent = False
+        for channel in (self._send_email, self._send_line):
+            try:
+                delivered = channel(subject, message) is True
+                sent = delivered or sent
+            except Exception as exc:
+                self.logger.error('Notification channel failed (%s)', type(exc).__name__)
+        if sent:
             self.logger.info(f"通知送信完了: {subject}")
-        except Exception as e:
-            self.logger.error(f"通知送信エラー: {e}")
+        else:
+            self.logger.warning('通知の送信成功を確認できませんでした')
+        return sent
 
     def _send_daily_report(self, stats: dict) -> None:
         """
@@ -2200,7 +2204,7 @@ class CryptoTradingBot(LiveExecutionMixin):
 
         return self.send_notification(subject, message, notification_type=nt)
 
-    def _send_line(self, subject: str, body: str) -> None:
+    def _send_line(self, subject: str, body: str) -> bool:
         """LINE Messaging API 送信（宛先は DB→ENV の順で解決。なければ黙ってスキップ）"""
         try:
             # 宛先解決：DB（user_id 紐づけ）→ 環境変数 LINE_DEFAULT_USER_ID
@@ -2211,7 +2215,7 @@ class CryptoTradingBot(LiveExecutionMixin):
                 line_user_id = os.getenv("LINE_DEFAULT_USER_ID")
             if not line_user_id:
                 self.logger.info("LINE宛先が未設定のため送信スキップ")
-                return
+                return False
 
             client = LineMessaging()  # ENV の LINE_CHANNEL_ACCESS_TOKEN を利用
             ok = client.send_text(line_user_id, f"{subject}\n{body}")
@@ -2219,9 +2223,11 @@ class CryptoTradingBot(LiveExecutionMixin):
                 self.logger.info("LINE送信成功")
             else:
                 self.logger.warning("LINE送信失敗（詳細は直前のログ参照）")
+            return bool(ok)
         except Exception as e:
             # 失敗してもボットは止めない
-            self.logger.warning(f"LINE送信エラー: {e}")
+            self.logger.warning('LINE送信エラー (%s)', type(e).__name__)
+            return False
 
     # （将来用）複数ユーザー配信のヘルパ
     def _send_line_multicast(self, app_user_ids: list[int], text: str) -> None:
@@ -2345,19 +2351,19 @@ class CryptoTradingBot(LiveExecutionMixin):
     
     def _send_email(self, subject, body):
         if not (self.notification_settings or {}).get('enabled', False):
-            return
+            return False
         try:
             email_settings = (self.notification_settings or {}).get('email', {}) or {}
             required_settings = ['smtp_server', 'smtp_port', 'sender', 'password']
             missing = [s for s in required_settings if not email_settings.get(s)]
             if missing:
                 self.logger.warning(f"メール設定が不完全: {missing}")
-                return
+                return False
 
             recipients = self._resolve_recipients_for_mode()
             if not recipients:
                 self.logger.info("宛先なしのためスキップ")
-                return
+                return False
 
             # ★SIMタグ & 復号パスワード
             _subject = f"[SIM] {subject}" if self._is_sim_mode() else subject
@@ -2380,14 +2386,15 @@ class CryptoTradingBot(LiveExecutionMixin):
                             msg.attach(MIMEText(body, 'plain', 'utf-8'))
                             server.sendmail(email_settings['sender'], rcpt, msg.as_string())
                     self.logger.info(f"メール送信成功（{len(recipients)}件）")
-                    return
+                    return True
                 except Exception as e:
-                    self.logger.warning(f"SMTP送信失敗({attempt+1}/3): {e}")
+                    self.logger.warning('SMTP送信失敗(%s/3): %s', attempt + 1, type(e).__name__)
                     time.sleep(2 ** attempt)
 
             self.logger.error("メール送信リトライ上限に到達し失敗")
         except Exception as e:
-            self.logger.error(f"メール送信エラー: {e}")
+            self.logger.error('メール送信エラー (%s)', type(e).__name__)
+        return False
 
     def _send_exit_detail(self, symbol: str, exit_price: float, *, timeframe: str = "5m", reason: str | None = None) -> None:
         """

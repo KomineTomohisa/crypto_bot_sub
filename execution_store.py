@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 import json
 import uuid
@@ -30,6 +30,9 @@ class ExecutionStore:
             conn.execute(text("SELECT client_order_id FROM bot_order_intents LIMIT 0"))
             conn.execute(text("SELECT net_pnl_before_carry FROM trades LIMIT 0"))
             conn.execute(text("SELECT batch_id,payload,completed FROM bot_close_batches LIMIT 0"))
+            conn.execute(text("""SELECT alert_last_attempt_at,alert_last_attempt_kind,
+                alert_warning_sent_at,alert_recovery_sent_at,alert_claim_token,alert_claim_until
+                FROM bot_close_batches LIMIT 0"""))
 
     def get(self, client_id):
         with self.engine.connect() as conn:
@@ -69,6 +72,68 @@ class ExecutionStore:
                 WHERE account_key=:a AND NOT completed ORDER BY created_at,batch_id"""),
                 {"a": account}).scalars())
             return registered + self._legacy_close_batches(conn, account)
+
+    def claim_close_alerts(self, account, policy, *, now=None, limit=8):
+        """Lease due notices across processes without holding locks during I/O."""
+        with self.engine.begin() as conn:
+            at = timestamp(now) if now is not None else conn.execute(text('SELECT clock_timestamp()')).scalar_one()
+            params = {'a': account, 'now': at, 'stale': at-timedelta(seconds=policy.stall_seconds),
+                      'reminder': at-timedelta(seconds=policy.reminder_seconds),
+                      'retry': at-timedelta(seconds=policy.retry_seconds), 'limit': limit}
+            rows = list(conn.execute(text("""SELECT b.batch_id,b.symbol,b.created_at,b.completed,
+                    b.payload->'positions' AS positions,
+                    EXISTS(SELECT 1 FROM bot_order_intents i WHERE i.account_key=b.account_key AND NOT i.finalized) AS has_pending
+                FROM bot_close_batches b WHERE b.account_key=:a
+                  AND (b.alert_claim_until IS NULL OR b.alert_claim_until<=:now)
+                  AND (
+                    (NOT b.completed AND b.created_at<=:stale
+                      AND (b.alert_warning_sent_at IS NULL OR b.alert_warning_sent_at<=:reminder)
+                      AND (b.alert_last_attempt_at IS NULL OR b.alert_last_attempt_at<=:retry))
+                    OR
+                    (b.completed AND b.alert_warning_sent_at IS NOT NULL AND b.alert_recovery_sent_at IS NULL
+                      AND (b.alert_last_attempt_kind IS DISTINCT FROM 'recovery'
+                           OR b.alert_last_attempt_at IS NULL OR b.alert_last_attempt_at<=:retry))
+                  ) ORDER BY b.created_at,b.batch_id LIMIT :limit FOR UPDATE OF b SKIP LOCKED"""), params).mappings())
+            jobs = []
+            for row in rows:
+                kind = 'recovery' if row['completed'] else 'warning'
+                token = uuid.uuid4().hex
+                conn.execute(text("""UPDATE bot_close_batches SET alert_last_attempt_at=:now,
+                    alert_last_attempt_kind=:kind,alert_claim_token=:token,alert_claim_until=:until
+                    WHERE account_key=:a AND batch_id=:id"""),
+                    {'a':account,'id':row['batch_id'],'now':at,'kind':kind,'token':token,
+                     'until':at+timedelta(seconds=policy.lease_seconds)})
+                phase = ('order_reconciliation' if row['has_pending'] else
+                         'position_confirmation' if row['positions'] is None else 'close_pending')
+                jobs.append({'batch_id':row['batch_id'],'symbol':row['symbol'],'created_at':row['created_at'],
+                             'observed_at':at,'kind':kind,'phase':phase,'claim_token':token})
+            return jobs
+
+    def close_alert_is_current(self, account, job, *, now=None):
+        with self.engine.connect() as conn:
+            row = conn.execute(text("""SELECT completed,alert_warning_sent_at,alert_recovery_sent_at
+                FROM bot_close_batches WHERE account_key=:a AND batch_id=:id
+                  AND alert_claim_token=:token AND alert_last_attempt_kind=:kind
+                  AND alert_claim_until>COALESCE(CAST(:now AS timestamptz),clock_timestamp())"""),
+                {'a':account,'id':job['batch_id'],'token':job['claim_token'],'kind':job['kind'],
+                 'now':timestamp(now) if now is not None else None}).mappings().first()
+        if row is None:return False
+        if job['kind']=='warning':return not row['completed']
+        return row['completed'] and row['alert_warning_sent_at'] is not None and row['alert_recovery_sent_at'] is None
+
+    def finish_close_alert(self, account, job, delivered, *, now=None):
+        with self.engine.begin() as conn:
+            at = timestamp(now) if now is not None else conn.execute(text('SELECT clock_timestamp()')).scalar_one()
+            row = conn.execute(text("""UPDATE bot_close_batches
+                SET alert_last_attempt_at=:now,
+                    alert_warning_sent_at=CASE WHEN :delivered AND :kind='warning' THEN :now ELSE alert_warning_sent_at END,
+                    alert_recovery_sent_at=CASE WHEN :delivered AND :kind='recovery' THEN :now ELSE alert_recovery_sent_at END,
+                    alert_claim_token=NULL,alert_claim_until=NULL
+                WHERE account_key=:a AND batch_id=:id AND alert_claim_token=:token
+                  AND alert_last_attempt_kind=:kind RETURNING batch_id"""),
+                {'a':account,'id':job['batch_id'],'token':job['claim_token'],'kind':job['kind'],
+                 'now':at,'delivered':bool(delivered)}).first()
+            return row is not None
 
     @staticmethod
     def _legacy_close_batches(conn, account):

@@ -28,6 +28,7 @@ SOURCE_FILES = (
     "strategy_inputs.py",
     "strategy_recording.py",
     "live_execution.py",
+    "close_alerts.py",
     "trading_execution.py",
     "execution_store.py",
     "backtest_data.py",
