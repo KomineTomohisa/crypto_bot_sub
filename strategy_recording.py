@@ -434,9 +434,9 @@ def record_bot_event(bot, kind, payload, observed_at=None):
         if recorder and isinstance(payload, dict) and "symbol" in payload:
             payload = {
                 **payload,
-                "feature_snapshot": getattr(bot, "_feature_event_refs", {}).get(
+                "feature_snapshot": payload.get("feature_snapshot", getattr(bot, "_feature_event_refs", {}).get(
                     payload["symbol"]
-                ),
+                )),
             }
         return recorder.append(kind, payload, observed_at) if recorder else None
     except Exception as exc:

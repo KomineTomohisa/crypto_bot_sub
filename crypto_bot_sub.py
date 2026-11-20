@@ -7518,7 +7518,8 @@ class CryptoTradingBot(LiveExecutionMixin):
                 try:
                     self._close_live_position(symbol, exit_reason, stats, trade_logs)
                 except Exception as exc:
-                    self.logger.error("%s: close not confirmed (%s)", symbol, type(exc).__name__)
+                    self.logger.error("%s: close not confirmed (%s): %s", symbol, type(exc).__name__,
+                                      str(exc) if isinstance(exc, ExecutionError) else "details suppressed")
                     self.send_notification(f"{symbol} 決済未確認", "自動決済の結果を確定できません。建玉と注文状態を確認してください。", "error")
                 return
             # 決済注文の実行

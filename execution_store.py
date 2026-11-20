@@ -54,6 +54,45 @@ class ExecutionStore:
                 ).mappings()
             ]
 
+    def finalized_ids(self, account):
+        """Startup backfill also covers a crash after commit but before recording."""
+        with self.engine.connect() as conn:
+            return list(conn.execute(text("""SELECT client_order_id FROM bot_order_intents
+                WHERE account_key=:a AND finalized ORDER BY created_at,client_order_id"""),
+                {"a": account}).scalars())
+
+    def close_batches(self, account):
+        """Batch metadata is committed with the first intent, before any POST."""
+        with self.engine.connect() as conn:
+            rows = conn.execute(text("""SELECT DISTINCT ON (context #>> '{close_batch,id}')
+                context->'close_batch' AS batch FROM bot_order_intents
+                WHERE account_key=:a AND settle_type='CLOSE' AND context ? 'close_batch'
+                  AND NOT (context @> '{"close_batch_done": true}'::jsonb)
+                ORDER BY context #>> '{close_batch,id}',created_at"""), {"a": account})
+            return [r.batch for r in rows]
+
+    def close_batch_remaining(self, account, batch):
+        with self.engine.connect() as conn:
+            closed = dict(conn.execute(text("""SELECT f.position_id,sum(f.size)
+                FROM bot_execution_fills f JOIN bot_order_intents i USING(client_order_id)
+                WHERE f.account_key=:a AND i.account_key=:a AND f.settle_type='CLOSE'
+                  AND i.context #>> '{close_batch,id}'=:id GROUP BY f.position_id"""),
+                {"a": account, "id": batch["id"]}).all())
+        remaining = {str(p["positionId"]): decimal(p["size"], positive=True) - closed.get(str(p["positionId"]), Decimal(0))
+                     for p in batch["positions"]}
+        if any(size < 0 for size in remaining.values()):
+            raise ExecutionError("Close batch exceeded target quantity")
+        return remaining
+
+    def finish_close_batch(self, account, batch):
+        if any(self.close_batch_remaining(account, batch).values()):
+            raise ExecutionError("Close batch still has unclosed targets")
+        with self.engine.begin() as conn:
+            conn.execute(text("""UPDATE bot_order_intents
+                SET context=context || '{"close_batch_done": true}'::jsonb
+                WHERE account_key=:a AND context #>> '{close_batch,id}'=:id"""),
+                {"a": account, "id": batch["id"]})
+
     def prepare(
         self, account, symbol, side, settle, size, position_id, key, body, context
     ):
@@ -87,6 +126,35 @@ class ExecutionStore:
             )
             if row:
                 return dict(row)
+            batch = context.get('close_batch') if settle == 'CLOSE' else None
+            if batch:
+                active = conn.execute(text("""SELECT context #>> '{close_batch,id}'
+                    FROM bot_order_intents WHERE account_key=:a AND symbol=:symbol
+                      AND context ? 'close_batch'
+                      AND NOT (context @> '{"close_batch_done": true}'::jsonb) LIMIT 1"""), params).scalar()
+                if active is not None and active != batch['id']:
+                    raise ExecutionError("Another close batch must finish first")
+                # Recheck under the account lock. A second worker may have
+                # completed this target after the caller read its snapshot.
+                target = next((p for p in batch['positions'] if str(p['positionId']) == params['pid']), None)
+                if target is None:
+                    raise ExecutionError("Position is not a close batch target")
+                closed = conn.execute(text("""SELECT COALESCE(sum(f.size),0)
+                    FROM bot_execution_fills f JOIN bot_order_intents i USING(client_order_id)
+                    WHERE f.account_key=:a AND i.account_key=:a AND f.position_id=:pid
+                      AND f.settle_type='CLOSE' AND i.context #>> '{close_batch,id}'=:batch"""),
+                    {**params, 'batch': batch['id']}).scalar_one()
+                if decimal(target['size'], positive=True) - closed != decimal(size):
+                    raise ExecutionError("Close batch target changed; refresh snapshot")
+                projected = conn.execute(text("""SELECT p.size FROM positions p
+                    WHERE p.position_id=:pid AND EXISTS (SELECT 1 FROM bot_execution_fills f
+                        WHERE f.position_id=p.position_id AND f.account_key=:a)"""), params).scalar()
+                if projected is not None and projected != decimal(size):
+                    raise ExecutionError("Close position quantity changed; refresh snapshot")
+            if settle == 'OPEN' and conn.execute(text("""SELECT 1 FROM bot_order_intents
+                WHERE account_key=:a AND context ? 'close_batch'
+                  AND NOT (context @> '{"close_batch_done": true}'::jsonb) LIMIT 1"""), params).first():
+                raise ExecutionError("Unfinished close batch blocks new exposure")
             conn.execute(
                 text("""INSERT INTO bot_order_intents(client_order_id,account_key,symbol,side,settle_type,size,position_id,decision_key,request,context)
                 VALUES(:id,:a,:symbol,:side,:settle,:size,:pid,:key,CAST(:body AS jsonb),CAST(:context AS jsonb))"""),

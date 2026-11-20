@@ -6,11 +6,13 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import os
 import time
+import uuid
 from strategy_recording import record_bot_event
 
 from trading_execution import (
     ExchangeGateway,
     ExecutionError,
+    ExecutionPending,
     ExecutionService,
     account_key,
     decimal,
@@ -45,7 +47,7 @@ class LiveExecutionMixin:
 
     def _live_funds_check(self, symbol, side, size):
         service = self._execution()
-        if service.store.pending(service.account):
+        if service.store.pending(service.account) or service.store.close_batches(service.account):
             # An unconfirmed account order may already have consumed margin.
             record_bot_event(self, "funds_blocked", {"symbol": symbol, "reason": "pending_order"})
             return False
@@ -86,6 +88,28 @@ class LiveExecutionMixin:
 
     def _recover_live_orders(self):
         service = self._execution()
+        if getattr(self, '_record_inputs', False) and not getattr(self, '_execution_events_backfilled', False):
+            try:
+                # Export a bounded number per cycle. Stable event IDs permit
+                # consumers to deduplicate delivery across process restarts.
+                count = 0
+                if not hasattr(self, '_backfilled_result_ids'):
+                    self._backfilled_result_ids = set()
+                for client_id in service.store.finalized_ids(service.account):
+                    if client_id in self._backfilled_result_ids:
+                        continue
+                    result = service.store.result(client_id)
+                    if self._record_live_order_result(result):
+                        self._backfilled_result_ids.add(client_id)
+                        count += 1
+                    else:
+                        break
+                    if count == 16:
+                        break
+                else:
+                    self._execution_events_backfilled = True
+            except Exception as exc:
+                self.logger.error("Execution event backfill not completed (%s)", type(exc).__name__)
         try:
             pending = service.store.pending(service.account)
         except Exception as exc:
@@ -100,6 +124,7 @@ class LiveExecutionMixin:
                 ):
                     continue
                 result = service.reconcile(service.store.get(intent["client_order_id"]))
+                self._record_live_order_result(result)
                 if result["finalized"] and callable(
                     getattr(self, "send_notification", None)
                 ):
@@ -127,6 +152,21 @@ class LiveExecutionMixin:
                         "error",
                     )
                     self._warned_execution_intents.add(intent["client_order_id"])
+        # A triggered close survives both a changed price and a process restart.
+        # Resume before considering any new entry or waiting for another signal.
+        try:
+            batches = service.store.close_batches(service.account)
+        except Exception as exc:
+            self.logger.error("Close batch ledger unavailable (%s)", type(exc).__name__)
+            batches = []
+        for batch in batches:
+            try:
+                self._drive_live_close_batch(batch)
+            except Exception as exc:
+                self.logger.error(
+                    "Close batch not completed (%s): %s", type(exc).__name__,
+                    str(exc) if isinstance(exc, ExecutionError) else "details suppressed",
+                )
         now = time.monotonic()
         if now >= getattr(self, "_next_fee_sync", 0):
             self._next_fee_sync = now + 3600
@@ -280,6 +320,7 @@ class LiveExecutionMixin:
             "user_id": getattr(self, "user_id", None),
             "decision_bar": str(bar),
             "decision_price": str(raw["decision_price"]),
+            "feature_snapshot": getattr(self, "_feature_event_refs", {}).get(symbol),
         }
         result = service.submit(
             self.symbol_mapping[symbol],
@@ -288,11 +329,7 @@ class LiveExecutionMixin:
             decision_key=key,
             context=context,
         )
-        record_bot_event(self, "order_result", {
-            "symbol": symbol, "purpose": "entry", "side": side,
-            "requested_size": quantity, "decision_bar": str(bar),
-            "result": {key: result.get(key) for key in ("success", "finalized", "executed_size", "execution_price", "executed_at", "position_ids", "client_order_id")},
-        })
+        self._record_live_order_result(result)
         if result.get("already_submitted"):
             return {
                 **result,
@@ -302,55 +339,114 @@ class LiveExecutionMixin:
         self._sync_live_positions(symbol)
         return result
 
+    def _record_live_order_result(self, result):
+        """Use the same payload for immediate and recovered exchange outcomes."""
+        intent = result["intent"]
+        context = intent["context"]
+        event_id = "order:" + hashlib.sha256(
+            f"{intent['client_order_id']}|{result['status']}|{result['finalized']}|{result['executed_size']}".encode()
+        ).hexdigest()
+        if not hasattr(self, '_recorded_order_results'):
+            self._recorded_order_results = set()
+        if event_id in self._recorded_order_results:
+            return True
+        payload = {
+            "event_id": event_id,
+            "symbol": context.get("bot_symbol", intent["symbol"]),
+            "purpose": "close" if intent["settle_type"] == "CLOSE" else "entry",
+            "side": intent["side"], "reason": context.get("exit_reason"),
+            "requested_size": intent["size"], "decision_bar": context.get("decision_bar"),
+            "feature_snapshot": context.get("feature_snapshot"),
+            "result": {key: result.get(key) for key in ("success", "status", "finalized", "executed_size", "execution_price", "executed_at", "position_ids", "client_order_id")},
+            "trades": [{key: trade.get(key) for key in ("entry_price", "exit_price", "size", "pnl", "entry_fee", "exit_fee", "net_pnl_before_carry", "cost_status")} for trade in result.get("trades", [])],
+        }
+        if record_bot_event(self, "order_result", payload):
+            self._recorded_order_results.add(event_id)
+            return True
+        return False
+
     def _close_live_position(self, symbol, reason, stats, trade_logs):
         service = self._execution()
+        batches = [b for b in service.store.close_batches(service.account) if b["symbol"] == symbol]
+        if batches:
+            batch = batches[0]
+        else:
+            positions = service.gateway.positions(self.symbol_mapping[symbol])
+            if not positions:
+                self._sync_live_positions(symbol)
+                return
+            side = self.positions[symbol]
+            if any(p["side"] != ("BUY" if side == "long" else "SELL") for p in positions):
+                raise ExecutionError("Position direction changed during close")
+            batch = {"id": uuid.uuid4().hex, "symbol": symbol, "side": side,
+                     "reason": reason, "positions": positions,
+                     "scores": self.entry_scores.get(symbol, {}),
+                     "user_id": getattr(self, "user_id", None),
+                     "feature_snapshot": getattr(self, "_feature_event_refs", {}).get(symbol)}
+        self._drive_live_close_batch(batch, stats, trade_logs)
+
+    def _drive_live_close_batch(self, batch, stats=None, trade_logs=None):
+        service = self._execution()
+        symbol, side, reason = batch["symbol"], batch["side"], batch["reason"]
         pending = service.store.pending(service.account)
-        if any(i["symbol"] == self.symbol_mapping[symbol] for i in pending):
+        if pending:
             self.logger.warning(
                 "%s: waiting for existing order reconciliation before another close",
                 symbol,
             )
             return
         positions = service.gateway.positions(self.symbol_mapping[symbol])
-        side = self.positions[symbol]
+        remaining = service.store.close_batch_remaining(service.account, batch)
+        current = {str(p["positionId"]): p for p in positions}
+        # A disappearing target without our recorded fills is an unresolved
+        # exposure, never permission to close a different/new position.
+        for pid, size in remaining.items():
+            if size and (pid not in current or decimal(current[pid]["size"]) != size):
+                raise ExecutionError("Close batch position snapshot not confirmed")
         results = []
-        for pos in positions:
+        for target in batch["positions"]:
+            pid = str(target["positionId"])
+            if not remaining[pid]:
+                continue
+            pos = current[pid]
             if pos["side"] != ("BUY" if side == "long" else "SELL"):
                 raise ExecutionError("Position direction changed during close")
             context = {
                 "bot_symbol": symbol,
                 "baseline": pos,
                 "exit_reason": reason,
-                "scores": self.entry_scores.get(symbol, {}),
-                "user_id": getattr(self, "user_id", None),
+                "scores": batch["scores"], "user_id": batch["user_id"],
+                "feature_snapshot": batch.get("feature_snapshot"), "close_batch": batch,
             }
-            result = service.submit(
-                self.symbol_mapping[symbol],
-                "SELL" if side == "long" else "BUY",
-                pos["size"],
-                position_id=pos["positionId"],
-                context=context,
-            )
+            try:
+                result = service.submit(
+                    self.symbol_mapping[symbol],
+                    "SELL" if side == "long" else "BUY",
+                    pos["size"], position_id=pos["positionId"], context=context,
+                )
+            except ExecutionPending:
+                self.logger.warning("%s: close awaiting consistent exchange snapshots", symbol)
+                break
             results.append(result)
-            record_bot_event(self, "order_result", {
-                "symbol": symbol, "purpose": "close", "reason": reason,
-                "result": {key: result.get(key) for key in ("success", "finalized", "executed_size", "execution_price", "executed_at", "position_ids", "client_order_id")},
-                "trades": [{key: trade.get(key) for key in ("entry_price", "exit_price", "size", "pnl", "entry_fee", "exit_fee", "net_pnl_before_carry", "cost_status")} for trade in result.get("trades", [])],
-            })
+            self._record_live_order_result(result)
             if not result["finalized"]:
                 break
         self._sync_live_positions(symbol)
         # Stats are refreshed from committed records, never incremented on a retry.
-        self._refresh_live_stats(stats)
+        if stats is not None:
+            self._refresh_live_stats(stats)
+        complete = not service.store.pending(service.account) and not any(service.store.close_batch_remaining(service.account, batch).values())
+        if complete:
+            service.store.finish_close_batch(service.account, batch)
         if results:
             self.logger.info(
-                "%s: close confirmed from exchange executions (%s); remaining=%s",
+                "%s: close execution progress (%s); remaining=%s",
                 symbol,
                 reason,
                 self.entry_sizes[symbol],
             )
             for result in results:
-                for trade in result.get("trades", []):
+                for trade in result.get("trades", []) if trade_logs is not None else []:
                     trade_logs.append(
                         {
                             "symbol": symbol,
@@ -364,7 +460,7 @@ class LiveExecutionMixin:
                             "holding_hours": float(trade["holding_hours"]),
                         }
                     )
-                if result["success"] and self.notification_settings.get(
+                if result["success"] and result["finalized"] and self.notification_settings.get(
                     "send_on_exit", True
                 ):
                     gross = sum(t["pnl"] for t in result.get("trades", []))
@@ -374,7 +470,7 @@ class LiveExecutionMixin:
                         f"売買損益（費用別）: {gross:,.2f}円\n残数量: {self.entry_sizes[symbol]}\n"
                         "手数料・日次費用は実明細で別途集計します。",
                     )
-        if self.positions.get(symbol) is None:
+        if complete and self.positions.get(symbol) is None:
             now = datetime.now(timezone.utc)
             self.reentry_block_until[symbol] = self._ceil_to_next_15min(now)
 

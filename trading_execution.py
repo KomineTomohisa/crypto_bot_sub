@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 import hashlib
+import time
 
 TERMINAL = frozenset({"EXECUTED", "CANCELED", "EXPIRED", "REJECTED"})
 DECLINED_CODES = frozenset(
@@ -23,6 +24,12 @@ DECLINED_CODES = frozenset(
 
 
 class ExecutionError(RuntimeError):
+    pass
+
+
+class ExecutionPending(ExecutionError):
+    """An identified read snapshot can lag another exchange endpoint."""
+
     pass
 
 
@@ -200,6 +207,8 @@ class ExchangeGateway:
                 )
             )
         ]
+        if not rows:
+            raise ExecutionPending("Order not yet visible")
         if len(rows) != 1:
             raise ExecutionError("Order identity not confirmed")
         row = rows[0]
@@ -287,8 +296,9 @@ class ExchangeGateway:
 
 
 class ExecutionService:
-    def __init__(self, gateway, store, account):
+    def __init__(self, gateway, store, account, *, retry_delays=(0.2, 0.5)):
         self.gateway, self.store, self.account = gateway, store, account
+        self.retry_delays = retry_delays
 
     def submit(
         self, symbol, side, size, *, position_id=None, decision_key=None, context=None
@@ -334,6 +344,9 @@ class ExecutionService:
             str(position_id) if position_id is not None else None,
         ):
             raise ExecutionError("Another unresolved order must be reconciled first")
+        requested_batch = (context or {}).get("close_batch", {}).get("id")
+        if requested_batch and intent["context"].get("close_batch", {}).get("id") != requested_batch:
+            raise ExecutionError("Another close batch must finish first")
         if intent["finalized"]:
             return {
                 **self.store.result(intent["client_order_id"]),
@@ -368,14 +381,34 @@ class ExecutionService:
         return self.reconcile(self.store.get(intent["client_order_id"]))
 
     def reconcile(self, intent):
+        # Only GET snapshots are retried. POST and the persisted sending claim are
+        # outside this loop, including when the original response was lost.
+        started = time.monotonic()
+        for attempt in range(len(self.retry_delays) + 1):
+            try:
+                result = self._reconcile_once(intent)
+            except ExecutionPending:
+                if attempt == len(self.retry_delays) or time.monotonic() - started >= 2:
+                    raise
+            else:
+                if result["finalized"] or attempt == len(self.retry_delays) or time.monotonic() - started >= 2:
+                    return result
+            time.sleep(self.retry_delays[attempt])
+            intent = self.store.get(intent["client_order_id"])
+
+    def _reconcile_once(self, intent):
         if intent["finalized"]:
             return self.store.result(intent["client_order_id"])
         order = self.gateway.order(intent)
         rows = self.gateway.executions(intent, order)
         quantity = sum((decimal(r["size"]) for r in rows), Decimal(0))
         reported = decimal(order.get("executedSize", "0"))
-        if not 0 <= quantity <= reported <= decimal(intent["size"]):
+        if not 0 <= quantity <= decimal(intent["size"]) or not 0 <= reported <= decimal(intent["size"]):
             raise ExecutionError("Inconsistent executed quantity")
+        if quantity > reported:
+            raise ExecutionPending("Execution list ahead of order snapshot")
+        if order["status"] == "EXECUTED" and reported != decimal(intent["size"]):
+            raise ExecutionPending("Executed order total not yet complete")
         # A delayed executions endpoint must not turn missing fills into a completed order.
         finalized = order["status"] in TERMINAL and quantity == reported
         self.store.record(intent, order, rows, finalized)
