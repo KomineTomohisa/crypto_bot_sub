@@ -81,10 +81,9 @@ class ExecutionStore:
             ORDER BY i.context #>> '{close_batch,id}',i.created_at"""),
             {"a": account}).scalars())
 
-    def save_close_batch(self, account, symbol, batch):
-        """Persist the immutable decision before checking the account order slot."""
+    @staticmethod
+    def _validate_close_positions(symbol, batch, positions):
         expected_side = {"long": "BUY", "short": "SELL"}.get(batch.get("side"))
-        positions = batch.get("positions")
         if not expected_side or not isinstance(positions, list) or not positions:
             raise ExecutionError("Invalid close batch targets")
         ids = set()
@@ -96,6 +95,25 @@ class ExecutionStore:
             decimal(pos.get("size"), positive=True)
             decimal(pos.get("price"), positive=True)
             timestamp(pos.get("timestamp"))
+
+    def save_close_batch(self, account, symbol, batch):
+        """Persist the request even before a position lookup can succeed."""
+        if batch.get('positions') is None:
+            ids = batch.get('target_ids')
+            if (batch.get('side') not in ('long', 'short') or not isinstance(ids, list)
+                    or any(not isinstance(pid, str) or not pid for pid in ids)
+                    or len(set(ids)) != len(ids)):
+                raise ExecutionError("Invalid unresolved close request")
+            sizes = batch.get('target_sizes')
+            if sizes is not None:
+                if not isinstance(sizes, dict) or set(sizes) != set(ids):
+                    raise ExecutionError("Invalid close request quantities")
+                for size in sizes.values():
+                    decimal(size, positive=True)
+            if batch.get('target_total') is not None:
+                decimal(batch['target_total'], positive=True)
+        else:
+            self._validate_close_positions(symbol, batch, batch['positions'])
         params = {"a": account, "symbol": symbol, "id": batch["id"], "payload": json_value(batch)}
         with self.engine.begin() as conn:
             conn.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:a,0))"), params)
@@ -118,7 +136,39 @@ class ExecutionStore:
             return conn.execute(text("""INSERT INTO bot_close_batches(batch_id,account_key,symbol,payload)
                 VALUES(:id,:a,:symbol,CAST(:payload AS jsonb)) RETURNING payload"""), params).scalar_one()
 
+    def resolve_close_batch(self, account, symbol, batch_id, positions):
+        """Bind one confirmed snapshot to the identities frozen at decision time."""
+        params = {'a': account, 'symbol': symbol, 'id': batch_id}
+        with self.engine.begin() as conn:
+            conn.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:a,0))"), params)
+            saved = conn.execute(text("""SELECT payload FROM bot_close_batches
+                WHERE account_key=:a AND symbol=:symbol AND batch_id=:id AND NOT completed"""), params).scalar()
+            if saved is None:
+                raise ExecutionError("Close batch changed or completed")
+            if saved.get('positions') is not None:
+                return saved
+            self._validate_close_positions(symbol, saved, positions)
+            ids = {str(pos['positionId']) for pos in positions}
+            if not saved['target_ids'] or ids != set(saved['target_ids']):
+                raise ExecutionError("Close request target identities not confirmed")
+            sizes = saved.get('target_sizes')
+            if sizes is not None:
+                if any(decimal(pos['size']) != decimal(sizes[str(pos['positionId'])]) for pos in positions):
+                    raise ExecutionError("Close request target quantities changed")
+            elif saved.get('target_total') is None:
+                raise ExecutionError("Close request has no verified quantity")
+            if saved.get('target_total') is not None:
+                total = sum((decimal(pos['size']) for pos in positions), Decimal(0))
+                if total != decimal(saved['target_total']):
+                    raise ExecutionError("Close request total quantity changed")
+            resolved = {**saved, 'positions': positions}
+            return conn.execute(text("""UPDATE bot_close_batches SET payload=CAST(:payload AS jsonb)
+                WHERE account_key=:a AND batch_id=:id RETURNING payload"""),
+                {**params, 'payload': json_value(resolved)}).scalar_one()
+
     def close_batch_remaining(self, account, batch):
+        if batch.get('positions') is None:
+            raise ExecutionError("Close request targets are not yet confirmed")
         with self.engine.connect() as conn:
             closed = dict(conn.execute(text("""SELECT f.position_id,sum(f.size)
                 FROM bot_execution_fills f JOIN bot_order_intents i USING(client_order_id)
@@ -194,6 +244,8 @@ class ExecutionStore:
                     raise ExecutionError("Another close batch must finish first")
                 if saved['payload'] != json.loads(params['context'])['close_batch']:
                     raise ExecutionError("Close batch targets changed after registration")
+                if batch.get('positions') is None:
+                    raise ExecutionError("Close request targets are not yet confirmed")
                 # Recheck under the account lock. A second worker may have
                 # completed this target after the caller read its snapshot.
                 target = next((p for p in batch['positions'] if str(p['positionId']) == params['pid']), None)

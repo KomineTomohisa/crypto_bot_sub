@@ -7,6 +7,7 @@ import hashlib
 import os
 import time
 import uuid
+from copy import deepcopy
 from strategy_recording import record_bot_event
 
 from trading_execution import (
@@ -216,6 +217,7 @@ class LiveExecutionMixin:
                     self.short_profit_lock_armed[sym] = False
                     self._reset_exit_adjustments(sym)
                     getattr(self, "_exit_position_ids", {}).pop(sym, None)
+                    getattr(self, "_verified_position_snapshots", {}).pop(sym, None)
                     if hasattr(self, "_position_sync_failed"):
                         self._position_sync_failed.discard(sym)
                     continue
@@ -246,6 +248,9 @@ class LiveExecutionMixin:
                 if not hasattr(self, "_exit_position_ids"):
                     self._exit_position_ids = {}
                 self._exit_position_ids[sym] = current_ids
+                if not hasattr(self, '_verified_position_snapshots'):
+                    self._verified_position_snapshots = {}
+                self._verified_position_snapshots[sym] = deepcopy(rows)
                 self.positions[sym] = side
                 self.entry_sizes[sym] = float(size)
                 self.entry_prices[sym] = float(price)
@@ -371,15 +376,22 @@ class LiveExecutionMixin:
         if batches:
             batch = batches[0]
         else:
-            positions = service.gateway.positions(self.symbol_mapping[symbol])
-            if not positions:
-                self._sync_live_positions(symbol)
-                return
             side = self.positions[symbol]
-            if any(p["side"] != ("BUY" if side == "long" else "SELL") for p in positions):
-                raise ExecutionError("Position direction changed during close")
+            snapshot = getattr(self, '_verified_position_snapshots', {}).get(symbol)
+            if snapshot:
+                sizes = {str(p['positionId']): str(p['size']) for p in snapshot}
+                ids = sorted(sizes)
+                total = str(sum((decimal(size) for size in sizes.values()), decimal(0)))
+            else:
+                known = getattr(self, '_exit_position_ids', {}).get(symbol)
+                pid = getattr(self, 'position_ids', {}).get(symbol)
+                ids = sorted(str(value) for value in known) if known is not None else ([str(pid)] if pid is not None else [])
+                sizes = None
+                size = getattr(self, 'entry_sizes', {}).get(symbol)
+                total = str(size) if size else None
             batch = {"id": uuid.uuid4().hex, "symbol": symbol, "side": side,
-                     "reason": reason, "positions": positions,
+                     "reason": reason, "positions": None,
+                     "target_ids": ids, "target_sizes": sizes, "target_total": total,
                      "scores": self.entry_scores.get(symbol, {}),
                      "user_id": getattr(self, "user_id", None),
                      "feature_snapshot": getattr(self, "_feature_event_refs", {}).get(symbol)}
@@ -401,6 +413,12 @@ class LiveExecutionMixin:
             )
             return
         positions = service.gateway.positions(self.symbol_mapping[symbol])
+        if batch.get('positions') is None:
+            targets = set(batch['target_ids'])
+            selected = [p for p in positions if str(p['positionId']) in targets]
+            batch = service.store.resolve_close_batch(
+                service.account, self.symbol_mapping[symbol], batch['id'], selected
+            )
         remaining = service.store.close_batch_remaining(service.account, batch)
         current = {str(p["positionId"]): p for p in positions}
         # A disappearing target without our recorded fills is an unresolved
