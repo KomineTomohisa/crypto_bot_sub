@@ -387,6 +387,11 @@ class LiveExecutionMixin:
 
     def _drive_live_close_batch(self, batch, stats=None, trade_logs=None):
         service = self._execution()
+        # A busy order slot must not discard the close decision. Registration is
+        # independent of bot_order_intents and commits before any waiting return.
+        batch = service.store.save_close_batch(
+            service.account, self.symbol_mapping[batch['symbol']], batch
+        )
         symbol, side, reason = batch["symbol"], batch["side"], batch["reason"]
         pending = service.store.pending(service.account)
         if pending:

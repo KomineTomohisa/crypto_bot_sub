@@ -29,6 +29,7 @@ class ExecutionStore:
         with self.engine.connect() as conn:
             conn.execute(text("SELECT client_order_id FROM bot_order_intents LIMIT 0"))
             conn.execute(text("SELECT net_pnl_before_carry FROM trades LIMIT 0"))
+            conn.execute(text("SELECT batch_id,payload,completed FROM bot_close_batches LIMIT 0"))
 
     def get(self, client_id):
         with self.engine.connect() as conn:
@@ -62,14 +63,60 @@ class ExecutionStore:
                 {"a": account}).scalars())
 
     def close_batches(self, account):
-        """Batch metadata is committed with the first intent, before any POST."""
+        """Read queued decisions, including old-process writes during deployment."""
         with self.engine.connect() as conn:
-            rows = conn.execute(text("""SELECT DISTINCT ON (context #>> '{close_batch,id}')
-                context->'close_batch' AS batch FROM bot_order_intents
-                WHERE account_key=:a AND settle_type='CLOSE' AND context ? 'close_batch'
-                  AND NOT (context @> '{"close_batch_done": true}'::jsonb)
-                ORDER BY context #>> '{close_batch,id}',created_at"""), {"a": account})
-            return [r.batch for r in rows]
+            registered = list(conn.execute(text("""SELECT payload FROM bot_close_batches
+                WHERE account_key=:a AND NOT completed ORDER BY created_at,batch_id"""),
+                {"a": account}).scalars())
+            return registered + self._legacy_close_batches(conn, account)
+
+    @staticmethod
+    def _legacy_close_batches(conn, account):
+        return list(conn.execute(text("""SELECT DISTINCT ON (i.context #>> '{close_batch,id}')
+            i.context->'close_batch' FROM bot_order_intents i
+            WHERE i.account_key=:a AND i.settle_type='CLOSE' AND i.context ? 'close_batch'
+              AND NOT (i.context @> '{"close_batch_done": true}'::jsonb)
+              AND NOT EXISTS (SELECT 1 FROM bot_close_batches b
+                  WHERE b.batch_id=i.context #>> '{close_batch,id}' AND b.account_key=i.account_key)
+            ORDER BY i.context #>> '{close_batch,id}',i.created_at"""),
+            {"a": account}).scalars())
+
+    def save_close_batch(self, account, symbol, batch):
+        """Persist the immutable decision before checking the account order slot."""
+        expected_side = {"long": "BUY", "short": "SELL"}.get(batch.get("side"))
+        positions = batch.get("positions")
+        if not expected_side or not isinstance(positions, list) or not positions:
+            raise ExecutionError("Invalid close batch targets")
+        ids = set()
+        for pos in positions:
+            pid = str(pos.get("positionId"))
+            if pos.get("positionId") is None or pid in ids or pos.get("symbol") != symbol or pos.get("side") != expected_side:
+                raise ExecutionError("Invalid close batch position identity")
+            ids.add(pid)
+            decimal(pos.get("size"), positive=True)
+            decimal(pos.get("price"), positive=True)
+            timestamp(pos.get("timestamp"))
+        params = {"a": account, "symbol": symbol, "id": batch["id"], "payload": json_value(batch)}
+        with self.engine.begin() as conn:
+            conn.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:a,0))"), params)
+            known = conn.execute(text("""SELECT account_key,symbol,payload,completed
+                FROM bot_close_batches WHERE batch_id=:id"""), params).mappings().first()
+            if known:
+                if known['account_key'] != account or known['symbol'] != symbol or known['completed']:
+                    raise ExecutionError("Close batch changed or completed")
+                return known['payload']
+            active = conn.execute(text("""SELECT payload FROM bot_close_batches
+                WHERE account_key=:a AND symbol=:symbol AND NOT completed"""), params).scalar()
+            if active is not None:
+                return active
+            # The previous process can still write a legacy intent after migration.
+            legacy = next((b for b in self._legacy_close_batches(conn, account)
+                           if b['symbol'] == batch['symbol']), None)
+            if legacy is not None:
+                batch = legacy
+                params.update(id=batch['id'], payload=json_value(batch))
+            return conn.execute(text("""INSERT INTO bot_close_batches(batch_id,account_key,symbol,payload)
+                VALUES(:id,:a,:symbol,CAST(:payload AS jsonb)) RETURNING payload"""), params).scalar_one()
 
     def close_batch_remaining(self, account, batch):
         with self.engine.connect() as conn:
@@ -88,6 +135,17 @@ class ExecutionStore:
         if any(self.close_batch_remaining(account, batch).values()):
             raise ExecutionError("Close batch still has unclosed targets")
         with self.engine.begin() as conn:
+            conn.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:a,0))"), {"a": account})
+            if conn.execute(text("""SELECT 1 FROM bot_order_intents
+                WHERE account_key=:a AND NOT finalized AND context #>> '{close_batch,id}'=:id LIMIT 1"""),
+                {"a": account, "id": batch["id"]}).first():
+                raise ExecutionError("Close batch still has a pending order")
+            updated = conn.execute(text("""UPDATE bot_close_batches
+                SET completed=true,completed_at=COALESCE(completed_at,now())
+                WHERE account_key=:a AND batch_id=:id RETURNING batch_id"""),
+                {"a": account, "id": batch["id"]}).first()
+            if updated is None:
+                raise ExecutionError("Close batch registration missing")
             conn.execute(text("""UPDATE bot_order_intents
                 SET context=context || '{"close_batch_done": true}'::jsonb
                 WHERE account_key=:a AND context #>> '{close_batch,id}'=:id"""),
@@ -128,12 +186,14 @@ class ExecutionStore:
                 return dict(row)
             batch = context.get('close_batch') if settle == 'CLOSE' else None
             if batch:
-                active = conn.execute(text("""SELECT context #>> '{close_batch,id}'
-                    FROM bot_order_intents WHERE account_key=:a AND symbol=:symbol
-                      AND context ? 'close_batch'
-                      AND NOT (context @> '{"close_batch_done": true}'::jsonb) LIMIT 1"""), params).scalar()
-                if active is not None and active != batch['id']:
+                saved = conn.execute(text("""SELECT batch_id,payload FROM bot_close_batches
+                    WHERE account_key=:a AND symbol=:symbol AND NOT completed"""), params).mappings().first()
+                if saved is None:
+                    raise ExecutionError("Close batch changed or completed")
+                if saved['batch_id'] != batch['id']:
                     raise ExecutionError("Another close batch must finish first")
+                if saved['payload'] != json.loads(params['context'])['close_batch']:
+                    raise ExecutionError("Close batch targets changed after registration")
                 # Recheck under the account lock. A second worker may have
                 # completed this target after the caller read its snapshot.
                 target = next((p for p in batch['positions'] if str(p['positionId']) == params['pid']), None)
@@ -151,10 +211,11 @@ class ExecutionStore:
                         WHERE f.position_id=p.position_id AND f.account_key=:a)"""), params).scalar()
                 if projected is not None and projected != decimal(size):
                     raise ExecutionError("Close position quantity changed; refresh snapshot")
-            if settle == 'OPEN' and conn.execute(text("""SELECT 1 FROM bot_order_intents
-                WHERE account_key=:a AND context ? 'close_batch'
-                  AND NOT (context @> '{"close_batch_done": true}'::jsonb) LIMIT 1"""), params).first():
-                raise ExecutionError("Unfinished close batch blocks new exposure")
+            if settle == 'OPEN':
+                registered = conn.execute(text("""SELECT 1 FROM bot_close_batches
+                    WHERE account_key=:a AND NOT completed LIMIT 1"""), params).first()
+                if registered or self._legacy_close_batches(conn, account):
+                    raise ExecutionError("Unfinished close batch blocks new exposure")
             conn.execute(
                 text("""INSERT INTO bot_order_intents(client_order_id,account_key,symbol,side,settle_type,size,position_id,decision_key,request,context)
                 VALUES(:id,:a,:symbol,:side,:settle,:size,:pid,:key,CAST(:body AS jsonb),CAST(:context AS jsonb))"""),

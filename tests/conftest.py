@@ -43,6 +43,9 @@ def store():
         conn.exec_driver_sql(
             (ROOT / "migrations/001_execution_accounting.sql").read_text()
         )
+        conn.exec_driver_sql(
+            (ROOT / "migrations/002_durable_close_batches.sql").read_text()
+        )
     yield ExecutionStore(engine)
     engine.dispose()
     with admin.begin() as conn:
