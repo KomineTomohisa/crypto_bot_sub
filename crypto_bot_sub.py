@@ -7195,7 +7195,7 @@ class CryptoTradingBot(LiveExecutionMixin):
             self.log_entry(symbol, position_type, current_price, now_jst(), entry_rsi, entry_cci, entry_atr, entry_adx, entry_sentiment)
             
             # 通知送信（修正箇所）
-            if self.notification_settings.get('send_on_entry', True):
+            if not self.exchange_settings_gmo.get('live_trade', False) and self.notification_settings.get('send_on_entry', True):
                 # --- df_5min を安全に取得（signal_dataに無ければキャッシュ等から） ---
                 df_5min = None
                 # 1) シグナル生成側で _df_5min を埋めているケース
@@ -7397,6 +7397,15 @@ class CryptoTradingBot(LiveExecutionMixin):
     def _entry_direction(self, symbol, latest, previous, observed_at):
         blocked_until = self.reentry_block_until.get(symbol)
         direction = entry_side(latest, previous, observed_at, blocked_until)
+        if not hasattr(self, '_entry_notification_context'):
+            self._entry_notification_context = {}
+        if direction is None:
+            self._entry_notification_context.pop(symbol, None)
+        else:
+            self._entry_notification_context[symbol] = {
+                'direction': direction, 'decision_bar': str(latest['timestamp']),
+                'previous_bar': str(previous['timestamp']),
+            }
         record_bot_event(self, 'entry_decision', {
             'symbol': symbol, 'latest': latest.to_dict(), 'previous': previous.to_dict(),
             'blocked_until': blocked_until, 'direction': direction,

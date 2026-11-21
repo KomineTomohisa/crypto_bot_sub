@@ -52,6 +52,7 @@ def replay(
         opposite_narrow_state={"ltc_jpy": {"long": True, "short": True}},
         _last_valid_exit_levels={("ltc_jpy", "long", 300): {"original": True}},
         _exit_level_fallback_state={("ltc_jpy", "long", 300): ("missing_atr", "previous_levels")},
+        _entry_notification_context={"ltc_jpy": {"direction": "long", "decision_bar": "original"}},
         short_profit_lock_armed={"ltc_jpy": True},
         is_backtest=starting_backtest,
         sentiment={"bullish": 12.0},
@@ -66,6 +67,7 @@ def replay(
                 "opposite_narrow_state",
                 "_last_valid_exit_levels",
                 "_exit_level_fallback_state",
+                "_entry_notification_context",
                 "short_profit_lock_armed",
                 "is_backtest",
             )

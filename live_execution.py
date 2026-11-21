@@ -9,6 +9,7 @@ import time
 import uuid
 from copy import deepcopy
 from strategy_recording import record_bot_event
+from trade_notifications import compose_execution_notice, entry_snapshot
 
 from trading_execution import (
     ExchangeGateway,
@@ -127,13 +128,7 @@ class LiveExecutionMixin:
                     continue
                 result = service.reconcile(service.store.get(intent["client_order_id"]))
                 self._record_live_order_result(result)
-                if result["finalized"] and callable(
-                    getattr(self, "send_notification", None)
-                ):
-                    self.send_notification(
-                        "注文照合完了",
-                        f"{intent['symbol']}: 約定数量 {result['executed_size']}、状態 {result['status']}",
-                    )
+                self._notify_live_execution(result, recovered=True)
             except Exception as exc:
                 # Continue protecting other positions. Unknown orders still block new exposure.
                 self.logger.error(
@@ -353,6 +348,19 @@ class LiveExecutionMixin:
             "decision_price": str(raw["decision_price"]),
             "feature_snapshot": getattr(self, "_feature_event_refs", {}).get(symbol),
         }
+        try:
+            context['notification'] = entry_snapshot(getattr(self, '_entry_decision_snapshot', None), kwargs)
+        except Exception as exc:
+            self.logger.warning('Entry receipt snapshot unavailable (%s)', type(exc).__name__)
+            context['notification'] = {}
+        confirmation = getattr(self, '_entry_notification_context', {}).get(symbol, {})
+        if confirmation.get('direction') == ('long' if side == 'BUY' else 'short'):
+            try:
+                if timestamp(confirmation.get('decision_bar')) == timestamp(bar):
+                    context['notification']['previous_bar'] = confirmation['previous_bar']
+                    context['notification'].setdefault('signals', {})['sell_signal' if side == 'BUY' else 'buy_signal'] = True
+            except (ExecutionError, TypeError, ValueError, KeyError):
+                pass  # Optional notification evidence cannot alter an order decision.
         result = service.submit(
             self.symbol_mapping[symbol],
             side,
@@ -368,7 +376,43 @@ class LiveExecutionMixin:
                 "error": "This entry decision was already processed",
             }
         self._sync_live_positions(symbol)
+        self._notify_live_execution(result)
         return result
+
+    def _notify_live_execution(self, result, *, recovered=False):
+        """Receipt failures must not undo a recorded fill or stop later closes."""
+        settings = getattr(self, 'notification_settings', {}) or {}
+        send = getattr(self, 'send_notification', None)
+        if not settings.get('enabled', False) or not callable(send) or not result.get('finalized'):
+            return False
+        intent = result.get('intent') or {}
+        opened = intent.get('settle_type') == 'OPEN'
+        if not settings.get('send_on_entry' if opened else 'send_on_exit', True):
+            return False
+        if result.get('already_submitted'):
+            return False
+        try:
+            key = (result.get('client_order_id'), result.get('status'), result.get('executed_size'))
+            if key in getattr(self, '_notified_live_executions', set()):
+                return False
+            remaining = None
+            batch = (intent.get('context') or {}).get('close_batch')
+            if batch:
+                try:
+                    service = self._execution()
+                    remaining = sum(service.store.close_batch_remaining(service.account, batch).values())
+                except Exception as exc:
+                    self.logger.warning('Receipt remaining quantity unavailable (%s)', type(exc).__name__)
+            subject, body, kind = compose_execution_notice(result, recovered=recovered, remaining=remaining)
+            delivered = send(subject, body, kind) is True
+            if delivered:
+                if not hasattr(self, '_notified_live_executions'):
+                    self._notified_live_executions = set()
+                self._notified_live_executions.add(key)
+            return delivered
+        except Exception as exc:
+            self.logger.error('Trade receipt unavailable (%s)', type(exc).__name__)
+            return False
 
     def _record_live_order_result(self, result):
         """Use the same payload for immediate and recovered exchange outcomes."""
@@ -509,16 +553,8 @@ class LiveExecutionMixin:
                             "holding_hours": float(trade["holding_hours"]),
                         }
                     )
-                if result["success"] and result["finalized"] and self.notification_settings.get(
-                    "send_on_exit", True
-                ):
-                    gross = sum(t["pnl"] for t in result.get("trades", []))
-                    self.send_notification(
-                        f"{symbol} 決済約定",
-                        f"理由: {reason}\n実約定数量: {result['executed_size']}\n"
-                        f"売買損益（費用別）: {gross:,.2f}円\n残数量: {self.entry_sizes[symbol]}\n"
-                        "手数料・日次費用は実明細で別途集計します。",
-                    )
+                if result['success']:
+                    self._notify_live_execution(result)
         if complete and self.positions.get(symbol) is None:
             now = datetime.now(timezone.utc)
             self.reentry_block_until[symbol] = self._ceil_to_next_15min(now)

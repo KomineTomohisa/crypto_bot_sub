@@ -667,6 +667,8 @@ class ExecutionStore:
             "order_id": intent["exchange_order_id"],
             "client_order_id": client_id,
             "executed_size": float(size),
+            "execution_fee": sum((r['fee'] for r in rows), Decimal(0))
+            if rows and all(r['fee'] is not None for r in rows) else None,
             "execution_price": float(sum(r["size"] * r["price"] for r in rows) / size)
             if size
             else None,
