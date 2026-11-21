@@ -29,7 +29,8 @@ from urllib3.util.retry import Retry
 import socket
 from urllib.parse import urlencode
 from live_execution import LiveExecutionMixin
-from trading_execution import ExchangeGateway, ExecutionError, fallback_exit
+from trading_execution import ExchangeGateway, ExecutionError, ExchangeMaintenance, fallback_exit
+from exchange_availability import ExchangeAvailability
 from signal_scoring import MACD_SCORING_VERSION, causal_macd_scores, macd_scoring_spec
 from backtest_data import backtest_state, load_backtest_candles, excel_backtest_inputs
 from strategy_decisions import DECISION_VERSION, entry_side, exit_decision, short_profit_stop, jst_timestamp, next_entry_time, symbol_priority
@@ -120,6 +121,11 @@ def _make_session():
     )
     s.mount("https://", HTTPAdapter(max_retries=retry))
     s.mount("http://",  HTTPAdapter(max_retries=retry))
+    # GMO retry policy lives in the explicit GET loop/status scheduler. Inspect
+    # maintenance responses before another HTTP attempt; POST is never retried.
+    no_retry = Retry(total=0, read=0, connect=0, status=0, other=0,
+                     allowed_methods=frozenset(['GET']), raise_on_status=False)
+    s.mount('https://api.coin.z.com/', HTTPAdapter(max_retries=no_retry))
     return s
 
 HTTP_SESSION = _make_session()
@@ -760,18 +766,20 @@ class PriceCacheRefresher:
 
     def run_forever(self):
         import time
+        from market_quotes import checked_quote
         while True:
             start = time.time()
             for sym in self.symbols:
                 try:
-                    px = self.get_price(sym)
-                    if px and px > 0:
-                        upsert_price_cache(sym.lower(), px, dt.datetime.now(timezone.utc))
-                        if self.logger:
-                            self.logger.debug(f"[price_cache] {sym} = {px}")
+                    quote = checked_quote(self.get_price(sym), dt.datetime.now(timezone.utc))
+                    upsert_price_cache(sym.lower(), quote.price, quote.quoted_at)
+                    if self.logger:
+                        self.logger.debug(f"[price_cache] {sym} = {quote.price}")
+                except ExchangeMaintenance:
+                    continue  # The shared availability object records transitions.
                 except Exception as e:
                     if self.logger:
-                        self.logger.warning(f"[price_cache] {sym} failed: {e}")
+                        self.logger.warning('[price_cache] %s failed (%s)', sym, type(e).__name__)
             elapsed = time.time() - start
             time.sleep(max(0, self.interval - elapsed))
 
@@ -783,6 +791,7 @@ class GMOCoinAPI:
         self.api_secret = api_secret
         self.base_url = "https://api.coin.z.com/private"
         self.public_url = "https://api.coin.z.com/public"
+        self.availability = ExchangeAvailability(logging.getLogger('crypto_bot'))
         
     def _sign(self, method, timestamp, path, reqBody=""):
         """リクエストの署名を作成"""
@@ -797,6 +806,9 @@ class GMOCoinAPI:
         """
         APIリクエスト共通処理（署名は送信直前に毎回生成。リトライごとにtimestampを更新）
         """
+        availability = getattr(self, 'availability', None)
+        if availability is not None:
+            availability.require_available()
         base_url = self.base_url + path
 
         # GETクエリをURLへ付与（署名には含めない：pathのみでOK）
@@ -807,8 +819,10 @@ class GMOCoinAPI:
 
         body_str = json.dumps(data, separators=(',', ':')) if data else ""
 
-        # 最大3回リトライ（HTTP_SESSION側にもRetryはあるが、ここではtimestamp再生成のため明示）
+        # GETは最大3回。GMO専用adapterでは追加リトライせず、POSTは1回だけ。
         for attempt in range(3 if method == "GET" else 1):
+            if availability is not None:
+                availability.require_available()
             ts = str(int(time.time() * 1000))  # ← 毎回作り直す（Timestamp too late対策）
             headers = {
                 "API-KEY": self.api_key,
@@ -826,9 +840,14 @@ class GMOCoinAPI:
                     # 注意: 元のコードは data=body_str なので合わせています
                     r = HTTP_SESSION.post(url, headers=headers, data=body_str, timeout=timeout, allow_redirects=False)
 
+                payload = r.json()
+                if availability is not None:
+                    availability.observe(payload)
                 r.raise_for_status()
-                return r.json()
+                return payload
 
+            except ExchangeMaintenance:
+                raise
             except requests.exceptions.RequestException as e:
                 # DNS一時失敗は少し待って再試行
                 if _is_dns_temp_failure(e):
@@ -865,10 +884,16 @@ class GMOCoinAPI:
         return {"status": -1, "messages": [{"message_string": "unknown error"}]}
 
     def _public_request(self, path, params=None):
+        availability = getattr(self, 'availability', None)
+        if availability is not None and path != '/v1/status':
+            availability.require_available()
         response = HTTP_SESSION.get('https://api.coin.z.com/public' + path, params=params, timeout=8)
         try:
+            payload = response.json()
+            if availability is not None:
+                availability.observe(payload)
             response.raise_for_status()
-            return response.json()
+            return payload
         finally:
             response.close()
 
@@ -1709,6 +1734,8 @@ class CryptoTradingBot(LiveExecutionMixin):
         if self.exchange_settings_gmo.get("live_trade", False):
             try:
                 return float(ExchangeGateway(self.gmo_api).margin()['actualProfitLoss'])
+            except ExchangeMaintenance:
+                raise  # Unavailable equity must not be displayed as a zero balance.
             except Exception as exc:
                 self.logger.error("Equity unavailable (%s)", type(exc).__name__)
                 return 0.0
@@ -2024,7 +2051,7 @@ class CryptoTradingBot(LiveExecutionMixin):
 
 
     
-    def send_notification(self, subject, message, notification_type='info'):
+    def send_notification(self, subject, message, notification_type='info', *, _direct=False, notification_key=None):
         """通知を送信（メールとLINE）
         
         Parameters:
@@ -2033,7 +2060,7 @@ class CryptoTradingBot(LiveExecutionMixin):
         notification_type (str): 通知の種類 ('info', 'entry', 'exit', 'error')
         """
         if not self.notification_settings['enabled']:
-            return
+            return False
             
         # 通知タイプに基づいて送信するかどうかを判断
         should_send = False
@@ -2049,16 +2076,27 @@ class CryptoTradingBot(LiveExecutionMixin):
             should_send = True
         
         if not should_send:
-            return
-            
-        try:
-            # 1) メール
-            self._send_email(subject, message)
-            # 2) LINE（Messaging API）
-            self._send_line(subject, message)
+            return False
+
+        if not _direct and (getattr(self,'exchange_settings_gmo',{}) or {}).get('live_trade',False):
+            return self._enqueue_live_message(subject,message,notification_type,notification_key=notification_key)
+
+        sent = False
+        for channel in (self._send_email, self._send_line):
+            try:
+                delivered = channel(subject, message) is True
+                sent = delivered or sent
+            except Exception as exc:
+                self.logger.error('Notification channel failed (%s)', type(exc).__name__)
+        if sent:
             self.logger.info(f"通知送信完了: {subject}")
-        except Exception as e:
-            self.logger.error(f"通知送信エラー: {e}")
+        else:
+            self.logger.warning('通知の送信成功を確認できませんでした')
+        return sent
+
+    def _send_notification_direct(self, subject, message, notification_type='info'):
+        # Close-stall delivery has its own persisted acknowledgement protocol.
+        return self.send_notification(subject,message,notification_type,_direct=True)
 
     def _send_daily_report(self, stats: dict) -> None:
         """
@@ -2200,18 +2238,42 @@ class CryptoTradingBot(LiveExecutionMixin):
 
         return self.send_notification(subject, message, notification_type=nt)
 
-    def _send_line(self, subject: str, body: str) -> None:
+    def _send_line(self, subject: str, body: str, *, retry_key=None, recipient=None) -> bool:
         """LINE Messaging API 送信（宛先は DB→ENV の順で解決。なければ黙ってスキップ）"""
         try:
             # 宛先解決：DB（user_id 紐づけ）→ 環境変数 LINE_DEFAULT_USER_ID
-            line_user_id = None
-            if getattr(self, "user_id", None) is not None:
+            line_user_id = recipient
+            if line_user_id is None and getattr(self, "user_id", None) is not None:
                 line_user_id = get_line_user_id(self.user_id)  # U で始まる 32桁のhex
             if not line_user_id:
                 line_user_id = os.getenv("LINE_DEFAULT_USER_ID")
             if not line_user_id:
                 self.logger.info("LINE宛先が未設定のため送信スキップ")
-                return
+                return False
+
+            if retry_key is not None:
+                retry_key=str(uuid.UUID(str(retry_key)))
+                token=os.getenv('LINE_CHANNEL_ACCESS_TOKEN')
+                if not token:return False
+                response=None
+                try:
+                    response=requests.post('https://api.line.me/v2/bot/message/push',
+                        headers={'Authorization':'Bearer '+token,'Content-Type':'application/json','X-Line-Retry-Key':retry_key},
+                        json={'to':line_user_id,'messages':[{'type':'text','text':f'{subject}\n{body}'}]},
+                        timeout=10,allow_redirects=False)
+                    accepted=response.status_code==200
+                    if response.status_code==409:
+                        try:
+                            uuid.UUID(response.headers.get('x-line-accepted-request-id',''))
+                            accepted=True
+                        except (ValueError,TypeError,AttributeError):pass
+                    if accepted:self.logger.info('LINE送信受付を確認（永続通知）')
+                    else:self.logger.warning('LINE永続通知の送信未確認 (HTTP %s)',response.status_code)
+                    return accepted
+                finally:
+                    if response is not None:
+                        try:response.close()
+                        except Exception:pass
 
             client = LineMessaging()  # ENV の LINE_CHANNEL_ACCESS_TOKEN を利用
             ok = client.send_text(line_user_id, f"{subject}\n{body}")
@@ -2219,9 +2281,11 @@ class CryptoTradingBot(LiveExecutionMixin):
                 self.logger.info("LINE送信成功")
             else:
                 self.logger.warning("LINE送信失敗（詳細は直前のログ参照）")
+            return bool(ok)
         except Exception as e:
             # 失敗してもボットは止めない
-            self.logger.warning(f"LINE送信エラー: {e}")
+            self.logger.warning('LINE送信エラー (%s)', type(e).__name__)
+            return False
 
     # （将来用）複数ユーザー配信のヘルパ
     def _send_line_multicast(self, app_user_ids: list[int], text: str) -> None:
@@ -2343,21 +2407,21 @@ class CryptoTradingBot(LiveExecutionMixin):
             self.logger.error(f"notify_users_by_email エラー: {e}")
             return 0
     
-    def _send_email(self, subject, body):
+    def _send_email(self, subject, body, *, message_id=None, recipients=None):
         if not (self.notification_settings or {}).get('enabled', False):
-            return
+            return False
         try:
             email_settings = (self.notification_settings or {}).get('email', {}) or {}
             required_settings = ['smtp_server', 'smtp_port', 'sender', 'password']
             missing = [s for s in required_settings if not email_settings.get(s)]
             if missing:
                 self.logger.warning(f"メール設定が不完全: {missing}")
-                return
+                return False
 
-            recipients = self._resolve_recipients_for_mode()
+            recipients = list(recipients) if recipients is not None else self._resolve_recipients_for_mode()
             if not recipients:
                 self.logger.info("宛先なしのためスキップ")
-                return
+                return False
 
             # ★SIMタグ & 復号パスワード
             _subject = f"[SIM] {subject}" if self._is_sim_mode() else subject
@@ -2377,17 +2441,19 @@ class CryptoTradingBot(LiveExecutionMixin):
                             msg['From'] = email_settings['sender']
                             msg['To'] = rcpt
                             msg['Subject'] = str(Header(_subject, 'utf-8'))
+                            if message_id is not None:msg['Message-ID']=message_id
                             msg.attach(MIMEText(body, 'plain', 'utf-8'))
                             server.sendmail(email_settings['sender'], rcpt, msg.as_string())
                     self.logger.info(f"メール送信成功（{len(recipients)}件）")
-                    return
+                    return True
                 except Exception as e:
-                    self.logger.warning(f"SMTP送信失敗({attempt+1}/3): {e}")
+                    self.logger.warning('SMTP送信失敗(%s/3): %s', attempt + 1, type(e).__name__)
                     time.sleep(2 ** attempt)
 
             self.logger.error("メール送信リトライ上限に到達し失敗")
         except Exception as e:
-            self.logger.error(f"メール送信エラー: {e}")
+            self.logger.error('メール送信エラー (%s)', type(e).__name__)
+        return False
 
     def _send_exit_detail(self, symbol: str, exit_price: float, *, timeframe: str = "5m", reason: str | None = None) -> None:
         """
@@ -2593,9 +2659,7 @@ class CryptoTradingBot(LiveExecutionMixin):
             for symbol, data in positions_data.items():
                 if symbol not in self.symbols:
                     continue
-                self.short_profit_lock_armed[symbol] = bool(
-                    data.get("short_profit_lock_armed", False)
-                )
+                self.short_profit_lock_armed[symbol] = data.get("short_profit_lock_armed") is True
                 if not hasattr(self, '_saved_short_lock_position_ids'):
                     self._saved_short_lock_position_ids = {}
                 self._saved_short_lock_position_ids[symbol] = str(data.get('position_id'))
@@ -2744,83 +2808,60 @@ class CryptoTradingBot(LiveExecutionMixin):
         if not has_positions:
             self.logger.info("現在ポジションはありません")
 
-    def get_current_price(self, symbol):
-        try:
-            gmo_symbol = self.symbol_mapping.get(symbol, symbol.upper())
-            url = f'https://api.coin.z.com/public/v1/ticker?symbol={gmo_symbol}'
-            headers = {'User-Agent': 'Mozilla/5.0'}
-
-            # レート制限ウェイト
-            elapsed = time.time() - self.last_api_call
-            if elapsed < self.rate_limit_delay:
-                time.sleep(self.rate_limit_delay - elapsed)
-
-            # 最大3回の明示再試行（HTTP_SESSION側のRetryとは別にDNS対策）
-            last_exc = None
-            for attempt in range(3):
-                response = None
+    def get_current_price(self, symbol, *, with_timestamp=False):
+        from market_quotes import QuoteUnavailable, parse_ticker
+        availability = getattr(getattr(self, 'gmo_api', None), 'availability', None)
+        if availability is not None:
+            availability.require_available()
+        gmo_symbol = self.symbol_mapping.get(symbol, symbol.upper())
+        url = f'https://api.coin.z.com/public/v1/ticker?symbol={gmo_symbol}'
+        elapsed = time.time() - self.last_api_call
+        if elapsed < self.rate_limit_delay:
+            time.sleep(self.rate_limit_delay - elapsed)
+        last_reason = 'request_failed'
+        # Retry GET only. Invalid snapshots are not prices, including after retry.
+        for attempt in range(3):
+            response = None
+            try:
+                if availability is not None:
+                    availability.require_available()
+                response = HTTP_SESSION.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
+                self.last_api_call = time.time()
+                data = response.json()
+                if availability is not None:
+                    availability.observe(data)
+                response.raise_for_status()
+                observed_at = now_jst()
+                quote = parse_ticker(data, gmo_symbol, observed_at)
+                rows = data['data'] if isinstance(data['data'], list) else [data['data']]
+                record_bot_event(self, 'ticker_response', {
+                    'symbol': symbol, 'status': data['status'],
+                    'tickers': [{key: item.get(key) for key in ('symbol', 'timestamp', 'bid', 'ask', 'last')} for item in rows],
+                }, observed_at)
+                self.logger.info(f"{symbol} 現在価格: {quote.price}")
+                return quote if with_timestamp else quote.price
+            except ExchangeMaintenance:
+                record_bot_event(self, 'input_error', {'symbol': symbol, 'source': 'gmo_ticker', 'reason': 'exchange_maintenance'}, now_jst())
+                raise
+            except (QuoteUnavailable, requests.exceptions.RequestException, ValueError) as exc:
+                last_reason = (exc.reason if isinstance(exc, QuoteUnavailable) else
+                               'invalid_json' if isinstance(exc, ValueError) else 'request_failed')
+                record_bot_event(self, 'input_error', {
+                    'symbol': symbol, 'source': 'gmo_ticker', 'attempt': attempt + 1,
+                    'reason': last_reason, 'error_type': type(exc).__name__,
+                }, now_jst())
+                if attempt < 2:
+                    time.sleep((1.2 if _is_dns_temp_failure(exc) else 0.6) * (attempt + 1))
+            finally:
                 try:
-                    response = HTTP_SESSION.get(url, headers=headers, timeout=10)
-                    self.last_api_call = time.time()
+                    if response is not None:
+                        response.close()
+                except Exception:
+                    pass
+        raise QuoteUnavailable(last_reason)
 
-                    # HTTPエラーを明示的に例外化（4xx/5xx）
-                    response.raise_for_status()
-
-                    data = response.json()
-                    rows = data.get('data', [])
-                    rows = rows if isinstance(rows, list) else [rows]
-                    record_bot_event(self, 'ticker_response', {
-                        'symbol': symbol, 'status': data.get('status'),
-                        'tickers': [{key: item.get(key) for key in ('symbol', 'timestamp', 'bid', 'ask', 'last')} for item in rows if isinstance(item, dict)],
-                    }, now_jst())
-                    if data.get('status') == 0 and 'data' in data:
-                        ticker_data = data['data']
-                        if isinstance(ticker_data, list):
-                            for item in ticker_data:
-                                if item.get('symbol') == gmo_symbol:
-                                    last_price = float(item.get('last', 0))
-                                    self.logger.info(f"{symbol} 現在価格: {last_price}")
-                                    return last_price
-                            self.logger.warning(f"{symbol}（{gmo_symbol}）の価格データが見つかりません")
-                            return 0.0
-                        else:
-                            return float(ticker_data.get('last', 0))
-                    else:
-                        # GMOエラー形式
-                        if data.get('messages'):
-                            err = data['messages'][0].get("message_string", "不明なエラー")
-                        else:
-                            err = "不明なエラー"
-                        self.logger.error(f"GMOコイン価格取得エラー: {err}")
-                        return 0.0
-
-                except requests.exceptions.RequestException as e:
-                    last_exc = e
-                    record_bot_event(self, 'input_error', {'symbol': symbol, 'source': 'gmo_ticker', 'attempt': attempt + 1, 'error_type': type(e).__name__}, now_jst())
-                    if _is_dns_temp_failure(e):
-                        time.sleep(1.2 * (attempt + 1))
-                        continue
-                    time.sleep(0.6 * (attempt + 1))
-                    continue
-
-                finally:
-                    # Responseはコンテキストマネージャ非保証なので明示close
-                    try:
-                        if response is not None:
-                            response.close()
-                    except Exception:
-                        pass
-
-            if last_exc:
-                self.logger.error(f"価格取得APIリクエストエラー: {last_exc}")
-            return 0.0
-
-        except ValueError as e:
-            self.logger.error(f"価格取得JSONパースエラー: {e}")
-            return 0.0
-        except Exception as e:
-            self.logger.error(f"価格取得未知のエラー: {e}")
-            return 0.0
+    def _get_exit_quote(self, symbol):
+        return self.get_current_price(symbol, with_timestamp=True)
 
     
     def create_backup(self):
@@ -2848,6 +2889,10 @@ class CryptoTradingBot(LiveExecutionMixin):
             positions_file = os.path.join(self.base_dir, 'positions.json')
             if os.path.exists(positions_file):
                 shutil.copy2(positions_file, backup_dir)
+
+            protection = getattr(self, '_exit_protection_store', None)
+            if protection is not None and protection.path.is_file():
+                shutil.copy2(protection.path, backup_dir)
             
             # 増資データのバックアップ
             increase_file = os.path.join(self.base_dir, 'last_increase.json')
@@ -2885,7 +2930,9 @@ class CryptoTradingBot(LiveExecutionMixin):
         """GMOコインの信用取引建玉を使用してポジションを検証する"""
         if self.exchange_settings_gmo.get("live_trade", False):
             self._execution()  # Fail before orders if the additive DB migration is absent.
-            self._restore_short_profit_lock_state("real")
+            if not getattr(self, '_legacy_short_lock_loaded', False):
+                self._restore_short_profit_lock_state("real")
+                self._legacy_short_lock_loaded = True
             self._recover_live_orders()
             self._sync_live_positions()
             return
@@ -6403,13 +6450,19 @@ class CryptoTradingBot(LiveExecutionMixin):
             # 取引ログ用のリスト（バックテストと同様）
             trade_logs = []
 
-            # 起動時にポジション検証を実行
-            self.verify_positions()
-
             # 起動時の資産状況を取得
+            try:
+                self.verify_positions()
+            except ExchangeMaintenance:
+                self._queue_close_alerts()
+                self.logger.info('Exchange unavailable at startup; position verification deferred')
             try:
                 start_balance = self.get_total_balance()
                 self.logger.info(f"起動時資産: {start_balance:,.0f}円")
+            except ExchangeMaintenance:
+                self._queue_close_alerts()
+                start_balance = self.initial_capital
+                self.logger.info('Exchange unavailable at startup; equity and position verification deferred')
             except Exception as e:
                 self.logger.error(f"起動時資産取得エラー: {e}")
                 start_balance = self.initial_capital
@@ -6445,6 +6498,12 @@ class CryptoTradingBot(LiveExecutionMixin):
                 loop_start_time = now_jst()
                 
                 try:
+                    self._exchange_status_ready()
+                    availability = getattr(self.gmo_api, 'availability', None)
+                    if availability is not None and availability.blocked:
+                        self._queue_close_alerts()
+                        time.sleep(min(30, max(1, availability.seconds_until_probe())))
+                        continue
                     # 現在の日本時間を取得
                     jst_now = dt.datetime.now(JST)
                     
@@ -6542,6 +6601,8 @@ class CryptoTradingBot(LiveExecutionMixin):
                             if hasattr(self, 'df_5min'):
                                 del self.df_5min
                             
+                        except ExchangeMaintenance:
+                            raise
                         except Exception as e:
                             record_bot_event(self, 'input_error', {'symbol': symbol, 'source': 'symbol_processing', 'error_type': type(e).__name__}, now_jst())
                             self.logger.error(f"{symbol}の処理中にエラーが発生: {str(e)}", exc_info=True)
@@ -6570,6 +6631,9 @@ class CryptoTradingBot(LiveExecutionMixin):
                     if remain > 0:
                         time.sleep(remain)
                     
+                except ExchangeMaintenance:
+                    self._queue_close_alerts()
+                    time.sleep(1)  # Next cycle waits only for the shared status probe.
                 except requests.exceptions.RequestException as e:
                     # APIリクエスト関連のエラー
                     error_states['consecutive_api_errors'] += 1
@@ -6655,6 +6719,8 @@ class CryptoTradingBot(LiveExecutionMixin):
             self.is_backtest = False
             # 稼働状況のレポートを出力
             self._generate_final_report(start_date, start_balance, stats, trade_logs)
+            if callable(getattr(self,'_stop_trade_notifications',None)):
+                self._stop_trade_notifications()
             
             # 取引ログをファイルに保存
             # Excel出力は本番（live）のみ実行。SIM時はスキップして落ちないようにする
@@ -6684,20 +6750,19 @@ class CryptoTradingBot(LiveExecutionMixin):
                 self.logger.error("API認証情報が設定されていません")
                 return False
             
-            # 資産残高の取得を試みる
-            for symbol in self.symbols:
-                base_coin = symbol.split('_')[0]
-                balance = self.get_balance(base_coin)
-                self.logger.info(f"{base_coin}の残高取得テスト: {balance}")
-                # 通貨ごとに少なくとも1つは成功すればOK
-                if balance is not None:
-                    return True
-                    
-            self.logger.error("API接続テストに失敗しました")
-            return False
+            self._exchange_status_ready()
+            availability = getattr(self.gmo_api, 'availability', None)
+            if availability is not None:
+                availability.require_available()
+            self._live_margin_available()  # Validated authenticated account read, not a zero fallback.
+            self.logger.info('Authenticated exchange account read confirmed')
+            return True
+        except ExchangeMaintenance:
+            self.logger.info('Exchange maintenance confirmed; startup verification deferred until OPEN')
+            return True  # Keep the process alive; the main loop performs bounded status probes.
         
         except Exception as e:
-            self.logger.error(f"API接続検証中にエラーが発生: {str(e)}")
+            self.logger.error('API接続検証中にエラーが発生 (%s)', type(e).__name__)
             return False
 
     def _display_current_positions(self):
@@ -7188,7 +7253,7 @@ class CryptoTradingBot(LiveExecutionMixin):
             self.log_entry(symbol, position_type, current_price, now_jst(), entry_rsi, entry_cci, entry_atr, entry_adx, entry_sentiment)
             
             # 通知送信（修正箇所）
-            if self.notification_settings.get('send_on_entry', True):
+            if not self.exchange_settings_gmo.get('live_trade', False) and self.notification_settings.get('send_on_entry', True):
                 # --- df_5min を安全に取得（signal_dataに無ければキャッシュ等から） ---
                 df_5min = None
                 # 1) シグナル生成側で _df_5min を埋めているケース
@@ -7390,6 +7455,15 @@ class CryptoTradingBot(LiveExecutionMixin):
     def _entry_direction(self, symbol, latest, previous, observed_at):
         blocked_until = self.reentry_block_until.get(symbol)
         direction = entry_side(latest, previous, observed_at, blocked_until)
+        if not hasattr(self, '_entry_notification_context'):
+            self._entry_notification_context = {}
+        if direction is None:
+            self._entry_notification_context.pop(symbol, None)
+        else:
+            self._entry_notification_context[symbol] = {
+                'direction': direction, 'decision_bar': str(latest['timestamp']),
+                'previous_bar': str(previous['timestamp']),
+            }
         record_bot_event(self, 'entry_decision', {
             'symbol': symbol, 'latest': latest.to_dict(), 'previous': previous.to_dict(),
             'blocked_until': blocked_until, 'direction': direction,
@@ -7413,6 +7487,9 @@ class CryptoTradingBot(LiveExecutionMixin):
         if armed and not previous:
             self.logger.info("%s: Short利益保護ON", symbol)
             if not getattr(self, 'is_backtest', False):
+                persist = getattr(self, '_persist_exit_protection', None)
+                if callable(persist):
+                    persist(symbol)
                 self.save_positions()
         return stop
 
@@ -7469,6 +7546,7 @@ class CryptoTradingBot(LiveExecutionMixin):
         stats (dict): 統計情報の辞書
         trade_logs (list): 取引ログのリスト
         """
+        from market_quotes import MarketQuote, QuoteUnavailable, checked_quote, price_value
         position = self.positions.get(symbol)
         # ポジションが無ければ何もしない（SIMのループでNoneが混ざるケース対策）
         if not position:
@@ -7483,11 +7561,40 @@ class CryptoTradingBot(LiveExecutionMixin):
             self.entry_times[symbol] = entry_time
 
         entry_size = self.entry_sizes[symbol]
-        current_price = self.get_current_price(symbol)
+
+        def read_price():
+            reason = None
+            try:
+                source = getattr(self, '_get_exit_quote', self.get_current_price)
+                candidate = source(symbol)
+                price = (checked_quote(candidate, now_jst()).price if isinstance(candidate, MarketQuote)
+                         else price_value(candidate))
+                if price is None:
+                    reason = 'invalid_price'
+            except QuoteUnavailable as exc:
+                price, reason = None, exc.reason
+            status = getattr(self, '_exit_quote_status', None)
+            if callable(status):
+                status(symbol, reason)
+            if reason is not None:
+                record_bot_event(self, 'input_error', {'symbol': symbol, 'source': 'exit_quote', 'reason': reason}, now_jst())
+            return price
+
+        def time_exit_without_quote(at):
+            if (jst_timestamp(at) - jst_timestamp(entry_time)).total_seconds() < 72 * 3600:
+                return None
+            return self._evaluate_exit_event(symbol, pd.DataFrame(), position, entry_price, entry_time, at, None)
+
+        current_price = read_price()
         observed_at = now_jst()
-        decision = self._evaluate_exit_event(
-            symbol, df_5min, position, entry_price, entry_time, observed_at, current_price
-        )
+        if current_price is None:
+            decision = time_exit_without_quote(observed_at)
+            if decision is None:
+                return
+        else:
+            decision = self._evaluate_exit_event(
+                symbol, df_5min, position, entry_price, entry_time, observed_at, current_price
+            )
         # 近接時の価格観測も、同じ判定関数へ入れる。閾値での架空約定はしない。
         if decision.reason is None and current_price:
             band = 0.0005
@@ -7497,7 +7604,12 @@ class CryptoTradingBot(LiveExecutionMixin):
                 deadline = time.time() + 3.0
                 levels = {'take_profit_price': decision.take_profit, 'stop_loss_price': decision.base_stop}
                 while time.time() < deadline and decision.reason is None:
-                    current_price = self.get_current_price(symbol) or current_price
+                    current_price = read_price()
+                    if current_price is None:
+                        decision = time_exit_without_quote(now_jst())
+                        if decision is None:
+                            return
+                        break
                     decision = self._evaluate_exit_event(
                         symbol, df_5min, position, entry_price, entry_time,
                         now_jst(), current_price, levels=levels,
@@ -7517,6 +7629,9 @@ class CryptoTradingBot(LiveExecutionMixin):
             if self.exchange_settings_gmo.get("live_trade", False):
                 try:
                     self._close_live_position(symbol, exit_reason, stats, trade_logs)
+                except ExchangeMaintenance:
+                    self._queue_close_alerts()
+                    raise
                 except Exception as exc:
                     self.logger.error("%s: close not confirmed (%s): %s", symbol, type(exc).__name__,
                                       str(exc) if isinstance(exc, ExecutionError) else "details suppressed")
@@ -8428,16 +8543,50 @@ class CryptoTradingBot(LiveExecutionMixin):
         基本SLはあまり動かさず、TPをメインで調整する戦略
         （ロングはTPを伸ばしすぎず、SLはやや守備的に寄せる）
         """
+        key = (symbol, position_type, entry_price)
+
+        def use_fallback(reason):
+            # A missing candle/indicator is an expected input state. Preserve the
+            # last valid protection before consulting settings or changing locks.
+            previous = getattr(self, '_last_valid_exit_levels', {}).get(key)
+            if previous is not None:
+                levels = dict(previous)
+                source = 'previous_levels'
+            else:
+                settings = self._get_dynamic_profit_loss_settings(symbol, df_5min)
+                levels = fallback_exit(settings, position_type, entry_price)
+                source = 'base_settings'
+            if not hasattr(self, '_exit_level_fallback_state'):
+                self._exit_level_fallback_state = {}
+            state = (reason, source)
+            if self._exit_level_fallback_state.get(key) != state:
+                self.logger.warning('%s: exit levels fallback (%s; %s); retaining position monitoring',
+                                    symbol, reason, source)
+                self._exit_level_fallback_state[key] = state
+            return levels
+
+        if not isinstance(df_5min, pd.DataFrame) or df_5min.empty:
+            return use_fallback('missing_candles')
+        if 'ATR' not in df_5min.columns:
+            return use_fallback('missing_atr')
+        if len(df_5min) < 2:
+            return use_fallback('insufficient_closed_history')
+        # The final row is forming. Never drop missing rows before selecting the
+        # closed candle: doing so could substitute an older or forming ATR.
+        value = df_5min['ATR'].iloc[-2]
+        if isinstance(value, (bool, np.bool_)):
+            return use_fallback('invalid_atr')
+        try:
+            atr = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return use_fallback('invalid_atr')
+        if not np.isfinite(atr) or atr <= 0:
+            return use_fallback('invalid_atr')
+        if 'ADX' not in df_5min.columns:
+            return use_fallback('missing_adx')
+
         try:
             # ========= ATR / ADX の安全取得 =========
-            atr_series = df_5min['ATR'].dropna()
-            if len(atr_series) == 0:
-                raise ValueError("ATRデータが存在しません。")
-            elif len(atr_series) == 1:
-                atr = atr_series.iloc[-1]
-            else:
-                atr = atr_series.iloc[-2]
-
             adx_series = df_5min['ADX'].dropna()
             if len(adx_series) == 0:
                 adx = None
@@ -8761,13 +8910,18 @@ class CryptoTradingBot(LiveExecutionMixin):
             if not hasattr(self, '_last_valid_exit_levels'):
                 self._last_valid_exit_levels = {}
             self._last_valid_exit_levels[(symbol, position_type, entry_price)] = dict(levels)
+            if not getattr(self, 'is_backtest', False):
+                persist = getattr(self, '_persist_exit_protection', None)
+                if callable(persist):
+                    persist(symbol)
+            state = getattr(self, '_exit_level_fallback_state', {})
+            if state.pop(key, None) is not None:
+                self.logger.info('%s: exit level calculation recovered', symbol)
             return levels
 
         except Exception as e:
             self.logger.error(f"{symbol}のATR利確損切計算中にエラー: {str(e)}", exc_info=True)
-            default_settings = self._get_dynamic_profit_loss_settings(symbol, df_5min)
-            previous = getattr(self, '_last_valid_exit_levels', {}).get((symbol, position_type, entry_price))
-            return dict(previous) if previous is not None else fallback_exit(default_settings, position_type, entry_price)
+            return use_fallback('calculation_error')
 
 # ================================
 # メイン実行部分（統一版・重複禁止）
@@ -8877,7 +9031,7 @@ if __name__ == "__main__":
             from threading import Thread
             refresher = PriceCacheRefresher(
                 bot.symbols,
-                bot.get_current_price,
+                lambda symbol: bot.get_current_price(symbol, with_timestamp=True),
                 interval_sec=30,
                 logger=bot.logger
             )

@@ -7,12 +7,15 @@ import hashlib
 import os
 import time
 import uuid
+from copy import deepcopy
 from strategy_recording import record_bot_event
+from trade_notifications import entry_snapshot
 
 from trading_execution import (
     ExchangeGateway,
     ExecutionError,
     ExecutionPending,
+    ExchangeMaintenance,
     ExecutionService,
     account_key,
     decimal,
@@ -38,6 +41,13 @@ class LiveExecutionMixin:
     def _live_margin_available(self):
         return self._execution().gateway.margin()
 
+    def _exchange_status_ready(self):
+        api = getattr(self, 'gmo_api', None)
+        availability = getattr(api, 'availability', None)
+        if availability is None:
+            return True  # Paper adapters and older test doubles have no exchange status.
+        return availability.poll(lambda: api._public_request('/v1/status'))
+
     def _live_order_size(self, symbol, size):
         rule = self._execution().gateway.rule(self.symbol_mapping[symbol])
         quantity = normalize_size(size, rule["sizeStep"], rule["minOrderSize"])
@@ -46,6 +56,9 @@ class LiveExecutionMixin:
         return quantity, rule
 
     def _live_funds_check(self, symbol, side, size):
+        if not self._exchange_status_ready():
+            record_bot_event(self, 'funds_blocked', {'symbol': symbol, 'reason': 'exchange_status_unconfirmed'})
+            return False
         service = self._execution()
         if service.store.pending(service.account) or service.store.close_batches(service.account):
             # An unconfirmed account order may already have consumed margin.
@@ -88,6 +101,7 @@ class LiveExecutionMixin:
 
     def _recover_live_orders(self):
         service = self._execution()
+        self._queue_trade_notifications()
         if getattr(self, '_record_inputs', False) and not getattr(self, '_execution_events_backfilled', False):
             try:
                 # Export a bounded number per cycle. Stable event IDs permit
@@ -116,6 +130,7 @@ class LiveExecutionMixin:
             self.logger.error(
                 "Order ledger unavailable; new orders blocked (%s)", type(exc).__name__
             )
+            self._queue_close_alerts()
             return
         for intent in pending:
             try:
@@ -123,15 +138,13 @@ class LiveExecutionMixin:
                     intent["client_order_id"]
                 ):
                     continue
-                result = service.reconcile(service.store.get(intent["client_order_id"]))
+                service.store.set_notification_preferences(service.account,intent['client_order_id'],self._notification_preferences())
+                result = service.reconcile(service.store.get(intent["client_order_id"]), recovered=True)
                 self._record_live_order_result(result)
-                if result["finalized"] and callable(
-                    getattr(self, "send_notification", None)
-                ):
-                    self.send_notification(
-                        "注文照合完了",
-                        f"{intent['symbol']}: 約定数量 {result['executed_size']}、状態 {result['status']}",
-                    )
+                self._notify_live_execution(result, recovered=True)
+            except ExchangeMaintenance:
+                self._queue_close_alerts()
+                raise
             except Exception as exc:
                 # Continue protecting other positions. Unknown orders still block new exposure.
                 self.logger.error(
@@ -162,11 +175,15 @@ class LiveExecutionMixin:
         for batch in batches:
             try:
                 self._drive_live_close_batch(batch)
+            except ExchangeMaintenance:
+                self._queue_close_alerts()
+                raise
             except Exception as exc:
                 self.logger.error(
                     "Close batch not completed (%s): %s", type(exc).__name__,
                     str(exc) if isinstance(exc, ExecutionError) else "details suppressed",
                 )
+        self._queue_close_alerts()
         now = time.monotonic()
         if now >= getattr(self, "_next_fee_sync", 0):
             self._next_fee_sync = now + 3600
@@ -175,20 +192,161 @@ class LiveExecutionMixin:
                     datetime.now(timezone.utc) + timedelta(hours=9) - timedelta(hours=6)
                 ).date()
                 service.sync_fees(today)
+            except ExchangeMaintenance:
+                self._next_fee_sync = 0  # Retry promptly after explicit OPEN, not an hour later.
+                raise
             except Exception as exc:
                 self.logger.error(
                     "Daily exchange fees not confirmed (%s): %s", type(exc).__name__,
                     str(exc) if isinstance(exc, ExecutionError) else "details suppressed"
                 )
 
+    def _queue_close_alerts(self):
+        settings = getattr(self, 'notification_settings', {}) or {}
+        if not settings.get('enabled', False) or not settings.get('send_on_error', False):
+            return
+        if not callable(getattr(self, 'send_notification', None)):
+            return
+        try:
+            from close_alerts import CloseAlertPolicy, CloseAlertWorker
+            service = self._execution()
+            worker = getattr(self, '_close_alert_worker', None)
+            if worker is None or not worker.thread.is_alive():
+                policy = CloseAlertPolicy.from_environment(self.logger)
+                sender = getattr(self, '_send_notification_direct', self.send_notification)
+                worker = CloseAlertWorker(service.store, service.account, sender, self.logger, policy)
+                self._close_alert_worker = worker
+            for job in service.store.claim_close_alerts(service.account, worker.policy):
+                if not worker.submit(job):
+                    service.store.finish_close_alert(service.account, job, False)
+        except Exception as exc:
+            self.logger.error('Close stall monitoring unavailable (%s)', type(exc).__name__)
+
     def _reset_exit_adjustments(self, symbol):
         """Clear per-trade exit state without disturbing other symbols."""
+        getattr(self, '_exit_quote_failures', {}).pop(symbol, None)
         if hasattr(self, "opposite_narrow_state"):
             self.opposite_narrow_state[symbol] = {"long": False, "short": False}
         cache = getattr(self, "_last_valid_exit_levels", {})
         for key in list(cache):
             if key[0] == symbol:
                 cache.pop(key, None)
+        fallback_state = getattr(self, '_exit_level_fallback_state', {})
+        for key in list(fallback_state):
+            if key[0] == symbol:
+                fallback_state.pop(key, None)
+
+    def _exit_protection_error(self, stage, exc):
+        if not hasattr(self, '_exit_protection_errors'):
+            self._exit_protection_errors = {}
+        kind = type(exc).__name__
+        if self._exit_protection_errors.get(stage) != kind:
+            self.logger.error('Exit protection persistence unavailable (%s; %s)', stage, kind)
+        self._exit_protection_errors[stage] = kind
+
+    def _exit_protection_recovered(self, stage):
+        if getattr(self, '_exit_protection_errors', {}).pop(stage, None):
+            self.logger.info('Exit protection persistence recovered (%s)', stage)
+
+    def _exit_protection_file(self):
+        if (getattr(self, 'is_backtest', False) or
+                not (getattr(self, 'exchange_settings_gmo', {}) or {}).get('live_trade', False) or
+                not getattr(self, 'base_dir', None)):
+            return None
+        try:
+            from exit_protection import ExitProtectionFile
+            account = self._execution().account
+            store = getattr(self, '_exit_protection_store', None)
+            if store is None or store.account != account:
+                store = ExitProtectionFile(self.base_dir, account)
+                store.load()
+                self._exit_protection_store = store
+            self._exit_protection_recovered('load')
+            return store
+        except Exception as exc:
+            self._exit_protection_error('load', exc)
+            return None
+
+    def _persist_exit_protection(self, symbol):
+        # A failed/absent exchange snapshot must never replace the last saved
+        # state with guessed positions or erase another symbol's protection.
+        if symbol in getattr(self, '_position_sync_failed', set()):
+            return False
+        rows = getattr(self, '_verified_position_snapshots', {}).get(symbol)
+        if not rows:
+            return False
+        store = self._exit_protection_file()
+        if store is None:
+            return False
+        if (store.account, symbol) not in getattr(self, '_exit_protection_restored', set()):
+            return False  # Do not overwrite a snapshot not yet checked after a read failure.
+        try:
+            from exit_protection import make_snapshot
+            side, entry = self.positions[symbol], self.entry_prices[symbol]
+            snapshot = make_snapshot(
+                store.account, symbol, rows, side, entry,
+                getattr(self, 'opposite_narrow_state', {}).get(symbol, {}).get(side, False),
+                self.short_profit_lock_armed.get(symbol, False),
+                getattr(self, '_last_valid_exit_levels', {}).get((symbol, side, entry)),
+            )
+            store.update(symbol, snapshot)
+            store.save()
+            self._exit_protection_recovered('write')
+            return True
+        except Exception as exc:
+            self._exit_protection_error('write', exc)
+            return False
+
+    def _sync_exit_protection(self, symbol, rows):
+        store = self._exit_protection_file()
+        if store is None:
+            return
+        try:
+            if not hasattr(self, '_exit_protection_restored'):
+                self._exit_protection_restored = set()
+            key = (store.account, symbol)
+            if not rows:
+                store.update(symbol, None)
+                store.save()
+                self._exit_protection_restored.add(key)
+                self._exit_protection_recovered('write')
+                return
+            if key not in self._exit_protection_restored:
+                saved = store.snapshots.get(symbol)
+                if saved is not None:
+                    from exit_protection import restore_snapshot
+                    try:
+                        state = restore_snapshot(saved, store.account, symbol, rows,
+                                                 self.positions[symbol], self.entry_prices[symbol])
+                    except (ValueError, TypeError, KeyError, OverflowError):
+                        state = None
+                        self.logger.warning('%s: invalid saved exit protection discarded', symbol)
+                    if state is not None:
+                        side, entry = self.positions[symbol], self.entry_prices[symbol]
+                        if not hasattr(self, 'opposite_narrow_state'):
+                            self.opposite_narrow_state = {}
+                        self.opposite_narrow_state[symbol] = {'long': False, 'short': False}
+                        self.opposite_narrow_state[symbol][side] = state['opposite_narrow']
+                        # Arming is monotonic for the same verified position.
+                        # A newer legacy save can survive a failed protection-file
+                        # write; never disarm that already verified protection.
+                        self.short_profit_lock_armed[symbol] = (
+                            state['short_profit_lock'] or self.short_profit_lock_armed.get(symbol, False)
+                        )
+                        if state['levels'] is not None:
+                            if not hasattr(self, '_last_valid_exit_levels'):
+                                self._last_valid_exit_levels = {}
+                            self._last_valid_exit_levels[(symbol, side, entry)] = state['levels']
+                        self.logger.info('%s: verified exit protection restored', symbol)
+                    else:
+                        self.logger.info('%s: saved exit protection does not match current positions', symbol)
+                self._exit_protection_restored.add(key)
+            # A temporary sync failure from a previous cycle is now resolved.
+            if hasattr(self, '_position_sync_failed'):
+                self._position_sync_failed.discard(symbol)
+            self._persist_exit_protection(symbol)
+        except Exception as exc:
+            self._exit_protection_error('write', exc)
 
     def _sync_live_positions(self, symbol=None):
         service = self._execution()
@@ -216,8 +374,10 @@ class LiveExecutionMixin:
                     self.short_profit_lock_armed[sym] = False
                     self._reset_exit_adjustments(sym)
                     getattr(self, "_exit_position_ids", {}).pop(sym, None)
+                    getattr(self, "_verified_position_snapshots", {}).pop(sym, None)
                     if hasattr(self, "_position_sync_failed"):
                         self._position_sync_failed.discard(sym)
+                    self._sync_exit_protection(sym, [])
                     continue
                 size = sum(decimal(r["size"]) for r in rows)
                 price = (
@@ -236,9 +396,16 @@ class LiveExecutionMixin:
                         if known_pid is not None
                         else frozenset()
                     )
-                continuous = bool(
-                    previous_ids.intersection(current_ids)
-                ) and previous_side in (None, side)
+                continuous = bool(previous_ids) and current_ids <= previous_ids and previous_side in (None, side)
+                prior_rows = getattr(self, '_verified_position_snapshots', {}).get(sym)
+                if continuous and prior_rows:
+                    from exit_protection import position_basis
+                    prior_basis, current_basis = position_basis(prior_rows), position_basis(rows)
+                    continuous = all(
+                        all(row[key] == prior_basis[pid][key] for key in ('symbol', 'side', 'price', 'opened_at'))
+                        and decimal(row['size']) <= decimal(prior_basis[pid]['size'])
+                        for pid, row in current_basis.items()
+                    )
                 if not continuous:
                     self._reset_exit_adjustments(sym)
                 if side != "short" or not continuous:
@@ -246,6 +413,9 @@ class LiveExecutionMixin:
                 if not hasattr(self, "_exit_position_ids"):
                     self._exit_position_ids = {}
                 self._exit_position_ids[sym] = current_ids
+                if not hasattr(self, '_verified_position_snapshots'):
+                    self._verified_position_snapshots = {}
+                self._verified_position_snapshots[sym] = deepcopy(rows)
                 self.positions[sym] = side
                 self.entry_sizes[sym] = float(size)
                 self.entry_prices[sym] = float(price)
@@ -257,6 +427,12 @@ class LiveExecutionMixin:
                 self.entry_scores[sym] = context.get(
                     "scores", self.entry_scores.get(sym, {})
                 )
+                self._sync_exit_protection(sym, rows)
+            except ExchangeMaintenance:
+                if not hasattr(self, '_position_sync_failed'):
+                    self._position_sync_failed = set()
+                self._position_sync_failed.update(self.symbols)
+                raise  # Preserve all prior snapshots, quantities and protection state.
             except Exception as exc:
                 # Missing data is not proof that a position has disappeared.
                 self.logger.error(
@@ -321,7 +497,21 @@ class LiveExecutionMixin:
             "decision_bar": str(bar),
             "decision_price": str(raw["decision_price"]),
             "feature_snapshot": getattr(self, "_feature_event_refs", {}).get(symbol),
+            "notification_delivery": self._notification_preferences(),
         }
+        try:
+            context['notification'] = entry_snapshot(getattr(self, '_entry_decision_snapshot', None), kwargs)
+        except Exception as exc:
+            self.logger.warning('Entry receipt snapshot unavailable (%s)', type(exc).__name__)
+            context['notification'] = {}
+        confirmation = getattr(self, '_entry_notification_context', {}).get(symbol, {})
+        if confirmation.get('direction') == ('long' if side == 'BUY' else 'short'):
+            try:
+                if timestamp(confirmation.get('decision_bar')) == timestamp(bar):
+                    context['notification']['previous_bar'] = confirmation['previous_bar']
+                    context['notification'].setdefault('signals', {})['sell_signal' if side == 'BUY' else 'buy_signal'] = True
+            except (ExecutionError, TypeError, ValueError, KeyError):
+                pass  # Optional notification evidence cannot alter an order decision.
         result = service.submit(
             self.symbol_mapping[symbol],
             side,
@@ -337,7 +527,117 @@ class LiveExecutionMixin:
                 "error": "This entry decision was already processed",
             }
         self._sync_live_positions(symbol)
+        self._notify_live_execution(result)
         return result
+
+    def _configured_trade_channels(self):
+        settings=getattr(self,'notification_settings',{}) or {}
+        email=settings.get('email') or {}
+        channels=[]
+        if all(email.get(key) for key in ('smtp_server','smtp_port','sender','password','recipient')):
+            channels.append('email')
+        if os.getenv('LINE_CHANNEL_ACCESS_TOKEN') and (os.getenv('LINE_DEFAULT_USER_ID') or getattr(self,'user_id',None) is not None):
+            channels.append('line')
+        return channels
+
+    def _notification_preferences(self):
+        settings = getattr(self, 'notification_settings', {}) or {}
+        return {'enabled':bool(settings.get('enabled',False)),
+                'entry':bool(settings.get('send_on_entry',True)), 'exit':bool(settings.get('send_on_exit',True)),
+                'error':bool(settings.get('send_on_error',True)), 'info':True,
+                'daily_report':bool(settings.get('daily_report',False)),
+                'channels':self._configured_trade_channels()}
+
+    def _outbox_enabled(self, kind):
+        prefs=self._notification_preferences()
+        return prefs['enabled'] and prefs.get(kind,False)
+
+    def _prepare_notification_route(self, channel):
+        if channel not in self._configured_trade_channels():return None
+        if channel=='email':return self._resolve_recipients_for_mode()
+        recipient=None
+        if getattr(self,'user_id',None) is not None:
+            from db import get_line_user_id
+            recipient=get_line_user_id(self.user_id)
+        return recipient or os.getenv('LINE_DEFAULT_USER_ID')
+
+    def _deliver_outbox_notification(self, channel, subject, body, kind, job_id, route):
+        if channel=='email':
+            return self._send_email(subject,body,message_id=f'<{job_id}@crypto-bot.invalid>',recipients=route)
+        return self._send_line(subject,body,retry_key=job_id,recipient=route)
+
+    def _queue_trade_notifications(self):
+        if not (getattr(self,'notification_settings',{}) or {}).get('enabled',False):return
+        try:
+            from notification_outbox import NotificationOutboxWorker
+            service=self._execution()
+            worker=getattr(self,'_trade_notification_worker',None)
+            if worker is None or not worker.thread.is_alive():
+                worker=NotificationOutboxWorker(service.store,service.account,self._outbox_enabled,
+                    self._prepare_notification_route,self._deliver_outbox_notification,self.logger)
+                self._trade_notification_worker=worker
+            worker.wake()
+        except Exception as exc:
+            self.logger.error('Notification dispatch unavailable (%s)',type(exc).__name__)
+
+    def _notify_live_execution(self, result, *, recovered=False):
+        # Finalized fills and their per-channel jobs already committed atomically.
+        if result.get('finalized') and not result.get('already_submitted'):
+            self._queue_trade_notifications()
+        return False
+
+    def _enqueue_live_message(self, subject, body, kind='info', *, notification_key=None):
+        try:
+            from notification_outbox import safe_message
+            service=self._execution()
+            count=service.store.enqueue_message(service.account,notification_key or 'message:'+uuid.uuid4().hex,
+                self._notification_preferences(),safe_message(subject),safe_message(body),kind)
+            self._queue_trade_notifications()
+            return bool(count)
+        except Exception as exc:
+            self.logger.error('Notification enqueue failed (%s)',type(exc).__name__)
+            return False
+
+    def _stop_trade_notifications(self):
+        worker=getattr(self,'_trade_notification_worker',None)
+        if worker is not None:worker.close(1)
+
+    def _exit_quote_status(self, symbol, reason=None):
+        failures = getattr(self, '_exit_quote_failures', {})
+        state = failures.get(symbol)
+        if reason is None and state is None:
+            return
+        if not hasattr(self, '_exit_quote_failures'):
+            self._exit_quote_failures = failures
+        live = ((getattr(self, 'exchange_settings_gmo', {}) or {}).get('live_trade', False)
+                and not getattr(self, 'is_backtest', False))
+        send = getattr(self, 'send_notification', None)
+        if reason is not None:
+            if state is None:
+                state = {'id': uuid.uuid4().hex, 'reason': None, 'notified': False}
+                failures[symbol] = state
+            if state['reason'] != reason:
+                self.logger.warning('%s: exit quote unavailable (%s); retaining position and protection', symbol, reason)
+                state['reason'] = reason
+            if live and callable(send) and not state['notified']:
+                try:
+                    state['notified'] = send(
+                        f'{symbol} 決済価格の確認不可',
+                        '有効な現在価格を取得できません。価格による利確・損切り判定を保留し、再取得を続けています。'
+                        '建玉と保護状態は保持しています。保有期限による決済と保存済み決済要求の照合は継続します。',
+                        'error', notification_key=f"exit-quote:{symbol}:{state['id']}:unavailable",
+                    ) is True
+                except Exception as exc:
+                    self.logger.error('Exit quote alert enqueue failed (%s)', type(exc).__name__)
+            return
+        failures.pop(symbol, None)
+        self.logger.info('%s: exit quote recovered; resuming price-based protection', symbol)
+        if live and callable(send) and state['notified']:
+            try:
+                send(f'{symbol} 決済価格の確認復旧', '有効な現在価格を取得できました。価格による利確・損切り判定を再開します。',
+                     'info', notification_key=f"exit-quote:{symbol}:{state['id']}:recovered")
+            except Exception as exc:
+                self.logger.error('Exit quote recovery notice enqueue failed (%s)', type(exc).__name__)
 
     def _record_live_order_result(self, result):
         """Use the same payload for immediate and recovered exchange outcomes."""
@@ -371,15 +671,22 @@ class LiveExecutionMixin:
         if batches:
             batch = batches[0]
         else:
-            positions = service.gateway.positions(self.symbol_mapping[symbol])
-            if not positions:
-                self._sync_live_positions(symbol)
-                return
             side = self.positions[symbol]
-            if any(p["side"] != ("BUY" if side == "long" else "SELL") for p in positions):
-                raise ExecutionError("Position direction changed during close")
+            snapshot = getattr(self, '_verified_position_snapshots', {}).get(symbol)
+            if snapshot:
+                sizes = {str(p['positionId']): str(p['size']) for p in snapshot}
+                ids = sorted(sizes)
+                total = str(sum((decimal(size) for size in sizes.values()), decimal(0)))
+            else:
+                known = getattr(self, '_exit_position_ids', {}).get(symbol)
+                pid = getattr(self, 'position_ids', {}).get(symbol)
+                ids = sorted(str(value) for value in known) if known is not None else ([str(pid)] if pid is not None else [])
+                sizes = None
+                size = getattr(self, 'entry_sizes', {}).get(symbol)
+                total = str(size) if size else None
             batch = {"id": uuid.uuid4().hex, "symbol": symbol, "side": side,
-                     "reason": reason, "positions": positions,
+                     "reason": reason, "positions": None,
+                     "target_ids": ids, "target_sizes": sizes, "target_total": total,
                      "scores": self.entry_scores.get(symbol, {}),
                      "user_id": getattr(self, "user_id", None),
                      "feature_snapshot": getattr(self, "_feature_event_refs", {}).get(symbol)}
@@ -401,6 +708,12 @@ class LiveExecutionMixin:
             )
             return
         positions = service.gateway.positions(self.symbol_mapping[symbol])
+        if batch.get('positions') is None:
+            targets = set(batch['target_ids'])
+            selected = [p for p in positions if str(p['positionId']) in targets]
+            batch = service.store.resolve_close_batch(
+                service.account, self.symbol_mapping[symbol], batch['id'], selected
+            )
         remaining = service.store.close_batch_remaining(service.account, batch)
         current = {str(p["positionId"]): p for p in positions}
         # A disappearing target without our recorded fills is an unresolved
@@ -422,6 +735,7 @@ class LiveExecutionMixin:
                 "exit_reason": reason,
                 "scores": batch["scores"], "user_id": batch["user_id"],
                 "feature_snapshot": batch.get("feature_snapshot"), "close_batch": batch,
+                "notification_delivery": self._notification_preferences(),
             }
             try:
                 result = service.submit(
@@ -465,16 +779,8 @@ class LiveExecutionMixin:
                             "holding_hours": float(trade["holding_hours"]),
                         }
                     )
-                if result["success"] and result["finalized"] and self.notification_settings.get(
-                    "send_on_exit", True
-                ):
-                    gross = sum(t["pnl"] for t in result.get("trades", []))
-                    self.send_notification(
-                        f"{symbol} 決済約定",
-                        f"理由: {reason}\n実約定数量: {result['executed_size']}\n"
-                        f"売買損益（費用別）: {gross:,.2f}円\n残数量: {self.entry_sizes[symbol]}\n"
-                        "手数料・日次費用は実明細で別途集計します。",
-                    )
+                if result['success']:
+                    self._notify_live_execution(result)
         if complete and self.positions.get(symbol) is None:
             now = datetime.now(timezone.utc)
             self.reentry_block_until[symbol] = self._ceil_to_next_15min(now)

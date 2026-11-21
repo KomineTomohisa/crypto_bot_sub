@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 import json
 import uuid
@@ -30,6 +30,90 @@ class ExecutionStore:
             conn.execute(text("SELECT client_order_id FROM bot_order_intents LIMIT 0"))
             conn.execute(text("SELECT net_pnl_before_carry FROM trades LIMIT 0"))
             conn.execute(text("SELECT batch_id,payload,completed FROM bot_close_batches LIMIT 0"))
+            conn.execute(text("""SELECT alert_last_attempt_at,alert_last_attempt_kind,
+                alert_warning_sent_at,alert_recovery_sent_at,alert_claim_token,alert_claim_until
+                FROM bot_close_batches LIMIT 0"""))
+            conn.execute(text('SELECT job_id,claim_token,delivered_at FROM bot_notification_outbox LIMIT 0'))
+
+    @staticmethod
+    def _insert_notifications(conn, account, event_key, preferences, kind, *, client_id=None,
+                              recovered=False, subject=None, body=None):
+        if not isinstance(preferences,dict) or preferences.get('enabled') is not True or preferences.get(kind,kind=='info') is not True:
+            return 0
+        if not isinstance(preferences.get('channels'),list):return 0
+        count = 0
+        for channel in ('email', 'line'):
+            if channel not in preferences.get('channels', []):
+                continue
+            job_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f'crypto-bot:{account}:{event_key}:{channel}'))
+            result = conn.execute(text("""INSERT INTO bot_notification_outbox
+                (job_id,account_key,event_key,client_order_id,channel,kind,recovered,subject,body)
+                VALUES(:id,:a,:key,:cid,:channel,:kind,:recovered,:subject,:body)
+                ON CONFLICT(account_key,event_key,channel) DO NOTHING"""),
+                {'id':job_id,'a':account,'key':event_key,'cid':client_id,'channel':channel,
+                 'kind':kind,'recovered':recovered,'subject':subject,'body':body})
+            count += result.rowcount
+        return count
+
+    def set_notification_preferences(self, account, client_id, preferences):
+        """Adopt only unfinished pre-upgrade intents, never replay historical mail."""
+        with self.engine.begin() as conn:
+            conn.execute(text("""UPDATE bot_order_intents
+                SET context=context || jsonb_build_object('notification_delivery',CAST(:prefs AS jsonb))
+                WHERE account_key=:a AND client_order_id=:id AND NOT finalized
+                  AND NOT(context ? 'notification_delivery')"""),
+                {'a':account,'id':client_id,'prefs':json_value(preferences)})
+
+    def enqueue_message(self, account, event_key, preferences, subject, body, kind):
+        with self.engine.begin() as conn:
+            return self._insert_notifications(conn,account,event_key,preferences,kind,subject=subject,body=body)
+
+    def claim_notification(self, account, *, now=None, lease_seconds=600):
+        with self.engine.begin() as conn:
+            at = timestamp(now) if now is not None else conn.execute(text('SELECT clock_timestamp()')).scalar_one()
+            row = conn.execute(text("""SELECT job_id FROM bot_notification_outbox
+                WHERE account_key=:a AND delivered_at IS NULL AND terminal_reason IS NULL
+                  AND next_attempt_at<=:now AND (claim_until IS NULL OR claim_until<=:now)
+                ORDER BY created_at,job_id LIMIT 1 FOR UPDATE SKIP LOCKED"""),{'a':account,'now':at}).first()
+            if row is None:
+                return None
+            return dict(conn.execute(text("""UPDATE bot_notification_outbox
+                SET claim_token=:token,claim_until=:until,attempts=attempts+1
+                WHERE account_key=:a AND job_id=:id RETURNING *"""),
+                {'a':account,'id':row.job_id,'token':uuid.uuid4().hex,
+                 'until':at+timedelta(seconds=lease_seconds)}).mappings().one())
+
+    def freeze_notification(self, account, job, subject, body, route_hash, *, now=None):
+        with self.engine.begin() as conn:
+            at = timestamp(now) if now is not None else conn.execute(text('SELECT clock_timestamp()')).scalar_one()
+            row = conn.execute(text("""UPDATE bot_notification_outbox
+                SET subject=COALESCE(subject,:subject),body=COALESCE(body,:body),
+                    route_hash=COALESCE(route_hash,:route),first_attempt_at=COALESCE(first_attempt_at,:now)
+                WHERE account_key=:a AND job_id=:id AND claim_token=:token AND claim_until>:now
+                  AND delivered_at IS NULL AND terminal_reason IS NULL RETURNING *"""),
+                {'a':account,'id':job['job_id'],'token':job['claim_token'],'now':at,
+                 'subject':subject,'body':body,'route':route_hash}).mappings().first()
+            return dict(row) if row is not None else None
+
+    def finish_notification(self, account, job, delivered, *, error_type=None, terminal_reason=None, now=None):
+        with self.engine.begin() as conn:
+            at = timestamp(now) if now is not None else conn.execute(text('SELECT clock_timestamp()')).scalar_one()
+            delay = min(1800, 30 * 2**min(max(job['attempts']-1,0),6))
+            row = conn.execute(text("""UPDATE bot_notification_outbox
+                SET delivered_at=CASE WHEN :sent THEN :now ELSE delivered_at END,
+                    next_attempt_at=:next,last_error_type=:error,terminal_reason=:terminal,
+                    claim_token=NULL,claim_until=NULL
+                WHERE account_key=:a AND job_id=:id AND claim_token=:token
+                  AND delivered_at IS NULL AND terminal_reason IS NULL RETURNING job_id"""),
+                {'a':account,'id':job['job_id'],'token':job['claim_token'],'sent':bool(delivered),
+                 'now':at,'next':at+timedelta(seconds=delay),'error':error_type,'terminal':terminal_reason}).first()
+            return row is not None
+
+    def _queue_execution_notifications(self, conn, intent, *, recovered=False):
+        preferences = intent['context'].get('notification_delivery') or {}
+        kind = 'entry' if intent['settle_type']=='OPEN' else 'exit'
+        return self._insert_notifications(conn,intent['account_key'],'execution:'+intent['client_order_id'],
+                                          preferences,kind,client_id=intent['client_order_id'],recovered=recovered)
 
     def get(self, client_id):
         with self.engine.connect() as conn:
@@ -70,6 +154,68 @@ class ExecutionStore:
                 {"a": account}).scalars())
             return registered + self._legacy_close_batches(conn, account)
 
+    def claim_close_alerts(self, account, policy, *, now=None, limit=8):
+        """Lease due notices across processes without holding locks during I/O."""
+        with self.engine.begin() as conn:
+            at = timestamp(now) if now is not None else conn.execute(text('SELECT clock_timestamp()')).scalar_one()
+            params = {'a': account, 'now': at, 'stale': at-timedelta(seconds=policy.stall_seconds),
+                      'reminder': at-timedelta(seconds=policy.reminder_seconds),
+                      'retry': at-timedelta(seconds=policy.retry_seconds), 'limit': limit}
+            rows = list(conn.execute(text("""SELECT b.batch_id,b.symbol,b.created_at,b.completed,
+                    b.payload->'positions' AS positions,
+                    EXISTS(SELECT 1 FROM bot_order_intents i WHERE i.account_key=b.account_key AND NOT i.finalized) AS has_pending
+                FROM bot_close_batches b WHERE b.account_key=:a
+                  AND (b.alert_claim_until IS NULL OR b.alert_claim_until<=:now)
+                  AND (
+                    (NOT b.completed AND b.created_at<=:stale
+                      AND (b.alert_warning_sent_at IS NULL OR b.alert_warning_sent_at<=:reminder)
+                      AND (b.alert_last_attempt_at IS NULL OR b.alert_last_attempt_at<=:retry))
+                    OR
+                    (b.completed AND b.alert_warning_sent_at IS NOT NULL AND b.alert_recovery_sent_at IS NULL
+                      AND (b.alert_last_attempt_kind IS DISTINCT FROM 'recovery'
+                           OR b.alert_last_attempt_at IS NULL OR b.alert_last_attempt_at<=:retry))
+                  ) ORDER BY b.created_at,b.batch_id LIMIT :limit FOR UPDATE OF b SKIP LOCKED"""), params).mappings())
+            jobs = []
+            for row in rows:
+                kind = 'recovery' if row['completed'] else 'warning'
+                token = uuid.uuid4().hex
+                conn.execute(text("""UPDATE bot_close_batches SET alert_last_attempt_at=:now,
+                    alert_last_attempt_kind=:kind,alert_claim_token=:token,alert_claim_until=:until
+                    WHERE account_key=:a AND batch_id=:id"""),
+                    {'a':account,'id':row['batch_id'],'now':at,'kind':kind,'token':token,
+                     'until':at+timedelta(seconds=policy.lease_seconds)})
+                phase = ('order_reconciliation' if row['has_pending'] else
+                         'position_confirmation' if row['positions'] is None else 'close_pending')
+                jobs.append({'batch_id':row['batch_id'],'symbol':row['symbol'],'created_at':row['created_at'],
+                             'observed_at':at,'kind':kind,'phase':phase,'claim_token':token})
+            return jobs
+
+    def close_alert_is_current(self, account, job, *, now=None):
+        with self.engine.connect() as conn:
+            row = conn.execute(text("""SELECT completed,alert_warning_sent_at,alert_recovery_sent_at
+                FROM bot_close_batches WHERE account_key=:a AND batch_id=:id
+                  AND alert_claim_token=:token AND alert_last_attempt_kind=:kind
+                  AND alert_claim_until>COALESCE(CAST(:now AS timestamptz),clock_timestamp())"""),
+                {'a':account,'id':job['batch_id'],'token':job['claim_token'],'kind':job['kind'],
+                 'now':timestamp(now) if now is not None else None}).mappings().first()
+        if row is None:return False
+        if job['kind']=='warning':return not row['completed']
+        return row['completed'] and row['alert_warning_sent_at'] is not None and row['alert_recovery_sent_at'] is None
+
+    def finish_close_alert(self, account, job, delivered, *, now=None):
+        with self.engine.begin() as conn:
+            at = timestamp(now) if now is not None else conn.execute(text('SELECT clock_timestamp()')).scalar_one()
+            row = conn.execute(text("""UPDATE bot_close_batches
+                SET alert_last_attempt_at=:now,
+                    alert_warning_sent_at=CASE WHEN :delivered AND :kind='warning' THEN :now ELSE alert_warning_sent_at END,
+                    alert_recovery_sent_at=CASE WHEN :delivered AND :kind='recovery' THEN :now ELSE alert_recovery_sent_at END,
+                    alert_claim_token=NULL,alert_claim_until=NULL
+                WHERE account_key=:a AND batch_id=:id AND alert_claim_token=:token
+                  AND alert_last_attempt_kind=:kind RETURNING batch_id"""),
+                {'a':account,'id':job['batch_id'],'token':job['claim_token'],'kind':job['kind'],
+                 'now':at,'delivered':bool(delivered)}).first()
+            return row is not None
+
     @staticmethod
     def _legacy_close_batches(conn, account):
         return list(conn.execute(text("""SELECT DISTINCT ON (i.context #>> '{close_batch,id}')
@@ -81,10 +227,9 @@ class ExecutionStore:
             ORDER BY i.context #>> '{close_batch,id}',i.created_at"""),
             {"a": account}).scalars())
 
-    def save_close_batch(self, account, symbol, batch):
-        """Persist the immutable decision before checking the account order slot."""
+    @staticmethod
+    def _validate_close_positions(symbol, batch, positions):
         expected_side = {"long": "BUY", "short": "SELL"}.get(batch.get("side"))
-        positions = batch.get("positions")
         if not expected_side or not isinstance(positions, list) or not positions:
             raise ExecutionError("Invalid close batch targets")
         ids = set()
@@ -96,6 +241,25 @@ class ExecutionStore:
             decimal(pos.get("size"), positive=True)
             decimal(pos.get("price"), positive=True)
             timestamp(pos.get("timestamp"))
+
+    def save_close_batch(self, account, symbol, batch):
+        """Persist the request even before a position lookup can succeed."""
+        if batch.get('positions') is None:
+            ids = batch.get('target_ids')
+            if (batch.get('side') not in ('long', 'short') or not isinstance(ids, list)
+                    or any(not isinstance(pid, str) or not pid for pid in ids)
+                    or len(set(ids)) != len(ids)):
+                raise ExecutionError("Invalid unresolved close request")
+            sizes = batch.get('target_sizes')
+            if sizes is not None:
+                if not isinstance(sizes, dict) or set(sizes) != set(ids):
+                    raise ExecutionError("Invalid close request quantities")
+                for size in sizes.values():
+                    decimal(size, positive=True)
+            if batch.get('target_total') is not None:
+                decimal(batch['target_total'], positive=True)
+        else:
+            self._validate_close_positions(symbol, batch, batch['positions'])
         params = {"a": account, "symbol": symbol, "id": batch["id"], "payload": json_value(batch)}
         with self.engine.begin() as conn:
             conn.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:a,0))"), params)
@@ -118,7 +282,39 @@ class ExecutionStore:
             return conn.execute(text("""INSERT INTO bot_close_batches(batch_id,account_key,symbol,payload)
                 VALUES(:id,:a,:symbol,CAST(:payload AS jsonb)) RETURNING payload"""), params).scalar_one()
 
+    def resolve_close_batch(self, account, symbol, batch_id, positions):
+        """Bind one confirmed snapshot to the identities frozen at decision time."""
+        params = {'a': account, 'symbol': symbol, 'id': batch_id}
+        with self.engine.begin() as conn:
+            conn.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:a,0))"), params)
+            saved = conn.execute(text("""SELECT payload FROM bot_close_batches
+                WHERE account_key=:a AND symbol=:symbol AND batch_id=:id AND NOT completed"""), params).scalar()
+            if saved is None:
+                raise ExecutionError("Close batch changed or completed")
+            if saved.get('positions') is not None:
+                return saved
+            self._validate_close_positions(symbol, saved, positions)
+            ids = {str(pos['positionId']) for pos in positions}
+            if not saved['target_ids'] or ids != set(saved['target_ids']):
+                raise ExecutionError("Close request target identities not confirmed")
+            sizes = saved.get('target_sizes')
+            if sizes is not None:
+                if any(decimal(pos['size']) != decimal(sizes[str(pos['positionId'])]) for pos in positions):
+                    raise ExecutionError("Close request target quantities changed")
+            elif saved.get('target_total') is None:
+                raise ExecutionError("Close request has no verified quantity")
+            if saved.get('target_total') is not None:
+                total = sum((decimal(pos['size']) for pos in positions), Decimal(0))
+                if total != decimal(saved['target_total']):
+                    raise ExecutionError("Close request total quantity changed")
+            resolved = {**saved, 'positions': positions}
+            return conn.execute(text("""UPDATE bot_close_batches SET payload=CAST(:payload AS jsonb)
+                WHERE account_key=:a AND batch_id=:id RETURNING payload"""),
+                {**params, 'payload': json_value(resolved)}).scalar_one()
+
     def close_batch_remaining(self, account, batch):
+        if batch.get('positions') is None:
+            raise ExecutionError("Close request targets are not yet confirmed")
         with self.engine.connect() as conn:
             closed = dict(conn.execute(text("""SELECT f.position_id,sum(f.size)
                 FROM bot_execution_fills f JOIN bot_order_intents i USING(client_order_id)
@@ -194,6 +390,8 @@ class ExecutionStore:
                     raise ExecutionError("Another close batch must finish first")
                 if saved['payload'] != json.loads(params['context'])['close_batch']:
                     raise ExecutionError("Close batch targets changed after registration")
+                if batch.get('positions') is None:
+                    raise ExecutionError("Close request targets are not yet confirmed")
                 # Recheck under the account lock. A second worker may have
                 # completed this target after the caller read its snapshot.
                 target = next((p for p in batch['positions'] if str(p['positionId']) == params['pid']), None)
@@ -262,25 +460,30 @@ class ExecutionStore:
 
     def reject(self, client_id):
         with self.engine.begin() as conn:
-            conn.execute(
+            row = conn.execute(
                 text(
-                    "UPDATE bot_order_intents SET status='REJECTED',finalized=true,updated_at=now() WHERE client_order_id=:id AND status='SUBMITTING'"
+                    "UPDATE bot_order_intents SET status='REJECTED',finalized=true,updated_at=now() WHERE client_order_id=:id AND status='SUBMITTING' RETURNING *"
                 ),
                 {"id": client_id},
-            )
+            ).mappings().first()
+            if row is not None:
+                self._queue_execution_notifications(conn,dict(row))
 
-    def record(self, intent, order, rows, finalized):
+    def record(self, intent, order, rows, finalized, *, recovered=False):
         cid, account = intent["client_order_id"], intent["account_key"]
-        context = intent["context"]
         with self.engine.begin() as conn:
             locked = conn.execute(
                 text(
-                    "SELECT finalized FROM bot_order_intents WHERE client_order_id=:id FOR UPDATE"
+                    "SELECT * FROM bot_order_intents WHERE client_order_id=:id FOR UPDATE"
                 ),
                 {"id": cid},
-            ).one()
-            if locked.finalized:
+            ).mappings().one()
+            if locked['finalized']:
                 return
+            # Recovery may have adopted notification settings since the caller's
+            # snapshot. Register from the locked, persisted intent, not that copy.
+            intent = dict(locked)
+            context = intent['context']
             known = conn.execute(
                 text(
                     "SELECT COALESCE(sum(size),0) FROM bot_execution_fills WHERE client_order_id=:id"
@@ -377,6 +580,8 @@ class ExecutionStore:
                     "done": finalized,
                 },
             )
+            if finalized:
+                self._queue_execution_notifications(conn,intent,recovered=recovered)
 
     def _project_position(self, conn, intent, pid):
         account = intent["account_key"]
@@ -550,6 +755,8 @@ class ExecutionStore:
             "order_id": intent["exchange_order_id"],
             "client_order_id": client_id,
             "executed_size": float(size),
+            "execution_fee": sum((r['fee'] for r in rows), Decimal(0))
+            if rows and all(r['fee'] is not None for r in rows) else None,
             "execution_price": float(sum(r["size"] * r["price"] for r in rows) / size)
             if size
             else None,

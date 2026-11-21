@@ -59,7 +59,8 @@ def test_first_close_is_saved_while_another_order_is_unknown(store):
     batches = records(store, 'bot_close_batches')
     assert len(batches) == 1 and not batches[0]['completed']
     assert batches[0]['payload']['reason'] == 'stop-triggered'
-    assert {p['positionId'] for p in batches[0]['payload']['positions']} == {'600', '601'}
+    assert batches[0]['payload']['positions'] is None
+    assert set(batches[0]['payload']['target_ids']) == {'600', '601'}
 
 
 def test_restart_and_cleared_pending_resumes_original_close_without_new_signal(store):
@@ -255,7 +256,8 @@ def test_migration_can_use_app_role_without_altering_old_table_ownership(store):
         conn.exec_driver_sql(f'GRANT USAGE,CREATE ON SCHEMA {schema} TO {role}')
         conn.exec_driver_sql('GRANT SELECT ON bot_order_intents TO ' + role)
     try:
-        script = MIGRATION.read_text().removeprefix('BEGIN;').removesuffix('COMMIT;\n')
+        script = '\n'.join(path.read_text().removeprefix('BEGIN;').removesuffix('COMMIT;\n')
+                           for path in (MIGRATION, Path('migrations/003_close_stall_notifications.sql')))
         with store.engine.connect().execution_options(isolation_level='AUTOCOMMIT') as conn:
             conn.exec_driver_sql(f'BEGIN; SET LOCAL ROLE {role};\n' + script + '\nCOMMIT;')
         with store.engine.connect() as conn:
