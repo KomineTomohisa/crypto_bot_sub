@@ -212,6 +212,10 @@ class LiveExecutionMixin:
         for key in list(cache):
             if key[0] == symbol:
                 cache.pop(key, None)
+        fallback_state = getattr(self, '_exit_level_fallback_state', {})
+        for key in list(fallback_state):
+            if key[0] == symbol:
+                fallback_state.pop(key, None)
 
     def _sync_live_positions(self, symbol=None):
         service = self._execution()

@@ -8435,16 +8435,50 @@ class CryptoTradingBot(LiveExecutionMixin):
         基本SLはあまり動かさず、TPをメインで調整する戦略
         （ロングはTPを伸ばしすぎず、SLはやや守備的に寄せる）
         """
+        key = (symbol, position_type, entry_price)
+
+        def use_fallback(reason):
+            # A missing candle/indicator is an expected input state. Preserve the
+            # last valid protection before consulting settings or changing locks.
+            previous = getattr(self, '_last_valid_exit_levels', {}).get(key)
+            if previous is not None:
+                levels = dict(previous)
+                source = 'previous_levels'
+            else:
+                settings = self._get_dynamic_profit_loss_settings(symbol, df_5min)
+                levels = fallback_exit(settings, position_type, entry_price)
+                source = 'base_settings'
+            if not hasattr(self, '_exit_level_fallback_state'):
+                self._exit_level_fallback_state = {}
+            state = (reason, source)
+            if self._exit_level_fallback_state.get(key) != state:
+                self.logger.warning('%s: exit levels fallback (%s; %s); retaining position monitoring',
+                                    symbol, reason, source)
+                self._exit_level_fallback_state[key] = state
+            return levels
+
+        if not isinstance(df_5min, pd.DataFrame) or df_5min.empty:
+            return use_fallback('missing_candles')
+        if 'ATR' not in df_5min.columns:
+            return use_fallback('missing_atr')
+        if len(df_5min) < 2:
+            return use_fallback('insufficient_closed_history')
+        # The final row is forming. Never drop missing rows before selecting the
+        # closed candle: doing so could substitute an older or forming ATR.
+        value = df_5min['ATR'].iloc[-2]
+        if isinstance(value, (bool, np.bool_)):
+            return use_fallback('invalid_atr')
+        try:
+            atr = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return use_fallback('invalid_atr')
+        if not np.isfinite(atr) or atr <= 0:
+            return use_fallback('invalid_atr')
+        if 'ADX' not in df_5min.columns:
+            return use_fallback('missing_adx')
+
         try:
             # ========= ATR / ADX の安全取得 =========
-            atr_series = df_5min['ATR'].dropna()
-            if len(atr_series) == 0:
-                raise ValueError("ATRデータが存在しません。")
-            elif len(atr_series) == 1:
-                atr = atr_series.iloc[-1]
-            else:
-                atr = atr_series.iloc[-2]
-
             adx_series = df_5min['ADX'].dropna()
             if len(adx_series) == 0:
                 adx = None
@@ -8768,13 +8802,14 @@ class CryptoTradingBot(LiveExecutionMixin):
             if not hasattr(self, '_last_valid_exit_levels'):
                 self._last_valid_exit_levels = {}
             self._last_valid_exit_levels[(symbol, position_type, entry_price)] = dict(levels)
+            state = getattr(self, '_exit_level_fallback_state', {})
+            if state.pop(key, None) is not None:
+                self.logger.info('%s: exit level calculation recovered', symbol)
             return levels
 
         except Exception as e:
             self.logger.error(f"{symbol}のATR利確損切計算中にエラー: {str(e)}", exc_info=True)
-            default_settings = self._get_dynamic_profit_loss_settings(symbol, df_5min)
-            previous = getattr(self, '_last_valid_exit_levels', {}).get((symbol, position_type, entry_price))
-            return dict(previous) if previous is not None else fallback_exit(default_settings, position_type, entry_price)
+            return use_fallback('calculation_error')
 
 # ================================
 # メイン実行部分（統一版・重複禁止）
