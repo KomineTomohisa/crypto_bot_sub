@@ -6547,14 +6547,6 @@ class CryptoTradingBot(LiveExecutionMixin):
                         stats['daily_profit'] = 0
                         stats['daily_loss'] = 0
                     
-                    # 全体の資金状況を表示
-                    total_balance = self.get_total_balance()
-                    self.logger.info(f"\n=== 資金状況: {total_balance:,.0f} 円（日本時間: {jst_now.strftime('%Y-%m-%d %H:%M:%S')}）===")
-                    self.logger.info(f"開始資金: {start_balance:,.0f} 円 / 運用利益: {self.total_profit:,.2f} 円 / 評価額: {total_balance:,.0f} 円")
-                    
-                    # 現在のポジション情報を表示
-                    self._display_current_positions()
-                        
                     # 各通貨ペアを順番に処理（バックテストと同様、同期処理にして確実性を高める）
                     for symbol in sorted(self.symbols, key=lambda item: symbol_priority(item, self.positions.get(item))):
                         try:
@@ -6608,6 +6600,23 @@ class CryptoTradingBot(LiveExecutionMixin):
                             self.logger.error(f"{symbol}の処理中にエラーが発生: {str(e)}", exc_info=True)
                             error_states['error_log'].append(f"{now_jst()}: {symbol}処理エラー - {str(e)}")
                             continue
+
+                    # Optional summaries run after position protection. A failed
+                    # display must not skip this or subsequent monitoring cycles.
+                    try:
+                        total_balance = self.get_total_balance()
+                        self.logger.info(f"\n=== 資金状況: {total_balance:,.0f} 円（日本時間: {jst_now.strftime('%Y-%m-%d %H:%M:%S')}）===")
+                        self.logger.info(f"開始資金: {start_balance:,.0f} 円 / 運用利益: {self.total_profit:,.2f} 円 / 評価額: {total_balance:,.0f} 円")
+                    except ExchangeMaintenance:
+                        raise
+                    except Exception as exc:
+                        self.logger.warning('Account summary unavailable (%s); retaining position monitoring', type(exc).__name__)
+                    try:
+                        self._display_current_positions()
+                    except ExchangeMaintenance:
+                        raise
+                    except Exception as exc:
+                        self.logger.warning('Position summary unavailable (%s); retaining position monitoring', type(exc).__name__)
                     
                     # メインループサイクル間のスリープ（5分間隔）
                     elapsed_time = (now_jst() - loop_start_time).total_seconds()
@@ -6767,16 +6776,20 @@ class CryptoTradingBot(LiveExecutionMixin):
 
     def _display_current_positions(self):
         """現在のポジション情報を表示する"""
+        from market_quotes import QuoteUnavailable, price_value
         self.logger.info("\n現在のポジション:")
         has_positions = False
         
         for symbol in self.symbols:
             position = self.positions.get(symbol)
-            if position:
-                has_positions = True
-                entry_price = self.entry_prices[symbol]
-                current_price = self.get_current_price(symbol)
-                if current_price > 0:
+            if not position:
+                self.logger.info(f"{symbol}: ポジションなし")
+                continue
+            has_positions = True
+            try:
+                entry_price = price_value(self.entry_prices.get(symbol))
+                current_price = price_value(self.get_current_price(symbol))
+                if entry_price is not None and current_price is not None:
                     # 損益計算
                     if position == 'long':
                         profit_pct = (current_price / entry_price - 1) * 100
@@ -6796,9 +6809,13 @@ class CryptoTradingBot(LiveExecutionMixin):
                             
                         self.logger.info(f"{symbol}: {position} ({profit_pct:+.2f}%, 現在価格: {current_price:,.2f}), {status}, 保有時間: {hours:.1f}時間")
                 else:
-                    self.logger.info(f"{symbol}: {position} (現在価格取得エラー)")
-            else:
-                self.logger.info(f"{symbol}: ポジションなし")
+                    self.logger.info('%s: %s (価格確認不可のため評価損益は未表示)', symbol, position)
+            except ExchangeMaintenance:
+                raise
+            except QuoteUnavailable:
+                self.logger.info('%s: %s (現在価格確認不可のため評価損益は未表示)', symbol, position)
+            except Exception as exc:
+                self.logger.warning('%s: position display unavailable (%s)', symbol, type(exc).__name__)
         
         if not has_positions:
             self.logger.info("現在ポジションはありません")
