@@ -2659,9 +2659,7 @@ class CryptoTradingBot(LiveExecutionMixin):
             for symbol, data in positions_data.items():
                 if symbol not in self.symbols:
                     continue
-                self.short_profit_lock_armed[symbol] = bool(
-                    data.get("short_profit_lock_armed", False)
-                )
+                self.short_profit_lock_armed[symbol] = data.get("short_profit_lock_armed") is True
                 if not hasattr(self, '_saved_short_lock_position_ids'):
                     self._saved_short_lock_position_ids = {}
                 self._saved_short_lock_position_ids[symbol] = str(data.get('position_id'))
@@ -2924,6 +2922,10 @@ class CryptoTradingBot(LiveExecutionMixin):
             positions_file = os.path.join(self.base_dir, 'positions.json')
             if os.path.exists(positions_file):
                 shutil.copy2(positions_file, backup_dir)
+
+            protection = getattr(self, '_exit_protection_store', None)
+            if protection is not None and protection.path.is_file():
+                shutil.copy2(protection.path, backup_dir)
             
             # 増資データのバックアップ
             increase_file = os.path.join(self.base_dir, 'last_increase.json')
@@ -2961,7 +2963,9 @@ class CryptoTradingBot(LiveExecutionMixin):
         """GMOコインの信用取引建玉を使用してポジションを検証する"""
         if self.exchange_settings_gmo.get("live_trade", False):
             self._execution()  # Fail before orders if the additive DB migration is absent.
-            self._restore_short_profit_lock_state("real")
+            if not getattr(self, '_legacy_short_lock_loaded', False):
+                self._restore_short_profit_lock_state("real")
+                self._legacy_short_lock_loaded = True
             self._recover_live_orders()
             self._sync_live_positions()
             return
@@ -7516,6 +7520,9 @@ class CryptoTradingBot(LiveExecutionMixin):
         if armed and not previous:
             self.logger.info("%s: Short利益保護ON", symbol)
             if not getattr(self, 'is_backtest', False):
+                persist = getattr(self, '_persist_exit_protection', None)
+                if callable(persist):
+                    persist(symbol)
                 self.save_positions()
         return stop
 
@@ -8901,6 +8908,10 @@ class CryptoTradingBot(LiveExecutionMixin):
             if not hasattr(self, '_last_valid_exit_levels'):
                 self._last_valid_exit_levels = {}
             self._last_valid_exit_levels[(symbol, position_type, entry_price)] = dict(levels)
+            if not getattr(self, 'is_backtest', False):
+                persist = getattr(self, '_persist_exit_protection', None)
+                if callable(persist):
+                    persist(symbol)
             state = getattr(self, '_exit_level_fallback_state', {})
             if state.pop(key, None) is not None:
                 self.logger.info('%s: exit level calculation recovered', symbol)

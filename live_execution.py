@@ -235,6 +235,118 @@ class LiveExecutionMixin:
             if key[0] == symbol:
                 fallback_state.pop(key, None)
 
+    def _exit_protection_error(self, stage, exc):
+        if not hasattr(self, '_exit_protection_errors'):
+            self._exit_protection_errors = {}
+        kind = type(exc).__name__
+        if self._exit_protection_errors.get(stage) != kind:
+            self.logger.error('Exit protection persistence unavailable (%s; %s)', stage, kind)
+        self._exit_protection_errors[stage] = kind
+
+    def _exit_protection_recovered(self, stage):
+        if getattr(self, '_exit_protection_errors', {}).pop(stage, None):
+            self.logger.info('Exit protection persistence recovered (%s)', stage)
+
+    def _exit_protection_file(self):
+        if (getattr(self, 'is_backtest', False) or
+                not (getattr(self, 'exchange_settings_gmo', {}) or {}).get('live_trade', False) or
+                not getattr(self, 'base_dir', None)):
+            return None
+        try:
+            from exit_protection import ExitProtectionFile
+            account = self._execution().account
+            store = getattr(self, '_exit_protection_store', None)
+            if store is None or store.account != account:
+                store = ExitProtectionFile(self.base_dir, account)
+                store.load()
+                self._exit_protection_store = store
+            self._exit_protection_recovered('load')
+            return store
+        except Exception as exc:
+            self._exit_protection_error('load', exc)
+            return None
+
+    def _persist_exit_protection(self, symbol):
+        # A failed/absent exchange snapshot must never replace the last saved
+        # state with guessed positions or erase another symbol's protection.
+        if symbol in getattr(self, '_position_sync_failed', set()):
+            return False
+        rows = getattr(self, '_verified_position_snapshots', {}).get(symbol)
+        if not rows:
+            return False
+        store = self._exit_protection_file()
+        if store is None:
+            return False
+        if (store.account, symbol) not in getattr(self, '_exit_protection_restored', set()):
+            return False  # Do not overwrite a snapshot not yet checked after a read failure.
+        try:
+            from exit_protection import make_snapshot
+            side, entry = self.positions[symbol], self.entry_prices[symbol]
+            snapshot = make_snapshot(
+                store.account, symbol, rows, side, entry,
+                getattr(self, 'opposite_narrow_state', {}).get(symbol, {}).get(side, False),
+                self.short_profit_lock_armed.get(symbol, False),
+                getattr(self, '_last_valid_exit_levels', {}).get((symbol, side, entry)),
+            )
+            store.update(symbol, snapshot)
+            store.save()
+            self._exit_protection_recovered('write')
+            return True
+        except Exception as exc:
+            self._exit_protection_error('write', exc)
+            return False
+
+    def _sync_exit_protection(self, symbol, rows):
+        store = self._exit_protection_file()
+        if store is None:
+            return
+        try:
+            if not hasattr(self, '_exit_protection_restored'):
+                self._exit_protection_restored = set()
+            key = (store.account, symbol)
+            if not rows:
+                store.update(symbol, None)
+                store.save()
+                self._exit_protection_restored.add(key)
+                self._exit_protection_recovered('write')
+                return
+            if key not in self._exit_protection_restored:
+                saved = store.snapshots.get(symbol)
+                if saved is not None:
+                    from exit_protection import restore_snapshot
+                    try:
+                        state = restore_snapshot(saved, store.account, symbol, rows,
+                                                 self.positions[symbol], self.entry_prices[symbol])
+                    except (ValueError, TypeError, KeyError, OverflowError):
+                        state = None
+                        self.logger.warning('%s: invalid saved exit protection discarded', symbol)
+                    if state is not None:
+                        side, entry = self.positions[symbol], self.entry_prices[symbol]
+                        if not hasattr(self, 'opposite_narrow_state'):
+                            self.opposite_narrow_state = {}
+                        self.opposite_narrow_state[symbol] = {'long': False, 'short': False}
+                        self.opposite_narrow_state[symbol][side] = state['opposite_narrow']
+                        # Arming is monotonic for the same verified position.
+                        # A newer legacy save can survive a failed protection-file
+                        # write; never disarm that already verified protection.
+                        self.short_profit_lock_armed[symbol] = (
+                            state['short_profit_lock'] or self.short_profit_lock_armed.get(symbol, False)
+                        )
+                        if state['levels'] is not None:
+                            if not hasattr(self, '_last_valid_exit_levels'):
+                                self._last_valid_exit_levels = {}
+                            self._last_valid_exit_levels[(symbol, side, entry)] = state['levels']
+                        self.logger.info('%s: verified exit protection restored', symbol)
+                    else:
+                        self.logger.info('%s: saved exit protection does not match current positions', symbol)
+                self._exit_protection_restored.add(key)
+            # A temporary sync failure from a previous cycle is now resolved.
+            if hasattr(self, '_position_sync_failed'):
+                self._position_sync_failed.discard(symbol)
+            self._persist_exit_protection(symbol)
+        except Exception as exc:
+            self._exit_protection_error('write', exc)
+
     def _sync_live_positions(self, symbol=None):
         service = self._execution()
         for sym in [symbol] if symbol else self.symbols:
@@ -264,6 +376,7 @@ class LiveExecutionMixin:
                     getattr(self, "_verified_position_snapshots", {}).pop(sym, None)
                     if hasattr(self, "_position_sync_failed"):
                         self._position_sync_failed.discard(sym)
+                    self._sync_exit_protection(sym, [])
                     continue
                 size = sum(decimal(r["size"]) for r in rows)
                 price = (
@@ -282,9 +395,16 @@ class LiveExecutionMixin:
                         if known_pid is not None
                         else frozenset()
                     )
-                continuous = bool(
-                    previous_ids.intersection(current_ids)
-                ) and previous_side in (None, side)
+                continuous = bool(previous_ids) and current_ids <= previous_ids and previous_side in (None, side)
+                prior_rows = getattr(self, '_verified_position_snapshots', {}).get(sym)
+                if continuous and prior_rows:
+                    from exit_protection import position_basis
+                    prior_basis, current_basis = position_basis(prior_rows), position_basis(rows)
+                    continuous = all(
+                        all(row[key] == prior_basis[pid][key] for key in ('symbol', 'side', 'price', 'opened_at'))
+                        and decimal(row['size']) <= decimal(prior_basis[pid]['size'])
+                        for pid, row in current_basis.items()
+                    )
                 if not continuous:
                     self._reset_exit_adjustments(sym)
                 if side != "short" or not continuous:
@@ -306,6 +426,7 @@ class LiveExecutionMixin:
                 self.entry_scores[sym] = context.get(
                     "scores", self.entry_scores.get(sym, {})
                 )
+                self._sync_exit_protection(sym, rows)
             except ExchangeMaintenance:
                 if not hasattr(self, '_position_sync_failed'):
                     self._position_sync_failed = set()
