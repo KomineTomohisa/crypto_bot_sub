@@ -766,20 +766,20 @@ class PriceCacheRefresher:
 
     def run_forever(self):
         import time
+        from market_quotes import checked_quote
         while True:
             start = time.time()
             for sym in self.symbols:
                 try:
-                    px = self.get_price(sym)
-                    if px and px > 0:
-                        upsert_price_cache(sym.lower(), px, dt.datetime.now(timezone.utc))
-                        if self.logger:
-                            self.logger.debug(f"[price_cache] {sym} = {px}")
+                    quote = checked_quote(self.get_price(sym), dt.datetime.now(timezone.utc))
+                    upsert_price_cache(sym.lower(), quote.price, quote.quoted_at)
+                    if self.logger:
+                        self.logger.debug(f"[price_cache] {sym} = {quote.price}")
                 except ExchangeMaintenance:
                     continue  # The shared availability object records transitions.
                 except Exception as e:
                     if self.logger:
-                        self.logger.warning(f"[price_cache] {sym} failed: {e}")
+                        self.logger.warning('[price_cache] %s failed (%s)', sym, type(e).__name__)
             elapsed = time.time() - start
             time.sleep(max(0, self.interval - elapsed))
 
@@ -2808,93 +2808,60 @@ class CryptoTradingBot(LiveExecutionMixin):
         if not has_positions:
             self.logger.info("現在ポジションはありません")
 
-    def get_current_price(self, symbol):
+    def get_current_price(self, symbol, *, with_timestamp=False):
+        from market_quotes import QuoteUnavailable, parse_ticker
         availability = getattr(getattr(self, 'gmo_api', None), 'availability', None)
         if availability is not None:
             availability.require_available()
-        try:
-            gmo_symbol = self.symbol_mapping.get(symbol, symbol.upper())
-            url = f'https://api.coin.z.com/public/v1/ticker?symbol={gmo_symbol}'
-            headers = {'User-Agent': 'Mozilla/5.0'}
-
-            # レート制限ウェイト
-            elapsed = time.time() - self.last_api_call
-            if elapsed < self.rate_limit_delay:
-                time.sleep(self.rate_limit_delay - elapsed)
-
-            # 最大3回の明示再試行。GMO専用adapterでの追加リトライは行わない。
-            last_exc = None
-            for attempt in range(3):
+        gmo_symbol = self.symbol_mapping.get(symbol, symbol.upper())
+        url = f'https://api.coin.z.com/public/v1/ticker?symbol={gmo_symbol}'
+        elapsed = time.time() - self.last_api_call
+        if elapsed < self.rate_limit_delay:
+            time.sleep(self.rate_limit_delay - elapsed)
+        last_reason = 'request_failed'
+        # Retry GET only. Invalid snapshots are not prices, including after retry.
+        for attempt in range(3):
+            response = None
+            try:
                 if availability is not None:
                     availability.require_available()
-                response = None
+                response = HTTP_SESSION.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
+                self.last_api_call = time.time()
+                data = response.json()
+                if availability is not None:
+                    availability.observe(data)
+                response.raise_for_status()
+                observed_at = now_jst()
+                quote = parse_ticker(data, gmo_symbol, observed_at)
+                rows = data['data'] if isinstance(data['data'], list) else [data['data']]
+                record_bot_event(self, 'ticker_response', {
+                    'symbol': symbol, 'status': data['status'],
+                    'tickers': [{key: item.get(key) for key in ('symbol', 'timestamp', 'bid', 'ask', 'last')} for item in rows],
+                }, observed_at)
+                self.logger.info(f"{symbol} 現在価格: {quote.price}")
+                return quote if with_timestamp else quote.price
+            except ExchangeMaintenance:
+                record_bot_event(self, 'input_error', {'symbol': symbol, 'source': 'gmo_ticker', 'reason': 'exchange_maintenance'}, now_jst())
+                raise
+            except (QuoteUnavailable, requests.exceptions.RequestException, ValueError) as exc:
+                last_reason = (exc.reason if isinstance(exc, QuoteUnavailable) else
+                               'invalid_json' if isinstance(exc, ValueError) else 'request_failed')
+                record_bot_event(self, 'input_error', {
+                    'symbol': symbol, 'source': 'gmo_ticker', 'attempt': attempt + 1,
+                    'reason': last_reason, 'error_type': type(exc).__name__,
+                }, now_jst())
+                if attempt < 2:
+                    time.sleep((1.2 if _is_dns_temp_failure(exc) else 0.6) * (attempt + 1))
+            finally:
                 try:
-                    response = HTTP_SESSION.get(url, headers=headers, timeout=10)
-                    self.last_api_call = time.time()
+                    if response is not None:
+                        response.close()
+                except Exception:
+                    pass
+        raise QuoteUnavailable(last_reason)
 
-                    data = response.json()
-                    if availability is not None:
-                        availability.observe(data)
-                    response.raise_for_status()
-                    rows = data.get('data', [])
-                    rows = rows if isinstance(rows, list) else [rows]
-                    record_bot_event(self, 'ticker_response', {
-                        'symbol': symbol, 'status': data.get('status'),
-                        'tickers': [{key: item.get(key) for key in ('symbol', 'timestamp', 'bid', 'ask', 'last')} for item in rows if isinstance(item, dict)],
-                    }, now_jst())
-                    if data.get('status') == 0 and 'data' in data:
-                        ticker_data = data['data']
-                        if isinstance(ticker_data, list):
-                            for item in ticker_data:
-                                if item.get('symbol') == gmo_symbol:
-                                    last_price = float(item.get('last', 0))
-                                    self.logger.info(f"{symbol} 現在価格: {last_price}")
-                                    return last_price
-                            self.logger.warning(f"{symbol}（{gmo_symbol}）の価格データが見つかりません")
-                            return 0.0
-                        else:
-                            return float(ticker_data.get('last', 0))
-                    else:
-                        # GMOエラー形式
-                        if data.get('messages'):
-                            err = data['messages'][0].get("message_string", "不明なエラー")
-                        else:
-                            err = "不明なエラー"
-                        self.logger.error(f"GMOコイン価格取得エラー: {err}")
-                        return 0.0
-
-                except ExchangeMaintenance:
-                    record_bot_event(self, 'input_error', {'symbol': symbol, 'source': 'gmo_ticker', 'reason': 'exchange_maintenance'}, now_jst())
-                    raise
-                except requests.exceptions.RequestException as e:
-                    last_exc = e
-                    record_bot_event(self, 'input_error', {'symbol': symbol, 'source': 'gmo_ticker', 'attempt': attempt + 1, 'error_type': type(e).__name__}, now_jst())
-                    if _is_dns_temp_failure(e):
-                        time.sleep(1.2 * (attempt + 1))
-                        continue
-                    time.sleep(0.6 * (attempt + 1))
-                    continue
-
-                finally:
-                    # Responseはコンテキストマネージャ非保証なので明示close
-                    try:
-                        if response is not None:
-                            response.close()
-                    except Exception:
-                        pass
-
-            if last_exc:
-                self.logger.error(f"価格取得APIリクエストエラー: {last_exc}")
-            return 0.0
-
-        except ExchangeMaintenance:
-            raise
-        except ValueError as e:
-            self.logger.error(f"価格取得JSONパースエラー: {e}")
-            return 0.0
-        except Exception as e:
-            self.logger.error(f"価格取得未知のエラー: {e}")
-            return 0.0
+    def _get_exit_quote(self, symbol):
+        return self.get_current_price(symbol, with_timestamp=True)
 
     
     def create_backup(self):
@@ -7579,6 +7546,7 @@ class CryptoTradingBot(LiveExecutionMixin):
         stats (dict): 統計情報の辞書
         trade_logs (list): 取引ログのリスト
         """
+        from market_quotes import MarketQuote, QuoteUnavailable, checked_quote, price_value
         position = self.positions.get(symbol)
         # ポジションが無ければ何もしない（SIMのループでNoneが混ざるケース対策）
         if not position:
@@ -7593,11 +7561,40 @@ class CryptoTradingBot(LiveExecutionMixin):
             self.entry_times[symbol] = entry_time
 
         entry_size = self.entry_sizes[symbol]
-        current_price = self.get_current_price(symbol)
+
+        def read_price():
+            reason = None
+            try:
+                source = getattr(self, '_get_exit_quote', self.get_current_price)
+                candidate = source(symbol)
+                price = (checked_quote(candidate, now_jst()).price if isinstance(candidate, MarketQuote)
+                         else price_value(candidate))
+                if price is None:
+                    reason = 'invalid_price'
+            except QuoteUnavailable as exc:
+                price, reason = None, exc.reason
+            status = getattr(self, '_exit_quote_status', None)
+            if callable(status):
+                status(symbol, reason)
+            if reason is not None:
+                record_bot_event(self, 'input_error', {'symbol': symbol, 'source': 'exit_quote', 'reason': reason}, now_jst())
+            return price
+
+        def time_exit_without_quote(at):
+            if (jst_timestamp(at) - jst_timestamp(entry_time)).total_seconds() < 72 * 3600:
+                return None
+            return self._evaluate_exit_event(symbol, pd.DataFrame(), position, entry_price, entry_time, at, None)
+
+        current_price = read_price()
         observed_at = now_jst()
-        decision = self._evaluate_exit_event(
-            symbol, df_5min, position, entry_price, entry_time, observed_at, current_price
-        )
+        if current_price is None:
+            decision = time_exit_without_quote(observed_at)
+            if decision is None:
+                return
+        else:
+            decision = self._evaluate_exit_event(
+                symbol, df_5min, position, entry_price, entry_time, observed_at, current_price
+            )
         # 近接時の価格観測も、同じ判定関数へ入れる。閾値での架空約定はしない。
         if decision.reason is None and current_price:
             band = 0.0005
@@ -7607,7 +7604,12 @@ class CryptoTradingBot(LiveExecutionMixin):
                 deadline = time.time() + 3.0
                 levels = {'take_profit_price': decision.take_profit, 'stop_loss_price': decision.base_stop}
                 while time.time() < deadline and decision.reason is None:
-                    current_price = self.get_current_price(symbol) or current_price
+                    current_price = read_price()
+                    if current_price is None:
+                        decision = time_exit_without_quote(now_jst())
+                        if decision is None:
+                            return
+                        break
                     decision = self._evaluate_exit_event(
                         symbol, df_5min, position, entry_price, entry_time,
                         now_jst(), current_price, levels=levels,
@@ -9029,7 +9031,7 @@ if __name__ == "__main__":
             from threading import Thread
             refresher = PriceCacheRefresher(
                 bot.symbols,
-                bot.get_current_price,
+                lambda symbol: bot.get_current_price(symbol, with_timestamp=True),
                 interval_sec=30,
                 logger=bot.logger
             )

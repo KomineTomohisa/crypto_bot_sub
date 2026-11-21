@@ -237,6 +237,7 @@ def test_actual_price_getter_records_only_public_quote_fields(tmp_path):
     bot.last_api_call = 0
     bot.rate_limit_delay = 0
     function, namespace = method(BOT, "get_current_price")
+    namespace['now_jst'] = lambda: pd.Timestamp('2026-11-17T00:00:00Z').to_pydatetime()
     namespace["HTTP_SESSION"] = SimpleNamespace(
         get=lambda *a, **kw: SimpleNamespace(
             raise_for_status=lambda: None,
@@ -281,7 +282,9 @@ def test_request_failures_are_recorded_in_the_order_the_bot_observed_them(tmp_pa
     namespace["HTTP_SESSION"] = SimpleNamespace(
         get=lambda *a, **kw: (_ for _ in ()).throw(requests.exceptions.Timeout())
     )
-    assert getter(bot, "ltc_jpy") == 0
+    from market_quotes import QuoteUnavailable
+    with pytest.raises(QuoteUnavailable, match='request_failed'):
+        getter(bot, "ltc_jpy")
     close_recorder(bot)
     errors = [
         event

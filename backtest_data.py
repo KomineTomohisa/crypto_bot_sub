@@ -89,6 +89,7 @@ def backtest_state(bot):
         "opposite_narrow_state": {},
         "_last_valid_exit_levels": {},
         "_exit_level_fallback_state": {},
+        "_exit_quote_failures": {},
         "_entry_notification_context": {},
         "short_profit_lock_armed": {},
         "total_profit": bot.total_profit,

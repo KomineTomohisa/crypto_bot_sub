@@ -224,6 +224,7 @@ class LiveExecutionMixin:
 
     def _reset_exit_adjustments(self, symbol):
         """Clear per-trade exit state without disturbing other symbols."""
+        getattr(self, '_exit_quote_failures', {}).pop(symbol, None)
         if hasattr(self, "opposite_narrow_state"):
             self.opposite_narrow_state[symbol] = {"long": False, "short": False}
         cache = getattr(self, "_last_valid_exit_levels", {})
@@ -600,6 +601,43 @@ class LiveExecutionMixin:
     def _stop_trade_notifications(self):
         worker=getattr(self,'_trade_notification_worker',None)
         if worker is not None:worker.close(1)
+
+    def _exit_quote_status(self, symbol, reason=None):
+        failures = getattr(self, '_exit_quote_failures', {})
+        state = failures.get(symbol)
+        if reason is None and state is None:
+            return
+        if not hasattr(self, '_exit_quote_failures'):
+            self._exit_quote_failures = failures
+        live = ((getattr(self, 'exchange_settings_gmo', {}) or {}).get('live_trade', False)
+                and not getattr(self, 'is_backtest', False))
+        send = getattr(self, 'send_notification', None)
+        if reason is not None:
+            if state is None:
+                state = {'id': uuid.uuid4().hex, 'reason': None, 'notified': False}
+                failures[symbol] = state
+            if state['reason'] != reason:
+                self.logger.warning('%s: exit quote unavailable (%s); retaining position and protection', symbol, reason)
+                state['reason'] = reason
+            if live and callable(send) and not state['notified']:
+                try:
+                    state['notified'] = send(
+                        f'{symbol} 決済価格の確認不可',
+                        '有効な現在価格を取得できません。価格による利確・損切り判定を保留し、再取得を続けています。'
+                        '建玉と保護状態は保持しています。保有期限による決済と保存済み決済要求の照合は継続します。',
+                        'error', notification_key=f"exit-quote:{symbol}:{state['id']}:unavailable",
+                    ) is True
+                except Exception as exc:
+                    self.logger.error('Exit quote alert enqueue failed (%s)', type(exc).__name__)
+            return
+        failures.pop(symbol, None)
+        self.logger.info('%s: exit quote recovered; resuming price-based protection', symbol)
+        if live and callable(send) and state['notified']:
+            try:
+                send(f'{symbol} 決済価格の確認復旧', '有効な現在価格を取得できました。価格による利確・損切り判定を再開します。',
+                     'info', notification_key=f"exit-quote:{symbol}:{state['id']}:recovered")
+            except Exception as exc:
+                self.logger.error('Exit quote recovery notice enqueue failed (%s)', type(exc).__name__)
 
     def _record_live_order_result(self, result):
         """Use the same payload for immediate and recovered exchange outcomes."""
