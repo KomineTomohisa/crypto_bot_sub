@@ -9,7 +9,7 @@ import time
 import uuid
 from copy import deepcopy
 from strategy_recording import record_bot_event
-from trade_notifications import compose_execution_notice, entry_snapshot
+from trade_notifications import entry_snapshot
 
 from trading_execution import (
     ExchangeGateway,
@@ -101,6 +101,7 @@ class LiveExecutionMixin:
 
     def _recover_live_orders(self):
         service = self._execution()
+        self._queue_trade_notifications()
         if getattr(self, '_record_inputs', False) and not getattr(self, '_execution_events_backfilled', False):
             try:
                 # Export a bounded number per cycle. Stable event IDs permit
@@ -137,7 +138,8 @@ class LiveExecutionMixin:
                     intent["client_order_id"]
                 ):
                     continue
-                result = service.reconcile(service.store.get(intent["client_order_id"]))
+                service.store.set_notification_preferences(service.account,intent['client_order_id'],self._notification_preferences())
+                result = service.reconcile(service.store.get(intent["client_order_id"]), recovered=True)
                 self._record_live_order_result(result)
                 self._notify_live_execution(result, recovered=True)
             except ExchangeMaintenance:
@@ -211,7 +213,8 @@ class LiveExecutionMixin:
             worker = getattr(self, '_close_alert_worker', None)
             if worker is None or not worker.thread.is_alive():
                 policy = CloseAlertPolicy.from_environment(self.logger)
-                worker = CloseAlertWorker(service.store, service.account, self.send_notification, self.logger, policy)
+                sender = getattr(self, '_send_notification_direct', self.send_notification)
+                worker = CloseAlertWorker(service.store, service.account, sender, self.logger, policy)
                 self._close_alert_worker = worker
             for job in service.store.claim_close_alerts(service.account, worker.policy):
                 if not worker.submit(job):
@@ -372,6 +375,7 @@ class LiveExecutionMixin:
             "decision_bar": str(bar),
             "decision_price": str(raw["decision_price"]),
             "feature_snapshot": getattr(self, "_feature_event_refs", {}).get(symbol),
+            "notification_delivery": self._notification_preferences(),
         }
         try:
             context['notification'] = entry_snapshot(getattr(self, '_entry_decision_snapshot', None), kwargs)
@@ -404,40 +408,77 @@ class LiveExecutionMixin:
         self._notify_live_execution(result)
         return result
 
-    def _notify_live_execution(self, result, *, recovered=False):
-        """Receipt failures must not undo a recorded fill or stop later closes."""
+    def _configured_trade_channels(self):
+        settings=getattr(self,'notification_settings',{}) or {}
+        email=settings.get('email') or {}
+        channels=[]
+        if all(email.get(key) for key in ('smtp_server','smtp_port','sender','password','recipient')):
+            channels.append('email')
+        if os.getenv('LINE_CHANNEL_ACCESS_TOKEN') and (os.getenv('LINE_DEFAULT_USER_ID') or getattr(self,'user_id',None) is not None):
+            channels.append('line')
+        return channels
+
+    def _notification_preferences(self):
         settings = getattr(self, 'notification_settings', {}) or {}
-        send = getattr(self, 'send_notification', None)
-        if not settings.get('enabled', False) or not callable(send) or not result.get('finalized'):
-            return False
-        intent = result.get('intent') or {}
-        opened = intent.get('settle_type') == 'OPEN'
-        if not settings.get('send_on_entry' if opened else 'send_on_exit', True):
-            return False
-        if result.get('already_submitted'):
-            return False
+        return {'enabled':bool(settings.get('enabled',False)),
+                'entry':bool(settings.get('send_on_entry',True)), 'exit':bool(settings.get('send_on_exit',True)),
+                'error':bool(settings.get('send_on_error',True)), 'info':True,
+                'daily_report':bool(settings.get('daily_report',False)),
+                'channels':self._configured_trade_channels()}
+
+    def _outbox_enabled(self, kind):
+        prefs=self._notification_preferences()
+        return prefs['enabled'] and prefs.get(kind,False)
+
+    def _prepare_notification_route(self, channel):
+        if channel not in self._configured_trade_channels():return None
+        if channel=='email':return self._resolve_recipients_for_mode()
+        recipient=None
+        if getattr(self,'user_id',None) is not None:
+            from db import get_line_user_id
+            recipient=get_line_user_id(self.user_id)
+        return recipient or os.getenv('LINE_DEFAULT_USER_ID')
+
+    def _deliver_outbox_notification(self, channel, subject, body, kind, job_id, route):
+        if channel=='email':
+            return self._send_email(subject,body,message_id=f'<{job_id}@crypto-bot.invalid>',recipients=route)
+        return self._send_line(subject,body,retry_key=job_id,recipient=route)
+
+    def _queue_trade_notifications(self):
+        if not (getattr(self,'notification_settings',{}) or {}).get('enabled',False):return
         try:
-            key = (result.get('client_order_id'), result.get('status'), result.get('executed_size'))
-            if key in getattr(self, '_notified_live_executions', set()):
-                return False
-            remaining = None
-            batch = (intent.get('context') or {}).get('close_batch')
-            if batch:
-                try:
-                    service = self._execution()
-                    remaining = sum(service.store.close_batch_remaining(service.account, batch).values())
-                except Exception as exc:
-                    self.logger.warning('Receipt remaining quantity unavailable (%s)', type(exc).__name__)
-            subject, body, kind = compose_execution_notice(result, recovered=recovered, remaining=remaining)
-            delivered = send(subject, body, kind) is True
-            if delivered:
-                if not hasattr(self, '_notified_live_executions'):
-                    self._notified_live_executions = set()
-                self._notified_live_executions.add(key)
-            return delivered
+            from notification_outbox import NotificationOutboxWorker
+            service=self._execution()
+            worker=getattr(self,'_trade_notification_worker',None)
+            if worker is None or not worker.thread.is_alive():
+                worker=NotificationOutboxWorker(service.store,service.account,self._outbox_enabled,
+                    self._prepare_notification_route,self._deliver_outbox_notification,self.logger)
+                self._trade_notification_worker=worker
+            worker.wake()
         except Exception as exc:
-            self.logger.error('Trade receipt unavailable (%s)', type(exc).__name__)
+            self.logger.error('Notification dispatch unavailable (%s)',type(exc).__name__)
+
+    def _notify_live_execution(self, result, *, recovered=False):
+        # Finalized fills and their per-channel jobs already committed atomically.
+        if result.get('finalized') and not result.get('already_submitted'):
+            self._queue_trade_notifications()
+        return False
+
+    def _enqueue_live_message(self, subject, body, kind='info', *, notification_key=None):
+        try:
+            from notification_outbox import safe_message
+            service=self._execution()
+            count=service.store.enqueue_message(service.account,notification_key or 'message:'+uuid.uuid4().hex,
+                self._notification_preferences(),safe_message(subject),safe_message(body),kind)
+            self._queue_trade_notifications()
+            return bool(count)
+        except Exception as exc:
+            self.logger.error('Notification enqueue failed (%s)',type(exc).__name__)
             return False
+
+    def _stop_trade_notifications(self):
+        worker=getattr(self,'_trade_notification_worker',None)
+        if worker is not None:worker.close(1)
 
     def _record_live_order_result(self, result):
         """Use the same payload for immediate and recovered exchange outcomes."""
@@ -535,6 +576,7 @@ class LiveExecutionMixin:
                 "exit_reason": reason,
                 "scores": batch["scores"], "user_id": batch["user_id"],
                 "feature_snapshot": batch.get("feature_snapshot"), "close_batch": batch,
+                "notification_delivery": self._notification_preferences(),
             }
             try:
                 result = service.submit(

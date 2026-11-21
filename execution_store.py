@@ -33,6 +33,87 @@ class ExecutionStore:
             conn.execute(text("""SELECT alert_last_attempt_at,alert_last_attempt_kind,
                 alert_warning_sent_at,alert_recovery_sent_at,alert_claim_token,alert_claim_until
                 FROM bot_close_batches LIMIT 0"""))
+            conn.execute(text('SELECT job_id,claim_token,delivered_at FROM bot_notification_outbox LIMIT 0'))
+
+    @staticmethod
+    def _insert_notifications(conn, account, event_key, preferences, kind, *, client_id=None,
+                              recovered=False, subject=None, body=None):
+        if not isinstance(preferences,dict) or preferences.get('enabled') is not True or preferences.get(kind,kind=='info') is not True:
+            return 0
+        if not isinstance(preferences.get('channels'),list):return 0
+        count = 0
+        for channel in ('email', 'line'):
+            if channel not in preferences.get('channels', []):
+                continue
+            job_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f'crypto-bot:{account}:{event_key}:{channel}'))
+            result = conn.execute(text("""INSERT INTO bot_notification_outbox
+                (job_id,account_key,event_key,client_order_id,channel,kind,recovered,subject,body)
+                VALUES(:id,:a,:key,:cid,:channel,:kind,:recovered,:subject,:body)
+                ON CONFLICT(account_key,event_key,channel) DO NOTHING"""),
+                {'id':job_id,'a':account,'key':event_key,'cid':client_id,'channel':channel,
+                 'kind':kind,'recovered':recovered,'subject':subject,'body':body})
+            count += result.rowcount
+        return count
+
+    def set_notification_preferences(self, account, client_id, preferences):
+        """Adopt only unfinished pre-upgrade intents, never replay historical mail."""
+        with self.engine.begin() as conn:
+            conn.execute(text("""UPDATE bot_order_intents
+                SET context=context || jsonb_build_object('notification_delivery',CAST(:prefs AS jsonb))
+                WHERE account_key=:a AND client_order_id=:id AND NOT finalized
+                  AND NOT(context ? 'notification_delivery')"""),
+                {'a':account,'id':client_id,'prefs':json_value(preferences)})
+
+    def enqueue_message(self, account, event_key, preferences, subject, body, kind):
+        with self.engine.begin() as conn:
+            return self._insert_notifications(conn,account,event_key,preferences,kind,subject=subject,body=body)
+
+    def claim_notification(self, account, *, now=None, lease_seconds=600):
+        with self.engine.begin() as conn:
+            at = timestamp(now) if now is not None else conn.execute(text('SELECT clock_timestamp()')).scalar_one()
+            row = conn.execute(text("""SELECT job_id FROM bot_notification_outbox
+                WHERE account_key=:a AND delivered_at IS NULL AND terminal_reason IS NULL
+                  AND next_attempt_at<=:now AND (claim_until IS NULL OR claim_until<=:now)
+                ORDER BY created_at,job_id LIMIT 1 FOR UPDATE SKIP LOCKED"""),{'a':account,'now':at}).first()
+            if row is None:
+                return None
+            return dict(conn.execute(text("""UPDATE bot_notification_outbox
+                SET claim_token=:token,claim_until=:until,attempts=attempts+1
+                WHERE account_key=:a AND job_id=:id RETURNING *"""),
+                {'a':account,'id':row.job_id,'token':uuid.uuid4().hex,
+                 'until':at+timedelta(seconds=lease_seconds)}).mappings().one())
+
+    def freeze_notification(self, account, job, subject, body, route_hash, *, now=None):
+        with self.engine.begin() as conn:
+            at = timestamp(now) if now is not None else conn.execute(text('SELECT clock_timestamp()')).scalar_one()
+            row = conn.execute(text("""UPDATE bot_notification_outbox
+                SET subject=COALESCE(subject,:subject),body=COALESCE(body,:body),
+                    route_hash=COALESCE(route_hash,:route),first_attempt_at=COALESCE(first_attempt_at,:now)
+                WHERE account_key=:a AND job_id=:id AND claim_token=:token AND claim_until>:now
+                  AND delivered_at IS NULL AND terminal_reason IS NULL RETURNING *"""),
+                {'a':account,'id':job['job_id'],'token':job['claim_token'],'now':at,
+                 'subject':subject,'body':body,'route':route_hash}).mappings().first()
+            return dict(row) if row is not None else None
+
+    def finish_notification(self, account, job, delivered, *, error_type=None, terminal_reason=None, now=None):
+        with self.engine.begin() as conn:
+            at = timestamp(now) if now is not None else conn.execute(text('SELECT clock_timestamp()')).scalar_one()
+            delay = min(1800, 30 * 2**min(max(job['attempts']-1,0),6))
+            row = conn.execute(text("""UPDATE bot_notification_outbox
+                SET delivered_at=CASE WHEN :sent THEN :now ELSE delivered_at END,
+                    next_attempt_at=:next,last_error_type=:error,terminal_reason=:terminal,
+                    claim_token=NULL,claim_until=NULL
+                WHERE account_key=:a AND job_id=:id AND claim_token=:token
+                  AND delivered_at IS NULL AND terminal_reason IS NULL RETURNING job_id"""),
+                {'a':account,'id':job['job_id'],'token':job['claim_token'],'sent':bool(delivered),
+                 'now':at,'next':at+timedelta(seconds=delay),'error':error_type,'terminal':terminal_reason}).first()
+            return row is not None
+
+    def _queue_execution_notifications(self, conn, intent, *, recovered=False):
+        preferences = intent['context'].get('notification_delivery') or {}
+        kind = 'entry' if intent['settle_type']=='OPEN' else 'exit'
+        return self._insert_notifications(conn,intent['account_key'],'execution:'+intent['client_order_id'],
+                                          preferences,kind,client_id=intent['client_order_id'],recovered=recovered)
 
     def get(self, client_id):
         with self.engine.connect() as conn:
@@ -379,25 +460,30 @@ class ExecutionStore:
 
     def reject(self, client_id):
         with self.engine.begin() as conn:
-            conn.execute(
+            row = conn.execute(
                 text(
-                    "UPDATE bot_order_intents SET status='REJECTED',finalized=true,updated_at=now() WHERE client_order_id=:id AND status='SUBMITTING'"
+                    "UPDATE bot_order_intents SET status='REJECTED',finalized=true,updated_at=now() WHERE client_order_id=:id AND status='SUBMITTING' RETURNING *"
                 ),
                 {"id": client_id},
-            )
+            ).mappings().first()
+            if row is not None:
+                self._queue_execution_notifications(conn,dict(row))
 
-    def record(self, intent, order, rows, finalized):
+    def record(self, intent, order, rows, finalized, *, recovered=False):
         cid, account = intent["client_order_id"], intent["account_key"]
-        context = intent["context"]
         with self.engine.begin() as conn:
             locked = conn.execute(
                 text(
-                    "SELECT finalized FROM bot_order_intents WHERE client_order_id=:id FOR UPDATE"
+                    "SELECT * FROM bot_order_intents WHERE client_order_id=:id FOR UPDATE"
                 ),
                 {"id": cid},
-            ).one()
-            if locked.finalized:
+            ).mappings().one()
+            if locked['finalized']:
                 return
+            # Recovery may have adopted notification settings since the caller's
+            # snapshot. Register from the locked, persisted intent, not that copy.
+            intent = dict(locked)
+            context = intent['context']
             known = conn.execute(
                 text(
                     "SELECT COALESCE(sum(size),0) FROM bot_execution_fills WHERE client_order_id=:id"
@@ -494,6 +580,8 @@ class ExecutionStore:
                     "done": finalized,
                 },
             )
+            if finalized:
+                self._queue_execution_notifications(conn,intent,recovered=recovered)
 
     def _project_position(self, conn, intent, pid):
         account = intent["account_key"]

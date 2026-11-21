@@ -12,6 +12,7 @@ from test_bot_execution_integration import BOT, method
 from test_execution import service, records
 from test_execution_recovery import bot_for, two_positions
 from trading_execution import ExecutionError
+from notification_outbox import NotificationOutboxWorker
 
 
 AT = datetime(2026, 11, 21, 3, tzinfo=timezone.utc)
@@ -125,6 +126,21 @@ def notified_bot(svc):
     bot=bot_for(svc);bot.notification_settings={'enabled':True,'send_on_entry':True,'send_on_exit':True,'send_on_error':False}
     bot.mail=[]
     bot.send_notification=lambda *a:bot.mail.append(a) or True
+    bot._configured_trade_channels=lambda:['email']
+    bot._prepare_notification_route=lambda channel:['fixture@example.invalid']
+    bot._deliver_outbox_notification=lambda channel,subject,body,kind,*rest:bot.send_notification(subject,body,kind)
+    # These existing tests isolate receipt content/routing. Dedicated outbox
+    # tests use the real background dispatcher, blocked transports and restarts.
+    def drain():
+        if not bot.notification_settings.get('enabled',False):return
+        worker=getattr(bot,'_trade_notification_worker',None)
+        if worker is None:
+            worker=NotificationOutboxWorker(svc.store,svc.account,bot._outbox_enabled,
+                bot._prepare_notification_route,bot._deliver_outbox_notification,bot.logger,poll_seconds=3600)
+            bot._trade_notification_worker=worker
+        for _ in range(8):
+            if not worker.process_one():break
+    bot._queue_trade_notifications=drain
     return bot
 
 
@@ -253,7 +269,7 @@ def test_actual_entry_handler_uses_rich_receipt_once_without_legacy_template(sto
 def test_formatting_failure_does_not_undo_entry_or_repeat_post(store,monkeypatch):
     svc,api=service(store);bot=notified_bot(svc)
     def fail(*a,**kw):raise ValueError('invalid display')
-    monkeypatch.setattr('live_execution.compose_execution_notice',fail)
+    monkeypatch.setattr('notification_outbox.compose_execution_notice',fail)
     assert open_order(bot)['success']
     assert len(api.posts)==len(records(store,'bot_execution_fills'))==1
     assert not bot.mail

@@ -31,6 +31,7 @@ SOURCE_FILES = (
     "close_alerts.py",
     "trade_notifications.py",
     "exchange_availability.py",
+    "notification_outbox.py",
     "trading_execution.py",
     "execution_store.py",
     "backtest_data.py",

@@ -2051,7 +2051,7 @@ class CryptoTradingBot(LiveExecutionMixin):
 
 
     
-    def send_notification(self, subject, message, notification_type='info'):
+    def send_notification(self, subject, message, notification_type='info', *, _direct=False, notification_key=None):
         """通知を送信（メールとLINE）
         
         Parameters:
@@ -2078,6 +2078,9 @@ class CryptoTradingBot(LiveExecutionMixin):
         if not should_send:
             return False
 
+        if not _direct and (getattr(self,'exchange_settings_gmo',{}) or {}).get('live_trade',False):
+            return self._enqueue_live_message(subject,message,notification_type,notification_key=notification_key)
+
         sent = False
         for channel in (self._send_email, self._send_line):
             try:
@@ -2090,6 +2093,10 @@ class CryptoTradingBot(LiveExecutionMixin):
         else:
             self.logger.warning('通知の送信成功を確認できませんでした')
         return sent
+
+    def _send_notification_direct(self, subject, message, notification_type='info'):
+        # Close-stall delivery has its own persisted acknowledgement protocol.
+        return self.send_notification(subject,message,notification_type,_direct=True)
 
     def _send_daily_report(self, stats: dict) -> None:
         """
@@ -2231,18 +2238,42 @@ class CryptoTradingBot(LiveExecutionMixin):
 
         return self.send_notification(subject, message, notification_type=nt)
 
-    def _send_line(self, subject: str, body: str) -> bool:
+    def _send_line(self, subject: str, body: str, *, retry_key=None, recipient=None) -> bool:
         """LINE Messaging API 送信（宛先は DB→ENV の順で解決。なければ黙ってスキップ）"""
         try:
             # 宛先解決：DB（user_id 紐づけ）→ 環境変数 LINE_DEFAULT_USER_ID
-            line_user_id = None
-            if getattr(self, "user_id", None) is not None:
+            line_user_id = recipient
+            if line_user_id is None and getattr(self, "user_id", None) is not None:
                 line_user_id = get_line_user_id(self.user_id)  # U で始まる 32桁のhex
             if not line_user_id:
                 line_user_id = os.getenv("LINE_DEFAULT_USER_ID")
             if not line_user_id:
                 self.logger.info("LINE宛先が未設定のため送信スキップ")
                 return False
+
+            if retry_key is not None:
+                retry_key=str(uuid.UUID(str(retry_key)))
+                token=os.getenv('LINE_CHANNEL_ACCESS_TOKEN')
+                if not token:return False
+                response=None
+                try:
+                    response=requests.post('https://api.line.me/v2/bot/message/push',
+                        headers={'Authorization':'Bearer '+token,'Content-Type':'application/json','X-Line-Retry-Key':retry_key},
+                        json={'to':line_user_id,'messages':[{'type':'text','text':f'{subject}\n{body}'}]},
+                        timeout=10,allow_redirects=False)
+                    accepted=response.status_code==200
+                    if response.status_code==409:
+                        try:
+                            uuid.UUID(response.headers.get('x-line-accepted-request-id',''))
+                            accepted=True
+                        except (ValueError,TypeError,AttributeError):pass
+                    if accepted:self.logger.info('LINE送信受付を確認（永続通知）')
+                    else:self.logger.warning('LINE永続通知の送信未確認 (HTTP %s)',response.status_code)
+                    return accepted
+                finally:
+                    if response is not None:
+                        try:response.close()
+                        except Exception:pass
 
             client = LineMessaging()  # ENV の LINE_CHANNEL_ACCESS_TOKEN を利用
             ok = client.send_text(line_user_id, f"{subject}\n{body}")
@@ -2376,7 +2407,7 @@ class CryptoTradingBot(LiveExecutionMixin):
             self.logger.error(f"notify_users_by_email エラー: {e}")
             return 0
     
-    def _send_email(self, subject, body):
+    def _send_email(self, subject, body, *, message_id=None, recipients=None):
         if not (self.notification_settings or {}).get('enabled', False):
             return False
         try:
@@ -2387,7 +2418,7 @@ class CryptoTradingBot(LiveExecutionMixin):
                 self.logger.warning(f"メール設定が不完全: {missing}")
                 return False
 
-            recipients = self._resolve_recipients_for_mode()
+            recipients = list(recipients) if recipients is not None else self._resolve_recipients_for_mode()
             if not recipients:
                 self.logger.info("宛先なしのためスキップ")
                 return False
@@ -2410,6 +2441,7 @@ class CryptoTradingBot(LiveExecutionMixin):
                             msg['From'] = email_settings['sender']
                             msg['To'] = rcpt
                             msg['Subject'] = str(Header(_subject, 'utf-8'))
+                            if message_id is not None:msg['Message-ID']=message_id
                             msg.attach(MIMEText(body, 'plain', 'utf-8'))
                             server.sendmail(email_settings['sender'], rcpt, msg.as_string())
                     self.logger.info(f"メール送信成功（{len(recipients)}件）")
@@ -6716,6 +6748,8 @@ class CryptoTradingBot(LiveExecutionMixin):
             self.is_backtest = False
             # 稼働状況のレポートを出力
             self._generate_final_report(start_date, start_balance, stats, trade_logs)
+            if callable(getattr(self,'_stop_trade_notifications',None)):
+                self._stop_trade_notifications()
             
             # 取引ログをファイルに保存
             # Excel出力は本番（live）のみ実行。SIM時はスキップして落ちないようにする

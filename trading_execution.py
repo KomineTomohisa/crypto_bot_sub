@@ -404,13 +404,13 @@ class ExecutionService:
             )
         return self.reconcile(self.store.get(intent["client_order_id"]))
 
-    def reconcile(self, intent):
+    def reconcile(self, intent, *, recovered=False):
         # Only GET snapshots are retried. POST and the persisted sending claim are
         # outside this loop, including when the original response was lost.
         started = time.monotonic()
         for attempt in range(len(self.retry_delays) + 1):
             try:
-                result = self._reconcile_once(intent)
+                result = self._reconcile_once(intent, recovered=recovered)
             except ExecutionPending:
                 if attempt == len(self.retry_delays) or time.monotonic() - started >= 2:
                     raise
@@ -420,7 +420,7 @@ class ExecutionService:
             time.sleep(self.retry_delays[attempt])
             intent = self.store.get(intent["client_order_id"])
 
-    def _reconcile_once(self, intent):
+    def _reconcile_once(self, intent, *, recovered=False):
         if intent["finalized"]:
             return self.store.result(intent["client_order_id"])
         order = self.gateway.order(intent)
@@ -435,7 +435,7 @@ class ExecutionService:
             raise ExecutionPending("Executed order total not yet complete")
         # A delayed executions endpoint must not turn missing fills into a completed order.
         finalized = order["status"] in TERMINAL and quantity == reported
-        self.store.record(intent, order, rows, finalized)
+        self.store.record(intent, order, rows, finalized, recovered=recovered)
         return self.store.result(intent["client_order_id"])
 
     def recover(self):
@@ -446,7 +446,7 @@ class ExecutionService:
             ):
                 # Persisted before the sending claim: no request was made.
                 continue
-            results.append(self.reconcile(self.store.get(intent["client_order_id"])))
+            results.append(self.reconcile(self.store.get(intent["client_order_id"]), recovered=True))
         return results
 
     def sync_fees(self, today):

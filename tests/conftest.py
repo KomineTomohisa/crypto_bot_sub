@@ -25,8 +25,20 @@ def no_exchange_network(monkeypatch):
     monkeypatch.setattr(smtplib, "SMTP", forbidden)
 
 
+@pytest.fixture(autouse=True)
+def notification_workers(monkeypatch, no_exchange_network):
+    from notification_outbox import NotificationOutboxWorker
+    workers=[]
+    original=NotificationOutboxWorker.__init__
+    def tracked(self,*args,**kwargs):
+        original(self,*args,**kwargs);workers.append(self)
+    monkeypatch.setattr(NotificationOutboxWorker,'__init__',tracked)
+    yield workers
+    for worker in workers:worker.close(2)
+
+
 @pytest.fixture
-def store():
+def store(notification_workers):
     admin = create_engine(TEST_URL)
     schema = "t_" + uuid.uuid4().hex
     with admin.begin() as conn:
@@ -51,7 +63,11 @@ def store():
         conn.exec_driver_sql(
             (ROOT / "migrations/003_close_stall_notifications.sql").read_text()
         )
+        conn.exec_driver_sql(
+            (ROOT / "migrations/004_notification_outbox.sql").read_text()
+        )
     yield ExecutionStore(engine)
+    for worker in notification_workers:worker.close(2)
     engine.dispose()
     with admin.begin() as conn:
         conn.exec_driver_sql("DROP SCHEMA " + schema + " CASCADE")

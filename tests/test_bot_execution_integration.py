@@ -89,6 +89,7 @@ def method(owner, name):
         "HTTPAdapter": HTTPAdapter,
         "Retry": Retry,
         "hashlib": hashlib,
+        "uuid": __import__('uuid'),
     }
     exec(
         compile(
