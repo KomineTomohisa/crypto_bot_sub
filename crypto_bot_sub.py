@@ -29,7 +29,8 @@ from urllib3.util.retry import Retry
 import socket
 from urllib.parse import urlencode
 from live_execution import LiveExecutionMixin
-from trading_execution import ExchangeGateway, ExecutionError, fallback_exit
+from trading_execution import ExchangeGateway, ExecutionError, ExchangeMaintenance, fallback_exit
+from exchange_availability import ExchangeAvailability
 from signal_scoring import MACD_SCORING_VERSION, causal_macd_scores, macd_scoring_spec
 from backtest_data import backtest_state, load_backtest_candles, excel_backtest_inputs
 from strategy_decisions import DECISION_VERSION, entry_side, exit_decision, short_profit_stop, jst_timestamp, next_entry_time, symbol_priority
@@ -120,6 +121,11 @@ def _make_session():
     )
     s.mount("https://", HTTPAdapter(max_retries=retry))
     s.mount("http://",  HTTPAdapter(max_retries=retry))
+    # GMO retry policy lives in the explicit GET loop/status scheduler. Inspect
+    # maintenance responses before another HTTP attempt; POST is never retried.
+    no_retry = Retry(total=0, read=0, connect=0, status=0, other=0,
+                     allowed_methods=frozenset(['GET']), raise_on_status=False)
+    s.mount('https://api.coin.z.com/', HTTPAdapter(max_retries=no_retry))
     return s
 
 HTTP_SESSION = _make_session()
@@ -769,6 +775,8 @@ class PriceCacheRefresher:
                         upsert_price_cache(sym.lower(), px, dt.datetime.now(timezone.utc))
                         if self.logger:
                             self.logger.debug(f"[price_cache] {sym} = {px}")
+                except ExchangeMaintenance:
+                    continue  # The shared availability object records transitions.
                 except Exception as e:
                     if self.logger:
                         self.logger.warning(f"[price_cache] {sym} failed: {e}")
@@ -783,6 +791,7 @@ class GMOCoinAPI:
         self.api_secret = api_secret
         self.base_url = "https://api.coin.z.com/private"
         self.public_url = "https://api.coin.z.com/public"
+        self.availability = ExchangeAvailability(logging.getLogger('crypto_bot'))
         
     def _sign(self, method, timestamp, path, reqBody=""):
         """リクエストの署名を作成"""
@@ -797,6 +806,9 @@ class GMOCoinAPI:
         """
         APIリクエスト共通処理（署名は送信直前に毎回生成。リトライごとにtimestampを更新）
         """
+        availability = getattr(self, 'availability', None)
+        if availability is not None:
+            availability.require_available()
         base_url = self.base_url + path
 
         # GETクエリをURLへ付与（署名には含めない：pathのみでOK）
@@ -807,8 +819,10 @@ class GMOCoinAPI:
 
         body_str = json.dumps(data, separators=(',', ':')) if data else ""
 
-        # 最大3回リトライ（HTTP_SESSION側にもRetryはあるが、ここではtimestamp再生成のため明示）
+        # GETは最大3回。GMO専用adapterでは追加リトライせず、POSTは1回だけ。
         for attempt in range(3 if method == "GET" else 1):
+            if availability is not None:
+                availability.require_available()
             ts = str(int(time.time() * 1000))  # ← 毎回作り直す（Timestamp too late対策）
             headers = {
                 "API-KEY": self.api_key,
@@ -826,9 +840,14 @@ class GMOCoinAPI:
                     # 注意: 元のコードは data=body_str なので合わせています
                     r = HTTP_SESSION.post(url, headers=headers, data=body_str, timeout=timeout, allow_redirects=False)
 
+                payload = r.json()
+                if availability is not None:
+                    availability.observe(payload)
                 r.raise_for_status()
-                return r.json()
+                return payload
 
+            except ExchangeMaintenance:
+                raise
             except requests.exceptions.RequestException as e:
                 # DNS一時失敗は少し待って再試行
                 if _is_dns_temp_failure(e):
@@ -865,10 +884,16 @@ class GMOCoinAPI:
         return {"status": -1, "messages": [{"message_string": "unknown error"}]}
 
     def _public_request(self, path, params=None):
+        availability = getattr(self, 'availability', None)
+        if availability is not None and path != '/v1/status':
+            availability.require_available()
         response = HTTP_SESSION.get('https://api.coin.z.com/public' + path, params=params, timeout=8)
         try:
+            payload = response.json()
+            if availability is not None:
+                availability.observe(payload)
             response.raise_for_status()
-            return response.json()
+            return payload
         finally:
             response.close()
 
@@ -1709,6 +1734,8 @@ class CryptoTradingBot(LiveExecutionMixin):
         if self.exchange_settings_gmo.get("live_trade", False):
             try:
                 return float(ExchangeGateway(self.gmo_api).margin()['actualProfitLoss'])
+            except ExchangeMaintenance:
+                raise  # Unavailable equity must not be displayed as a zero balance.
             except Exception as exc:
                 self.logger.error("Equity unavailable (%s)", type(exc).__name__)
                 return 0.0
@@ -2752,6 +2779,9 @@ class CryptoTradingBot(LiveExecutionMixin):
             self.logger.info("現在ポジションはありません")
 
     def get_current_price(self, symbol):
+        availability = getattr(getattr(self, 'gmo_api', None), 'availability', None)
+        if availability is not None:
+            availability.require_available()
         try:
             gmo_symbol = self.symbol_mapping.get(symbol, symbol.upper())
             url = f'https://api.coin.z.com/public/v1/ticker?symbol={gmo_symbol}'
@@ -2762,18 +2792,20 @@ class CryptoTradingBot(LiveExecutionMixin):
             if elapsed < self.rate_limit_delay:
                 time.sleep(self.rate_limit_delay - elapsed)
 
-            # 最大3回の明示再試行（HTTP_SESSION側のRetryとは別にDNS対策）
+            # 最大3回の明示再試行。GMO専用adapterでの追加リトライは行わない。
             last_exc = None
             for attempt in range(3):
+                if availability is not None:
+                    availability.require_available()
                 response = None
                 try:
                     response = HTTP_SESSION.get(url, headers=headers, timeout=10)
                     self.last_api_call = time.time()
 
-                    # HTTPエラーを明示的に例外化（4xx/5xx）
-                    response.raise_for_status()
-
                     data = response.json()
+                    if availability is not None:
+                        availability.observe(data)
+                    response.raise_for_status()
                     rows = data.get('data', [])
                     rows = rows if isinstance(rows, list) else [rows]
                     record_bot_event(self, 'ticker_response', {
@@ -2801,6 +2833,9 @@ class CryptoTradingBot(LiveExecutionMixin):
                         self.logger.error(f"GMOコイン価格取得エラー: {err}")
                         return 0.0
 
+                except ExchangeMaintenance:
+                    record_bot_event(self, 'input_error', {'symbol': symbol, 'source': 'gmo_ticker', 'reason': 'exchange_maintenance'}, now_jst())
+                    raise
                 except requests.exceptions.RequestException as e:
                     last_exc = e
                     record_bot_event(self, 'input_error', {'symbol': symbol, 'source': 'gmo_ticker', 'attempt': attempt + 1, 'error_type': type(e).__name__}, now_jst())
@@ -2822,6 +2857,8 @@ class CryptoTradingBot(LiveExecutionMixin):
                 self.logger.error(f"価格取得APIリクエストエラー: {last_exc}")
             return 0.0
 
+        except ExchangeMaintenance:
+            raise
         except ValueError as e:
             self.logger.error(f"価格取得JSONパースエラー: {e}")
             return 0.0
@@ -6410,13 +6447,19 @@ class CryptoTradingBot(LiveExecutionMixin):
             # 取引ログ用のリスト（バックテストと同様）
             trade_logs = []
 
-            # 起動時にポジション検証を実行
-            self.verify_positions()
-
             # 起動時の資産状況を取得
+            try:
+                self.verify_positions()
+            except ExchangeMaintenance:
+                self._queue_close_alerts()
+                self.logger.info('Exchange unavailable at startup; position verification deferred')
             try:
                 start_balance = self.get_total_balance()
                 self.logger.info(f"起動時資産: {start_balance:,.0f}円")
+            except ExchangeMaintenance:
+                self._queue_close_alerts()
+                start_balance = self.initial_capital
+                self.logger.info('Exchange unavailable at startup; equity and position verification deferred')
             except Exception as e:
                 self.logger.error(f"起動時資産取得エラー: {e}")
                 start_balance = self.initial_capital
@@ -6452,6 +6495,12 @@ class CryptoTradingBot(LiveExecutionMixin):
                 loop_start_time = now_jst()
                 
                 try:
+                    self._exchange_status_ready()
+                    availability = getattr(self.gmo_api, 'availability', None)
+                    if availability is not None and availability.blocked:
+                        self._queue_close_alerts()
+                        time.sleep(min(30, max(1, availability.seconds_until_probe())))
+                        continue
                     # 現在の日本時間を取得
                     jst_now = dt.datetime.now(JST)
                     
@@ -6549,6 +6598,8 @@ class CryptoTradingBot(LiveExecutionMixin):
                             if hasattr(self, 'df_5min'):
                                 del self.df_5min
                             
+                        except ExchangeMaintenance:
+                            raise
                         except Exception as e:
                             record_bot_event(self, 'input_error', {'symbol': symbol, 'source': 'symbol_processing', 'error_type': type(e).__name__}, now_jst())
                             self.logger.error(f"{symbol}の処理中にエラーが発生: {str(e)}", exc_info=True)
@@ -6577,6 +6628,9 @@ class CryptoTradingBot(LiveExecutionMixin):
                     if remain > 0:
                         time.sleep(remain)
                     
+                except ExchangeMaintenance:
+                    self._queue_close_alerts()
+                    time.sleep(1)  # Next cycle waits only for the shared status probe.
                 except requests.exceptions.RequestException as e:
                     # APIリクエスト関連のエラー
                     error_states['consecutive_api_errors'] += 1
@@ -6691,20 +6745,19 @@ class CryptoTradingBot(LiveExecutionMixin):
                 self.logger.error("API認証情報が設定されていません")
                 return False
             
-            # 資産残高の取得を試みる
-            for symbol in self.symbols:
-                base_coin = symbol.split('_')[0]
-                balance = self.get_balance(base_coin)
-                self.logger.info(f"{base_coin}の残高取得テスト: {balance}")
-                # 通貨ごとに少なくとも1つは成功すればOK
-                if balance is not None:
-                    return True
-                    
-            self.logger.error("API接続テストに失敗しました")
-            return False
+            self._exchange_status_ready()
+            availability = getattr(self.gmo_api, 'availability', None)
+            if availability is not None:
+                availability.require_available()
+            self._live_margin_available()  # Validated authenticated account read, not a zero fallback.
+            self.logger.info('Authenticated exchange account read confirmed')
+            return True
+        except ExchangeMaintenance:
+            self.logger.info('Exchange maintenance confirmed; startup verification deferred until OPEN')
+            return True  # Keep the process alive; the main loop performs bounded status probes.
         
         except Exception as e:
-            self.logger.error(f"API接続検証中にエラーが発生: {str(e)}")
+            self.logger.error('API接続検証中にエラーが発生 (%s)', type(e).__name__)
             return False
 
     def _display_current_positions(self):
@@ -7533,6 +7586,9 @@ class CryptoTradingBot(LiveExecutionMixin):
             if self.exchange_settings_gmo.get("live_trade", False):
                 try:
                     self._close_live_position(symbol, exit_reason, stats, trade_logs)
+                except ExchangeMaintenance:
+                    self._queue_close_alerts()
+                    raise
                 except Exception as exc:
                     self.logger.error("%s: close not confirmed (%s): %s", symbol, type(exc).__name__,
                                       str(exc) if isinstance(exc, ExecutionError) else "details suppressed")

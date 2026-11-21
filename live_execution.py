@@ -15,6 +15,7 @@ from trading_execution import (
     ExchangeGateway,
     ExecutionError,
     ExecutionPending,
+    ExchangeMaintenance,
     ExecutionService,
     account_key,
     decimal,
@@ -40,6 +41,13 @@ class LiveExecutionMixin:
     def _live_margin_available(self):
         return self._execution().gateway.margin()
 
+    def _exchange_status_ready(self):
+        api = getattr(self, 'gmo_api', None)
+        availability = getattr(api, 'availability', None)
+        if availability is None:
+            return True  # Paper adapters and older test doubles have no exchange status.
+        return availability.poll(lambda: api._public_request('/v1/status'))
+
     def _live_order_size(self, symbol, size):
         rule = self._execution().gateway.rule(self.symbol_mapping[symbol])
         quantity = normalize_size(size, rule["sizeStep"], rule["minOrderSize"])
@@ -48,6 +56,9 @@ class LiveExecutionMixin:
         return quantity, rule
 
     def _live_funds_check(self, symbol, side, size):
+        if not self._exchange_status_ready():
+            record_bot_event(self, 'funds_blocked', {'symbol': symbol, 'reason': 'exchange_status_unconfirmed'})
+            return False
         service = self._execution()
         if service.store.pending(service.account) or service.store.close_batches(service.account):
             # An unconfirmed account order may already have consumed margin.
@@ -129,6 +140,9 @@ class LiveExecutionMixin:
                 result = service.reconcile(service.store.get(intent["client_order_id"]))
                 self._record_live_order_result(result)
                 self._notify_live_execution(result, recovered=True)
+            except ExchangeMaintenance:
+                self._queue_close_alerts()
+                raise
             except Exception as exc:
                 # Continue protecting other positions. Unknown orders still block new exposure.
                 self.logger.error(
@@ -159,6 +173,9 @@ class LiveExecutionMixin:
         for batch in batches:
             try:
                 self._drive_live_close_batch(batch)
+            except ExchangeMaintenance:
+                self._queue_close_alerts()
+                raise
             except Exception as exc:
                 self.logger.error(
                     "Close batch not completed (%s): %s", type(exc).__name__,
@@ -173,6 +190,9 @@ class LiveExecutionMixin:
                     datetime.now(timezone.utc) + timedelta(hours=9) - timedelta(hours=6)
                 ).date()
                 service.sync_fees(today)
+            except ExchangeMaintenance:
+                self._next_fee_sync = 0  # Retry promptly after explicit OPEN, not an hour later.
+                raise
             except Exception as exc:
                 self.logger.error(
                     "Daily exchange fees not confirmed (%s): %s", type(exc).__name__,
@@ -283,6 +303,11 @@ class LiveExecutionMixin:
                 self.entry_scores[sym] = context.get(
                     "scores", self.entry_scores.get(sym, {})
                 )
+            except ExchangeMaintenance:
+                if not hasattr(self, '_position_sync_failed'):
+                    self._position_sync_failed = set()
+                self._position_sync_failed.update(self.symbols)
+                raise  # Preserve all prior snapshots, quantities and protection state.
             except Exception as exc:
                 # Missing data is not proof that a position has disappeared.
                 self.logger.error(

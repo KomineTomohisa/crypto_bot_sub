@@ -20,7 +20,8 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from trading_execution import ExchangeGateway, ExecutionError, fallback_exit
+from trading_execution import ExchangeGateway, ExecutionError, ExchangeMaintenance, fallback_exit
+from exchange_availability import ExchangeAvailability
 from signal_scoring import MACD_SCORING_VERSION, causal_macd_scores, macd_scoring_spec
 from backtest_data import backtest_state, load_backtest_candles, excel_backtest_inputs
 from strategy_decisions import DECISION_VERSION, entry_side, exit_decision, short_profit_stop, jst_timestamp, next_entry_time, symbol_priority
@@ -47,6 +48,9 @@ def method(owner, name):
         "np": np,
         "ExchangeGateway": ExchangeGateway,
         "ExecutionError": ExecutionError,
+        "ExchangeMaintenance": ExchangeMaintenance,
+        "ExchangeAvailability": ExchangeAvailability,
+        "logging": logging,
         "fallback_exit": fallback_exit,
         "MACD_SCORING_VERSION": MACD_SCORING_VERSION,
         "causal_macd_scores": causal_macd_scores,

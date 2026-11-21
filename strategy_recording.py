@@ -30,6 +30,7 @@ SOURCE_FILES = (
     "live_execution.py",
     "close_alerts.py",
     "trade_notifications.py",
+    "exchange_availability.py",
     "trading_execution.py",
     "execution_store.py",
     "backtest_data.py",

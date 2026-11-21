@@ -33,6 +33,13 @@ class ExecutionPending(ExecutionError):
     pass
 
 
+class ExchangeMaintenance(ExecutionError):
+    """Explicit exchange unavailability; only a local pre-send guard proves no POST."""
+    def __init__(self, state='MAINTENANCE', *, not_sent=False):
+        super().__init__('Exchange unavailable: ' + state)
+        self.state, self.not_sent = state, not_sent
+
+
 def decimal(value, *, positive=False):
     try:
         result = Decimal(str(value))
@@ -106,6 +113,13 @@ class ExchangeGateway:
 
     def request(self, path, params=None):
         response = self.api._request("GET", path, params=params)
+        from exchange_availability import maintenance_reason
+        state = maintenance_reason(response)
+        if state:
+            availability = getattr(self.api, 'availability', None)
+            if availability is not None:
+                availability.observe(response)
+            raise ExchangeMaintenance(state)
         if not isinstance(response, dict) or response.get("status") != 0:
             codes = []
             if isinstance(response, dict):
@@ -307,6 +321,9 @@ class ExecutionService:
         if side not in ("BUY", "SELL"):
             raise ExecutionError("Invalid order side")
         size = decimal(size, positive=True)
+        availability = getattr(self.gateway.api, 'availability', None)
+        if availability is not None:
+            availability.require_available()
         body = {
             "symbol": symbol,
             "side": side,
@@ -363,6 +380,13 @@ class ExecutionService:
                     "/v1/closeOrder" if settle == "CLOSE" else "/v1/order",
                     data=request,
                 )
+            except ExchangeMaintenance as exc:
+                if exc.not_sent:
+                    # This wrapper raised before entering HTTP, after our DB claim.
+                    # Never apply this to a response or an exception after sending.
+                    self.store.reject(intent['client_order_id'])
+                    raise
+                response = {"status": -1}
             except Exception:
                 response = {"status": -1}
             order_id = None
