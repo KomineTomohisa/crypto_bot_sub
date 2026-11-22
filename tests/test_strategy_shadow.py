@@ -218,3 +218,33 @@ def test_optional_shadow_failure_does_not_interrupt_actual_monitoring(monkeypatc
     run()
     assert [('monitor', s, cycle) for cycle in (0, 1) for s in SYMBOLS] == [a for a in actions if a[0] == 'monitor']
     assert len(waits) == 2
+
+
+def test_worker_records_database_sr_rows_with_uuid_and_decimal(tmp_path, monkeypatch):
+    from decimal import Decimal
+    from types import SimpleNamespace
+    from uuid import uuid4
+    import strategy_shadow
+    monkeypatch.setattr(strategy_shadow, 'datetime', SimpleNamespace(now=lambda tz: AT.to_pydatetime()))
+    class Reader:
+        def read(self, symbol):
+            return MarketQuote(100, AT.to_pydatetime()), AT, RULE
+        def close(self):
+            pass
+    def build():
+        result = core()
+        result.identity['code'] = code_fingerprint()
+        return result
+    def sr(**kwargs):
+        return [dict(zone_id=uuid4(), zone_type='support', price_low=Decimal('80'),
+                     price_high=Decimal('81'), strength=Decimal('20'), touches=3,
+                     last_touched_at=AT.to_pydatetime(), user_id=1)]
+    worker = ShadowWorker(build, tmp_path, Reader(), sr, logging.getLogger('test'))
+    assert worker.offer('observation', (SYMBOL, features()))
+    worker.close(5)
+    assert not worker.thread.is_alive() and not worker.failed
+    verified = verify_shadow_journal(next((tmp_path / 'observations').glob('*.jsonl')))
+    assert verified['checkpoints'] == 1
+    assert verified['report']['books'][BASELINE.version]['open_positions'] == 1
+    contents = next((tmp_path / 'observations').glob('*.jsonl')).read_text()
+    assert 'zone_id' not in contents and 'user_id' not in contents

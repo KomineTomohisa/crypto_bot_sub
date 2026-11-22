@@ -368,7 +368,12 @@ class ShadowWorker:
                         zones = {}
                         for query in core.sr_queries(symbol):
                             try:
-                                zones[digest(query)] = self.sr_reader(**query) or []
+                                rows = self.sr_reader(**query) or []
+                                # Match the live SR observation contract. Database
+                                # IDs (UUID) and unrelated columns are not inputs
+                                # to either decision and must not enter the journal.
+                                fields = ('zone_type', 'price_low', 'price_high', 'strength', 'touches', 'last_touched_at')
+                                zones[digest(query)] = [{key: row.get(key) for key in fields} for row in rows]
                             except Exception as exc:
                                 gap('sr_unavailable_' + type(exc).__name__, symbol, at)
                         # SR reads may take time; validate quote freshness again.
