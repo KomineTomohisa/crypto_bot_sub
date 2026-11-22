@@ -24,21 +24,29 @@ def plan(api, reason='stop-triggered'):
             'scores': {}, 'user_id': None, 'feature_snapshot': None}
 
 
-def waiting_other_order(svc, api, symbol='OTHER_JPY'):
+def waiting_other_order(svc, api, symbol='LTC_JPY'):
     """The exchange accepted a different order but its response and reads are lost."""
     original = api._request
+    posts_before = len(api.posts)
     blocked = {'value': True}
     api.lose_response = True
+    previous_ratio = api.fill_ratio
+    api.fill_ratio = Decimal(0)
+    hidden = []
 
     def request(method, path, params=None, data=None):
-        if method == 'GET' and path == '/v1/orders' and blocked['value']:
+        if method == 'POST' and not hidden:
+            hidden.append(data['clientOrderId'])
+        if (method == 'GET' and path == '/v1/orders' and blocked['value']
+                and params.get('clientOrderId') in hidden):
             return {'status': -1}
         return original(method, path, params, data)
 
     api._request = request
     with pytest.raises(ExecutionError):
         svc.submit(symbol, 'BUY', 1, decision_key='other-order', context={'bot_symbol': symbol.lower()})
-    assert len(api.posts) == 1 and svc.store.pending(svc.account)[0]['status'] == 'UNKNOWN'
+    api.fill_ratio = previous_ratio
+    assert len(api.posts) == posts_before + 1 and svc.store.pending(svc.account)[0]['status'] == 'UNKNOWN'
     return blocked
 
 
@@ -79,7 +87,7 @@ def test_restart_and_cleared_pending_resumes_original_close_without_new_signal(s
     restarted._recover_live_orders()
     assert [p['settlePosition'][0]['positionId'] for p in api.posts if 'settlePosition' in p] == [600, 601]
     assert not store.pending('test') and not store.close_batches('test')
-    assert [p['symbol'] for p in api.position_rows] == ['OTHER_JPY']
+    assert not api.position_rows
     assert all(t['raw']['exit_reason'] == 'stop-triggered' for t in records(store, 'trades'))
     completed = records(store, 'bot_close_batches')[0]
     assert completed['completed'] and completed['completed_at'] is not None
@@ -274,7 +282,7 @@ def test_migration_can_use_app_role_without_altering_old_table_ownership(store):
             conn.exec_driver_sql('DROP ROLE ' + role)
 
 
-def test_two_symbols_can_queue_without_relaxing_single_pending_order(store):
+def test_other_symbol_unknown_order_does_not_block_two_protective_closes(store):
     svc, api = service(store)
     two_positions(api)
     api.position_rows.append({'positionId': '700', 'symbol': 'OTHER_JPY', 'side': 'BUY',
@@ -286,10 +294,10 @@ def test_two_symbols_can_queue_without_relaxing_single_pending_order(store):
     blocked = waiting_other_order(svc, api, symbol='WAIT_JPY')
     bot._close_live_position('ltc_jpy', 'ltc-stop', None, None)
     bot._close_live_position('other_jpy', 'other-stop', None, None)
-    assert len(store.pending('test')) == 1 and len(api.posts) == 1
-    assert [b['symbol'] for b in store.close_batches('test')] == ['ltc_jpy', 'other_jpy']
+    assert len(store.pending('test')) == 1 and len(api.posts) == 4
+    assert not store.close_batches('test') and not api.position_rows
     blocked['value'] = False
     bot._recover_live_orders()
     assert [p['settlePosition'][0]['positionId'] for p in api.posts if 'settlePosition' in p] == [600, 601, 700]
     assert not store.pending('test') and not store.close_batches('test')
-    assert [p['symbol'] for p in api.position_rows] == ['WAIT_JPY']
+    assert not api.position_rows

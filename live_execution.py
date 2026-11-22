@@ -705,8 +705,12 @@ class LiveExecutionMixin:
             service.account, self.symbol_mapping[batch['symbol']], batch
         )
         symbol, side, reason = batch["symbol"], batch["side"], batch["reason"]
-        pending = service.store.pending(service.account)
-        if pending:
+        target_ids = set(batch.get('target_ids') or [str(p['positionId']) for p in batch.get('positions') or []])
+        def blocking_pending():
+            return [intent for intent in service.store.pending(service.account)
+                    if intent['symbol'] == self.symbol_mapping[symbol]
+                    or str(intent.get('position_id')) in target_ids]
+        if blocking_pending():
             self.logger.warning(
                 "%s: waiting for existing order reconciliation before another close",
                 symbol,
@@ -759,7 +763,7 @@ class LiveExecutionMixin:
         # Stats are refreshed from committed records, never incremented on a retry.
         if stats is not None:
             self._refresh_live_stats(stats)
-        complete = not service.store.pending(service.account) and not any(service.store.close_batch_remaining(service.account, batch).values())
+        complete = not blocking_pending() and not any(service.store.close_batch_remaining(service.account, batch).values())
         if complete:
             service.store.finish_close_batch(service.account, batch)
         if results:
