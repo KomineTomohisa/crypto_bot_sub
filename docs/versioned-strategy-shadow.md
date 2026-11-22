@@ -32,7 +32,7 @@ liveの新規注文はPOSTの前に、既存の発注台帳の `context.strategy
 python crypto_bot_sub.py live --shadow-costs configs/backtest_costs_reference.json
 ```
 
-`--shadow-costs` を指定したliveだけで有効。`--strategy-policy` を指定しなければ、実注文は従来版のまま。候補版を実注文に使う切替は別途 `--strategy-policy adx30_no_short_lock_v1` が必要。この作業では本番起動コマンドを変更しない。
+`--shadow-costs` を指定したliveだけで有効。`--strategy-policy` を指定しなければ、実注文は従来版のまま。候補版を実注文に使う切替は別途 `--strategy-policy adx30_no_short_lock_v1` が必要。本番への適用記録は末尾を参照。
 
 - 別ワーカーで公開APIの営業状態・時刻付き価格・数量ルールを読み取り、SR情報も一度取得して両方の仮想口座へ渡す。仮想口座は秘密鍵・実注文API・発注サービスを持たない。
 - 両方とも同額の初期資金・取引予算・同じ費用シナリオから開始。エントリー可否、保有、資金不足、利確・損切り・利益保護、手数料、06時JSTの持越料を独立して計算する。実建玉は引き継がない。
@@ -53,3 +53,17 @@ python strategy_shadow.py shadow/<口座ハッシュ>/observations/<記録ファ
 仮想約定は「観測lastにシナリオのスプレッド・滑りを加算」した推計。実際の板、発注遅延、分割約定、余力、APIの拒否や未確定注文を再現するものではない。建玉の元本全額を仮想資金から拘束する保守的な資金モデルを使う。持越料は06時前に最後に観測した価格を使用し、実費の確定値ではない。
 
 この実装のテストは外部HTTP・メール送信を禁止し、永続化の検証には専用のlocalhost PostgreSQLを使用する。本番DB・実注文は使わない。
+
+## 2026-11-22 本番への適用
+
+`feat/versioned-strategy-shadow` の `eb8c52e8` と、SR記録修正 `beca3bab` を配置した。未配置だった `09f9696c`（表示失敗の分離）、`51a4247b`（手数料同期の別ワーカー化）、`cc6c8479`（他注文が未確定でも検証済み決済を実行）の変更も含む。
+
+- 既知の本番版 `c3c8af8b` と一致することを確認し、必要な12ファイルだけを更新。サーバー固有の `db.py`、`.env`、API・フロントエンドを変更しなかった。
+- コード・サービス設定・保護状態・DBのバックアップを取得。`005_independent_protective_closes.sql` は既存DBロール `cryptobot` で適用し、`bot_one_pending_open_account` の存在と旧 `bot_one_pending_account` の撤去を確認した。データ削除や所有者変更は行っていない。
+- systemdの `90-strategy-shadow.conf` により、元の `live --test --notify` を維持し、`--strategy-policy baseline_v1 --shadow-costs configs/backtest_costs_reference.json` を追加。実売買は従来版、候補版は仮想比較のみ。`--test` が付いていても実取引モードである。
+- 最初の起動では、SRの管理用UUIDを比較記録へ渡して比較ワーカーだけが停止した。実売買は稼働を維持。SQLAlchemyで実際に返る型を読み取り専用で確認し、本番のSR判断と同じ6項目へ限定する修正を加えた。UUID・Decimal・日時を含む再現テストと、サーバー実データ型を使う発注しないステージング試験を通して再配置した。
+- 最終再起動は21:27 JST。PID `1250390`、`active/running`、自動再起動0回。21:27:38と21:28:29の確認でPIDが安定し、7銘柄を分析、仮想比較は7観測から18観測へ増加。最終再起動後の確認範囲ではエラー・比較停止・欠測なし。確認時点の台帳では保有建玉・未確定注文・未完了決済バッチは0件。実注文や通知を追加で送る疎通試験はしていない。
+
+全体797件、探索互換調整後の関連74件、SR記録修正後の関連58件が合格した。後二者は重複を含む再テストであり、単純合計をテスト件数とはしない。起動・観測の確認は将来の収益性や今後の無故障を保証しない。
+
+検証証跡はローカルの `outputs/tests/versioned-strategy-shadow-20261122*.json`・XML、`outputs/tests/shadow-sr-projection-20261122.xml` と `outputs/deployments/eb8c52e8/`・`beca3bab/` に保存。サーバーのバックアップは `/home/crypto/crypto_bot/backups/eb8c52e8-20261122T121755Z-fe4f09` と `/home/crypto/crypto_bot/backups/beca3bab-20261122T122701Z-8e1077`。
