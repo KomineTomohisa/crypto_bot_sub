@@ -41,8 +41,9 @@ def _flag(value):
     return False if pd.isna(value) else bool(value)
 
 
-def entry_side(latest, previous, observed_at, blocked_until=None):
+def entry_side(latest, previous, observed_at, blocked_until=None, *, policy=None):
     """Two consecutive closed signals; Short retains the live loop's priority."""
+    from strategy_policy import adx_entry_ready
     observed_at = jst_timestamp(observed_at)
     if blocked_until is not None and observed_at < jst_timestamp(blocked_until):
         return None
@@ -50,6 +51,8 @@ def entry_side(latest, previous, observed_at, blocked_until=None):
     previous_at = jst_timestamp(previous["timestamp"])
     bar = pd.Timedelta(minutes=15)
     if latest_at - previous_at != bar or latest_at + bar != observed_at.floor("15min"):
+        return None
+    if not adx_entry_ready(latest, previous, policy):
         return None
     if _flag(latest.get("buy_signal", False)) and _flag(
         previous.get("buy_signal", False)
@@ -63,13 +66,15 @@ def entry_side(latest, previous, observed_at, blocked_until=None):
 
 
 def short_profit_stop(
-    side, entry_price, current_price, stop, armed, trigger=0.75, level=0.25
+    side, entry_price, current_price, stop, armed, trigger=0.75, level=0.25, enabled=True
 ):
     """No persistence or clock access: arming is part of the decision state."""
     entry = _positive(entry_price)
     current = _positive(current_price)
     if side != "short" or entry is None or current is None:
         return float(stop), bool(armed)
+    if not enabled and not armed:
+        return float(stop), False
     armed = bool(armed) or (entry - current) / entry * 100 >= trigger
     if armed:
         stop = min(float(stop), entry * (1 - level / 100))

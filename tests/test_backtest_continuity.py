@@ -41,11 +41,12 @@ def candles(side="long"):
 
 
 def replay(
-    frame, *, hourly=True, fail_exit=False, starting_backtest=False, bulk=False, days=2
+    frame, *, hourly=True, fail_exit=False, starting_backtest=False, bulk=False, days=2,
+    costs=None, capital=10000.0, symbols=None
 ):
     bot = SimpleNamespace(
-        symbols=["ltc_jpy"],
-        initial_capital=10000.0,
+        symbols=symbols or ["ltc_jpy"],
+        initial_capital=capital,
         total_profit=0.0,
         TRADE_SIZE=1000.0,
         entry_sizes={"ltc_jpy": 123.0},
@@ -148,7 +149,7 @@ def replay(
         run_namespace["now_jst"] = namespace["now_jst"]
         bot.run_namespace = run_namespace
         bot._run_backtest = lambda *a, **kw: run(bot, *a, **kw)
-    return bot, lambda: backtest(bot, days)
+    return bot, lambda: backtest(bot, days, costs=costs)
 
 
 @pytest.mark.parametrize("side", ["long", "short"])

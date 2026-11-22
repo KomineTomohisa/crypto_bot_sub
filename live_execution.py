@@ -376,6 +376,7 @@ class LiveExecutionMixin:
                     self.entry_times[sym] = None
                     self.position_ids[sym] = None
                     self.entry_scores[sym] = {}
+                    getattr(self, 'position_policies', {}).pop(sym, None)
                     self.short_profit_lock_armed[sym] = False
                     self._reset_exit_adjustments(sym)
                     getattr(self, "_exit_position_ids", {}).pop(sym, None)
@@ -429,6 +430,17 @@ class LiveExecutionMixin:
                 context = service.store.position_context(
                     service.account, rows[0]["positionId"]
                 )
+                from strategy_policy import policy, BASELINE
+                contexts = [context] + [service.store.position_context(service.account, r['positionId']) for r in rows[1:]]
+                try:
+                    policies = [policy(c.get('strategy_policy')) for c in contexts]
+                    selected = policies[0] if all(p == policies[0] for p in policies) else BASELINE
+                except (ValueError, TypeError):
+                    selected = BASELINE  # Unknown/mixed provenance cannot disable protection.
+                    self.logger.error('%s: invalid position policy; retaining legacy profit protection', sym)
+                if not hasattr(self, 'position_policies'):
+                    self.position_policies = {}
+                self.position_policies[sym] = selected.snapshot()
                 self.entry_scores[sym] = context.get(
                     "scores", self.entry_scores.get(sym, {})
                 )
@@ -504,6 +516,16 @@ class LiveExecutionMixin:
             "feature_snapshot": getattr(self, "_feature_event_refs", {}).get(symbol),
             "notification_delivery": self._notification_preferences(),
         }
+        from strategy_policy import active_policy
+        selected = active_policy(self)
+        confirmation = getattr(self, '_entry_notification_context', {}).get(symbol, {})
+        if selected.entry_adx_min and (
+            confirmation.get('strategy_policy') != selected.snapshot()
+            or confirmation.get('direction') != ('long' if side == 'BUY' else 'short')
+            or confirmation.get('decision_bar') != str(bar)
+        ):
+            return {'success': False, 'error': 'Candidate entry lacks matching closed-bar policy evidence'}
+        context['strategy_policy'] = selected.snapshot()
         try:
             context['notification'] = entry_snapshot(getattr(self, '_entry_decision_snapshot', None), kwargs)
         except Exception as exc:
@@ -661,10 +683,17 @@ class LiveExecutionMixin:
             "purpose": "close" if intent["settle_type"] == "CLOSE" else "entry",
             "side": intent["side"], "reason": context.get("exit_reason"),
             "requested_size": intent["size"], "decision_bar": context.get("decision_bar"),
+            "strategy_policy": context.get('strategy_policy'),
             "feature_snapshot": context.get("feature_snapshot"),
             "result": {key: result.get(key) for key in ("success", "status", "finalized", "executed_size", "execution_price", "executed_at", "position_ids", "client_order_id")},
-            "trades": [{key: trade.get(key) for key in ("entry_price", "exit_price", "size", "pnl", "entry_fee", "exit_fee", "net_pnl_before_carry", "cost_status")} for trade in result.get("trades", [])],
+            "trades": [{key: trade.get(key) for key in ("trade_id", "entry_price", "exit_price", "size", "pnl", "entry_fee", "exit_fee", "net_pnl_before_carry", "cost_status")} for trade in result.get("trades", [])],
         }
+        shadow = getattr(self, '_shadow_worker', None)
+        if shadow is not None:
+            try:
+                shadow.offer('actual', deepcopy(payload))
+            except Exception as exc:
+                self.logger.warning('Shadow execution receipt unavailable (%s)', type(exc).__name__)
         if record_bot_event(self, "order_result", payload):
             self._recorded_order_results.add(event_id)
             return True

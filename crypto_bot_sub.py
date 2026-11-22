@@ -1872,6 +1872,8 @@ class CryptoTradingBot(LiveExecutionMixin):
         self.short_profit_lock_armed = {symbol: False for symbol in self.symbols}
         self.SHORT_PROFIT_LOCK_TRIGGER_PCT = 0.75
         self.SHORT_PROFIT_LOCK_LEVEL_PCT = 0.25
+        self.strategy_policy = None  # Baseline is the live default.
+        self.position_policies = {}
         
         # 運用資金増加の管理用変数
         self.monthly_increase = 500  # 月間増資額
@@ -5357,15 +5359,20 @@ class CryptoTradingBot(LiveExecutionMixin):
         
         return order_size, base_order_amount
 
-    def backtest(self, days_to_test, live_mode=False):
+    def backtest(self, days_to_test, live_mode=False, *, costs=None, policy=None):
         """検証専用の状態で実行し、終了・例外時には実行前の状態へ戻す。"""
         if isinstance(days_to_test, bool) or not isinstance(days_to_test, int) or days_to_test <= 0:
             raise ValueError("days_to_test must be a positive integer")
         with backtest_state(self):
-            return self._run_backtest(days_to_test, live_mode=live_mode)
+            if policy is not None:
+                from strategy_policy import policy as parse_policy
+                self.strategy_policy = parse_policy(policy)
+            return self._run_backtest(days_to_test, live_mode=live_mode, costs=costs)
 
-    def _run_backtest(self, days_to_test, live_mode=False):
+    def _run_backtest(self, days_to_test, live_mode=False, *, costs=None):
         """銘柄ごとにウォームアップを含む全期間を連続再生する。"""
+        from backtest_costs import BacktestAccount
+        from strategy_policy import active_policy
         import heapq
         import threading
         import pandas as pd
@@ -5384,7 +5391,8 @@ class CryptoTradingBot(LiveExecutionMixin):
         entry_sizes_lock = threading.Lock()
 
         # 共有変数
-        total_balance = self.initial_capital + self.total_profit
+        account = BacktestAccount(self.initial_capital + self.total_profit, self.symbols, costs)
+        total_balance = account.cash
         trade_logs = []  # 全取引ログを格納
 
         # 銘柄ごとのシグナル蓄積用（リスト→後で結合）
@@ -5443,6 +5451,9 @@ class CryptoTradingBot(LiveExecutionMixin):
                 # 口座全体で次に観測するイベントを先に提示する。処理はschedulerが再開した時だけ。
                 event_at = pd.Timestamp(timestamp) + (pd.Timedelta(minutes=15) if position else pd.Timedelta(0))
                 yield event_at, symbol_priority(symbol, position)[0]
+                account.advance(event_at)
+                account.mark(symbol, price_close if position else price_open, event_at)
+                total_balance = account.cash
 
                 # Historical OHLC is known only at close; opening observations use
                 # the open alone. Feature calculation itself is shared with live.
@@ -5473,13 +5484,13 @@ class CryptoTradingBot(LiveExecutionMixin):
                             continue
 
                         # 直近2本で同方向 buy が点灯、かつ反対シグナルは消灯
-                        direction = entry_side(prev1, prev2, timestamp, reentry_block_until)
+                        direction = entry_side(prev1, prev2, timestamp, reentry_block_until, policy=active_policy(self))
                         enter_short = direction == 'short'
                         enter_long = direction == 'long'
 
                         # ロングエントリー
                         if enter_short:
-                            entry_price = price_open  # 次バーの始値で約定
+                            entry_price = account.fill_price(price_open, 'short')  # 次バーの始値で約定
                             if entry_price is None or entry_price <= 0:
                                 # openもcloseも欠損の場合はスキップ
                                 continue
@@ -5492,9 +5503,13 @@ class CryptoTradingBot(LiveExecutionMixin):
                             if total_balance < entry_amount:
                                 continue
 
+                            opened = account.open(symbol, 'short' if enter_short else 'long', price_open, order_size, timestamp)
+                            if opened is None:
+                                continue
                             self._reset_exit_adjustments(symbol)
                             self.short_profit_lock_armed[symbol] = False
                             position = 'short'
+                            self.position_policies[symbol] = active_policy(self).snapshot()
                             entry_time = timestamp
                             entry_rsi = prev1.get('RSI', None)  # 判定に使った直近確定バーの値を記録
                             entry_cci = prev1.get('CCI', None)
@@ -5531,7 +5546,7 @@ class CryptoTradingBot(LiveExecutionMixin):
 
                             with balance_lock:
                                 balance_before_entry = total_balance
-                                total_balance -= entry_amount
+                                total_balance = account.cash
                                 balance_after_entry = total_balance
 
                             self.log_entry(symbol, 'short', entry_price, entry_time, entry_rsi, entry_cci,
@@ -5539,7 +5554,7 @@ class CryptoTradingBot(LiveExecutionMixin):
 
                         # ショートエントリー
                         elif enter_long:
-                            entry_price = price_open
+                            entry_price = account.fill_price(price_open, 'long')
                             if entry_price is None or entry_price <= 0:
                                 continue
 
@@ -5551,9 +5566,13 @@ class CryptoTradingBot(LiveExecutionMixin):
                             if total_balance < entry_amount:
                                 continue
 
+                            opened = account.open(symbol, 'short' if enter_short else 'long', price_open, order_size, timestamp)
+                            if opened is None:
+                                continue
                             self._reset_exit_adjustments(symbol)
                             self.short_profit_lock_armed[symbol] = False
                             position = 'long'
+                            self.position_policies[symbol] = active_policy(self).snapshot()
                             entry_time = timestamp
                             entry_rsi = prev1.get('RSI', None)
                             entry_cci = prev1.get('CCI', None)
@@ -5589,7 +5608,7 @@ class CryptoTradingBot(LiveExecutionMixin):
 
                             with balance_lock:
                                 balance_before_entry = total_balance
-                                total_balance -= entry_amount
+                                total_balance = account.cash
                                 balance_after_entry = total_balance
 
                             self.log_entry(symbol, 'long', entry_price, entry_time, entry_rsi, entry_cci,
@@ -5606,16 +5625,17 @@ class CryptoTradingBot(LiveExecutionMixin):
                     if decision.reason is not None:
                         timestamp = observed_at
                         # liveは成行決済。閾値で約定したことにせず観測価格を代理値にする。
-                        exit_price = float(price_close)
-                        profit = (exit_price - entry_price) * order_size
-                        profit_pct = (exit_price - entry_price) / entry_price * 100.0
+                        execution = account.close(symbol, price_close, timestamp)
+                        exit_price = execution['exit_price']
+                        profit = execution['profit']
+                        profit_pct = execution['profit_pct']
 
                         entry_amount = order_size * entry_price
                         exit_amount = order_size * exit_price
 
                         with balance_lock:
                             balance_before_exit = total_balance
-                            total_balance += exit_amount
+                            total_balance = account.cash
                             balance_after_exit = total_balance
 
                         # 保有時間
@@ -5632,6 +5652,8 @@ class CryptoTradingBot(LiveExecutionMixin):
                         buy5, sell5 = self._last5_flags_str(event_history, len(event_history) - 1)
 
                         trade_data = {
+                            **execution,
+                            'strategy_policy': dict(self.position_policies[symbol]),
                             'symbol': symbol,
                             'type': 'long',
                             'entry_price': entry_price,
@@ -5704,16 +5726,17 @@ class CryptoTradingBot(LiveExecutionMixin):
                     if decision.reason is not None:
                         timestamp = observed_at
                         # liveは成行決済。閾値で約定したことにせず観測価格を代理値にする。
-                        exit_price = float(price_close)
-                        profit = (entry_price - exit_price) * order_size
-                        profit_pct = (entry_price - exit_price) / entry_price * 100.0
+                        execution = account.close(symbol, price_close, timestamp)
+                        exit_price = execution['exit_price']
+                        profit = execution['profit']
+                        profit_pct = execution['profit_pct']
 
                         entry_amount = order_size * entry_price
 
                         with balance_lock:
                             balance_before_exit = total_balance
                             # 既存仕様：ショートは entry_amount + profit を現金側に反映
-                            total_balance += (entry_amount + profit)
+                            total_balance = account.cash
                             balance_after_exit = total_balance
 
                         if isinstance(timestamp, pd.Timestamp) and isinstance(entry_time, pd.Timestamp):
@@ -5729,6 +5752,8 @@ class CryptoTradingBot(LiveExecutionMixin):
                         buy5, sell5 = self._last5_flags_str(event_history, len(event_history) - 1)
 
                         trade_data = {
+                            **execution,
+                            'strategy_policy': dict(self.position_policies[symbol]),
                             'symbol': symbol,
                             'type': 'short',
                             'entry_price': entry_price,
@@ -5802,6 +5827,9 @@ class CryptoTradingBot(LiveExecutionMixin):
                 unrealized_profit = float(direction * order_size * (mark_price - entry_price))
                 reserved_capital = float(order_size * entry_price)
                 open_position = {
+                    'entry_fee': account.positions[symbol]['entry_fee'],
+                    'carry_fee': account.positions[symbol]['carry_fee'],
+                    'entry_reference': account.positions[symbol]['entry_reference'],
                     'side': position,
                     'size': float(order_size),
                     'entry_price': float(entry_price),
@@ -5876,6 +5904,16 @@ class CryptoTradingBot(LiveExecutionMixin):
         finally:
             for stream in streams.values():
                 stream.close()
+        account.advance(test_end)
+        for mark_symbol, mark_result in results.items():
+            if mark_result['open_position'] is not None:
+                held = account.positions[mark_symbol]
+                mark_result['open_position'].update(
+                    entry_fee=held['entry_fee'], carry_fee=held['carry_fee'],
+                    carry_events=[dict(event) for event in held['carry_events']],
+                )
+                account.mark(mark_symbol, mark_result['open_position']['mark_price'], test_end)
+        total_balance = account.cash
         trade_logs.sort(key=lambda trade: (trade['exit_time'], trade['symbol']))
 
         # 取引詳細の最終サマリー出力
@@ -5910,20 +5948,27 @@ class CryptoTradingBot(LiveExecutionMixin):
         self.logger.info(f"・バックテスト収益: {backtest_profit:,.2f} 円")
 
         self._backtest_summary = {
-            "valuation_method": "last_available_close_gross",
+            "valuation_method": "last_close_after_paid_costs" if account.enabled else "last_available_close_gross",
             "decision_version": DECISION_VERSION,
             "feature_history": feature_history_spec(),
             "execution_model": "15min_ohlc_market_close_proxy",
             "account_model": "chronological_1x_notional_reservation",
             "ending_available_cash": float(total_balance),
             "live_equivalent": False,
-            "limitations": ["intrabar_quotes_unavailable", "historical_sr_not_replayed", "exchange_rules_and_costs_not_replayed"],
+            "limitations": ["intrabar_quotes_unavailable", "historical_sr_not_replayed",
+                             "exchange_rules_not_replayed", "scenario_costs_not_actual_history" if account.enabled else "costs_not_replayed"],
 
-            "costs_included": False,
+            "costs_included": account.enabled,
             "realized_profit": float(backtest_profit),
             "unrealized_profit": sum(r["unrealized_profit"] for r in results.values()),
             "reserved_capital": sum(r["reserved_capital"] for r in results.values()),
         }
+        self._backtest_summary.update(account.summary())
+        self._backtest_summary['strategy_policy'] = active_policy(self).snapshot()
+        if account.enabled:
+            self.logger.info('費用シナリオ=%s 手数料=%.2f 持越料=%.2f 未決済分の支払済費用=%.2f 純資産増減=%.2f',
+                             account.config['name'], account.fees_paid, account.carry_paid,
+                             self._backtest_summary['open_costs_paid'], self._backtest_summary['net_equity_change'])
         self.logger.info(
             "・未決済評価損益（最終観測終値・費用控除前）: %.2f 円、拘束元本: %.2f 円",
             self._backtest_summary["unrealized_profit"],
@@ -6027,6 +6072,8 @@ class CryptoTradingBot(LiveExecutionMixin):
             'ema_deviation',
             'exit_price', 'exit_time', 'size', 
             'profit', 'profit_pct', 'exit_reason', 'holding_hours', 
+            'gross_profit', 'reference_gross_profit', 'execution_cost',
+            'entry_fee', 'exit_fee', 'carry_fee', 'cost_status',
             'buy_score', 'sell_score',
             # 追加スコア情報
             'rsi_score_long', 'rsi_score_short',
@@ -6555,6 +6602,8 @@ class CryptoTradingBot(LiveExecutionMixin):
                             # データ取得（バックテストと同じデータ取得方法を使用）
                             df_5min, df_hourly = self._prepare_live_inputs(symbol, stats, trade_logs)
                             if df_5min is None:
+                                from strategy_shadow import offer_observation
+                                offer_observation(self, symbol, None)
                                 continue
                             self.df_5min = df_5min
 
@@ -6588,6 +6637,9 @@ class CryptoTradingBot(LiveExecutionMixin):
                             # ポジションがある場合のイグジット判断
                             elif position is not None:
                                 self._check_exit_conditions(symbol, stats, trade_logs, df_5min)
+
+                            from strategy_shadow import offer_observation
+                            offer_observation(self, symbol, df_5min)
                             
                             # DataFrameの参照を削除（バックテストと同様）
                             if hasattr(self, 'df_5min'):
@@ -6724,6 +6776,9 @@ class CryptoTradingBot(LiveExecutionMixin):
             self.logger.info("キーボード割り込みを受け取りました。プログラムを安全に終了します。")
         
         finally:
+            shadow = getattr(self, '_shadow_worker', None)
+            if shadow is not None:
+                shadow.close(timeout=1)
             if callable(getattr(self, '_stop_fee_sync', None)):
                 self._stop_fee_sync()
             close_recorder(self)
@@ -7242,6 +7297,10 @@ class CryptoTradingBot(LiveExecutionMixin):
             if not self.exchange_settings_gmo.get("live_trade", False):
                 self._reset_exit_adjustments(symbol)
             self.positions[symbol] = position_type
+            from strategy_policy import active_policy
+            if not hasattr(self, 'position_policies'):
+                self.position_policies = {}
+            self.position_policies[symbol] = active_policy(self).snapshot()
             self.entry_prices[symbol] = current_price
             self.entry_times[symbol] = order_result.get('executed_at') or now_jst()
             self.entry_sizes[symbol] = executed_size
@@ -7472,8 +7531,10 @@ class CryptoTradingBot(LiveExecutionMixin):
         return next_entry_time(ts).to_pydatetime()
 
     def _entry_direction(self, symbol, latest, previous, observed_at):
+        from strategy_policy import active_policy, adx_entry_ready
+        selected = active_policy(self)
         blocked_until = self.reentry_block_until.get(symbol)
-        direction = entry_side(latest, previous, observed_at, blocked_until)
+        direction = entry_side(latest, previous, observed_at, blocked_until, policy=selected)
         if not hasattr(self, '_entry_notification_context'):
             self._entry_notification_context = {}
         if direction is None:
@@ -7482,10 +7543,13 @@ class CryptoTradingBot(LiveExecutionMixin):
             self._entry_notification_context[symbol] = {
                 'direction': direction, 'decision_bar': str(latest['timestamp']),
                 'previous_bar': str(previous['timestamp']),
+                'strategy_policy': selected.snapshot(),
             }
         record_bot_event(self, 'entry_decision', {
             'symbol': symbol, 'latest': latest.to_dict(), 'previous': previous.to_dict(),
             'blocked_until': blocked_until, 'direction': direction,
+            'strategy_policy': selected.snapshot(),
+            'adx_ready': adx_entry_ready(latest, previous, selected),
         }, observed_at)
         return direction
 
@@ -7497,10 +7561,12 @@ class CryptoTradingBot(LiveExecutionMixin):
         if not hasattr(self, 'short_profit_lock_armed'):
             self.short_profit_lock_armed = {}
         previous = self.short_profit_lock_armed.get(symbol, False)
+        from strategy_policy import position_policy
+        selected = position_policy(self, symbol)
         stop, armed = short_profit_stop(
             position, entry_price, current_price, stop_loss_price, previous,
-            getattr(self, 'SHORT_PROFIT_LOCK_TRIGGER_PCT', 0.75),
-            getattr(self, 'SHORT_PROFIT_LOCK_LEVEL_PCT', 0.25),
+            selected.lock_trigger, selected.lock_level,
+            enabled=selected.short_profit_lock,
         )
         self.short_profit_lock_armed[symbol] = armed
         if armed and not previous:
@@ -7526,6 +7592,8 @@ class CryptoTradingBot(LiveExecutionMixin):
         tp = float(levels['take_profit_price'])
         base_sl = float(levels['stop_loss_price'])
         armed_before = self.short_profit_lock_armed.get(symbol, False)
+        from strategy_policy import position_policy
+        selected = position_policy(self, symbol)
         sl = self._apply_short_profit_lock(
             symbol=symbol, position=position, entry_price=float(entry_price),
             current_price=float(current_price or 0), stop_loss_price=base_sl,
@@ -7549,9 +7617,10 @@ class CryptoTradingBot(LiveExecutionMixin):
             'short_lock_input': {
                 'side': position, 'entry_price': entry_price, 'current_price': current_price,
                 'stop': base_sl, 'armed': armed_before,
-                'trigger': getattr(self, 'SHORT_PROFIT_LOCK_TRIGGER_PCT', 0.75),
-                'level': getattr(self, 'SHORT_PROFIT_LOCK_LEVEL_PCT', 0.25),
+                'trigger': selected.lock_trigger, 'level': selected.lock_level,
+                'enabled': selected.short_profit_lock,
             },
+            'strategy_policy': selected.snapshot(),
             'expected': decision,
         }, observed_at)
         return decision
@@ -8957,6 +9026,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="仮想通貨トレーディングボット（live / paper / backtest）")
     parser.add_argument("mode", choices=["backtest", "live", "paper"], help="実行モード (backtest / live / paper)")
     parser.add_argument("--days", type=int, default=60, help="バックテスト日数 (デフォルト: 60)")
+    parser.add_argument("--backtest-costs", type=str, help="バックテスト費用シナリオのJSONファイル")
+    parser.add_argument('--strategy-policy', choices=['baseline_v1', 'adx30_no_short_lock_v1'], default='baseline_v1', help='新規建玉の戦略設定（既存建玉は保存済み設定を維持）')
+    parser.add_argument('--shadow-costs', type=str, help='実注文を出さない baseline/candidate 並行比較の費用JSON。live専用')
     parser.add_argument("--capital", type=int, default=200000, help="初期資金 (円)")
     parser.add_argument("--test", action="store_true", help="テストモード（取引額を半分にする等）")
     parser.add_argument("--notify", action="store_true", help="通知を有効にする")
@@ -8968,9 +9040,31 @@ if __name__ == "__main__":
     parser.add_argument("--user-id", type=int, help="通知/DB設定をひもづけるユーザーID")
     parser.add_argument("--rules-version", type=str, help="signal_rule_thresholds の version を明示指定（未指定なら None）")
     args = parser.parse_args()
+    if args.shadow_costs and args.mode != 'live':
+        parser.error('--shadow-costs is only available in live mode')
+    backtest_cost_config = None
+    shadow_cost_config = None
+    if args.shadow_costs:
+        with open(args.shadow_costs, encoding='utf-8-sig') as shadow_file:
+            shadow_cost_config = json.load(shadow_file)
+        if not isinstance(shadow_cost_config, dict):
+            parser.error('--shadow-costs must contain a JSON object')
+    if args.backtest_costs:
+        if args.mode != 'backtest':
+            parser.error('--backtest-costs is only available in backtest mode')
+        with open(args.backtest_costs, encoding='utf-8-sig') as cost_file:
+            backtest_cost_config = json.load(cost_file)
+        if not isinstance(backtest_cost_config, dict):
+            parser.error('--backtest-costs must contain a JSON object')
 
     # ボット生成
     bot = CryptoTradingBot(initial_capital=args.capital, test_mode=args.test, user_id=args.user_id)
+    from strategy_policy import policy as parse_strategy_policy
+    bot.strategy_policy = parse_strategy_policy(args.strategy_policy)
+    if args.shadow_costs:
+        from backtest_costs import BacktestAccount
+        BacktestAccount(args.capital, bot.symbols, shadow_cost_config)
+        bot.shadow_costs = shadow_cost_config
 
     # ログレベル
     if args.debug:
@@ -9070,10 +9164,7 @@ if __name__ == "__main__":
         # backtest エントリの名前差を吸収
         try:
             if hasattr(bot, "backtest"):
-                try:
-                    bot.backtest(args.days)
-                except TypeError:
-                    bot.backtest(days_to_test=args.days)
+                bot.backtest(args.days, costs=backtest_cost_config)
             elif hasattr(bot, "run_backtest"):
                 bot.run_backtest(days=args.days)
             else:

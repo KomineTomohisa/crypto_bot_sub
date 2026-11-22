@@ -1,0 +1,17 @@
+{
+  "name": "gmo_reference_20261122_assumed_friction",
+  "source": "https://coin.z.com/jp/corp/guide/fees/",
+  "notes": "Scenario only: reference leverage taker/carry rates checked 2026-11-22, held constant across history. Spread and slippage are assumptions, not measured market data. No liquidation or exchange margin simulation.",
+  "fee_bps": {
+    "ltc_jpy": 0,
+    "xrp_jpy": 0,
+    "sol_jpy": 3,
+    "doge_jpy": 3,
+    "eth_jpy": 0,
+    "bcc_jpy": 0,
+    "ada_jpy": 3
+  },
+  "spread_bps": 2,
+  "slippage_bps": 1,
+  "carry_bps_per_day": 4
+}
