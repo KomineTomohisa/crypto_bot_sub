@@ -5,7 +5,6 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import hashlib
 import os
-import time
 import uuid
 from copy import deepcopy
 from strategy_recording import record_bot_event
@@ -184,22 +183,28 @@ class LiveExecutionMixin:
                     str(exc) if isinstance(exc, ExecutionError) else "details suppressed",
                 )
         self._queue_close_alerts()
-        now = time.monotonic()
-        if now >= getattr(self, "_next_fee_sync", 0):
-            self._next_fee_sync = now + 3600
-            try:
-                today = (
-                    datetime.now(timezone.utc) + timedelta(hours=9) - timedelta(hours=6)
-                ).date()
-                service.sync_fees(today)
-            except ExchangeMaintenance:
-                self._next_fee_sync = 0  # Retry promptly after explicit OPEN, not an hour later.
-                raise
-            except Exception as exc:
-                self.logger.error(
-                    "Daily exchange fees not confirmed (%s): %s", type(exc).__name__,
-                    str(exc) if isinstance(exc, ExecutionError) else "details suppressed"
-                )
+        self._queue_fee_sync()
+
+    def _queue_fee_sync(self):
+        if (getattr(self, 'is_backtest', False) or
+                not (getattr(self, 'exchange_settings_gmo', {}) or {}).get('live_trade', False) or
+                getattr(self, '_fee_sync_stopped', False)):
+            return
+        try:
+            from fee_sync import FeeSyncWorker
+            worker = getattr(self, '_fee_sync_worker', None)
+            if worker is None or not worker.thread.is_alive():
+                worker = FeeSyncWorker(self._execution(), self.logger)
+                self._fee_sync_worker = worker
+            worker.wake()  # No DB or exchange reads on the monitoring thread.
+        except Exception as exc:
+            self.logger.error('Fee sync worker unavailable (%s)', type(exc).__name__)
+
+    def _stop_fee_sync(self):
+        self._fee_sync_stopped = True
+        worker = getattr(self, '_fee_sync_worker', None)
+        if worker is not None:
+            worker.close(1)
 
     def _queue_close_alerts(self):
         settings = getattr(self, 'notification_settings', {}) or {}

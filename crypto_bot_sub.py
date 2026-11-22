@@ -6724,6 +6724,8 @@ class CryptoTradingBot(LiveExecutionMixin):
             self.logger.info("キーボード割り込みを受け取りました。プログラムを安全に終了します。")
         
         finally:
+            if callable(getattr(self, '_stop_fee_sync', None)):
+                self._stop_fee_sync()
             close_recorder(self)
             self.is_backtest = False
             # 稼働状況のレポートを出力

@@ -28,11 +28,17 @@ def no_exchange_network(monkeypatch):
 @pytest.fixture(autouse=True)
 def notification_workers(monkeypatch, no_exchange_network):
     from notification_outbox import NotificationOutboxWorker
+    from fee_sync import FeeSyncWorker
     workers=[]
     original=NotificationOutboxWorker.__init__
     def tracked(self,*args,**kwargs):
         original(self,*args,**kwargs);workers.append(self)
     monkeypatch.setattr(NotificationOutboxWorker,'__init__',tracked)
+    original_fee = FeeSyncWorker.__init__
+    def tracked_fee(self, *args, **kwargs):
+        original_fee(self, *args, **kwargs)
+        workers.append(self)
+    monkeypatch.setattr(FeeSyncWorker, '__init__', tracked_fee)
     yield workers
     for worker in workers:worker.close(2)
 

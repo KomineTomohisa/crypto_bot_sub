@@ -275,10 +275,12 @@ class ExchangeGateway:
             unique[key] = row
         return list(unique.values())
 
-    def daily_fees(self, start, end):
+    def daily_fees(self, start, end, *, check_continue=None):
         result, cursor, seen = [], None, set()
         finalized = None
         for _ in range(1000):
+            if check_continue is not None:
+                check_continue()
             params = {
                 "fromDate": start.strftime("%Y%m%d"),
                 "toDate": end.strftime("%Y%m%d"),
@@ -449,12 +451,26 @@ class ExecutionService:
             results.append(self.reconcile(self.store.get(intent["client_order_id"]), recovered=True))
         return results
 
-    def sync_fees(self, today):
+    def sync_fees(self, today, *, check_continue=None, max_windows=None):
+        """Commit complete windows only; return whether bounded backfill has more work."""
+        if max_windows is not None and (type(max_windows) is not int or max_windows < 1):
+            raise ValueError('max_windows must be a positive integer')
+        if check_continue is not None:
+            check_continue()
         through = self.store.fee_through(self.account)
         start = through + timedelta(days=1) if through else today - timedelta(days=7)
+        windows = 0
         while start <= today:
+            if check_continue is not None:
+                check_continue()
+            if max_windows is not None and windows >= max_windows:
+                return True
             end = min(start + timedelta(days=7), today)
-            rows, finalized = self.gateway.daily_fees(start, end)
+            if check_continue is None:
+                rows, finalized = self.gateway.daily_fees(start, end)
+            else:
+                rows, finalized = self.gateway.daily_fees(start, end, check_continue=check_continue)
+                check_continue()
             confirmed = (
                 min(end, datetime.strptime(finalized, "%Y%m%d").date())
                 if finalized
@@ -465,6 +481,8 @@ class ExecutionService:
                 rows,
                 confirmed if confirmed and confirmed >= start else None,
             )
+            windows += 1
             if confirmed is None or confirmed < end:
                 break
             start = end + timedelta(days=1)
+        return False
