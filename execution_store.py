@@ -34,6 +34,9 @@ class ExecutionStore:
                 alert_warning_sent_at,alert_recovery_sent_at,alert_claim_token,alert_claim_until
                 FROM bot_close_batches LIMIT 0"""))
             conn.execute(text('SELECT job_id,claim_token,delivered_at FROM bot_notification_outbox LIMIT 0'))
+            if (conn.execute(text("SELECT to_regclass('bot_one_pending_open_account')")).scalar() is None
+                    or conn.execute(text("SELECT to_regclass('bot_one_pending_account')")).scalar() is not None):
+                raise ExecutionError('Apply migration 005 before starting independent protective closes')
 
     @staticmethod
     def _insert_notifications(conn, account, event_key, preferences, kind, *, client_id=None,
@@ -163,7 +166,8 @@ class ExecutionStore:
                       'retry': at-timedelta(seconds=policy.retry_seconds), 'limit': limit}
             rows = list(conn.execute(text("""SELECT b.batch_id,b.symbol,b.created_at,b.completed,
                     b.payload->'positions' AS positions,
-                    EXISTS(SELECT 1 FROM bot_order_intents i WHERE i.account_key=b.account_key AND NOT i.finalized) AS has_pending
+                    EXISTS(SELECT 1 FROM bot_order_intents i WHERE i.account_key=b.account_key AND NOT i.finalized
+                        AND (i.symbol=b.symbol OR i.context #>> '{close_batch,id}'=b.batch_id)) AS has_pending
                 FROM bot_close_batches b WHERE b.account_key=:a
                   AND (b.alert_claim_until IS NULL OR b.alert_claim_until<=:now)
                   AND (
@@ -350,7 +354,9 @@ class ExecutionStore:
     def prepare(
         self, account, symbol, side, settle, size, position_id, key, body, context
     ):
+        batch = context.get('close_batch') if settle == 'CLOSE' else None
         params = {
+            "independent": bool(batch),
             "a": account,
             "symbol": symbol,
             "side": side,
@@ -363,7 +369,9 @@ class ExecutionStore:
             "id": uuid.uuid4().hex,
         }
         with self.engine.begin() as conn:
-            # Serialize decisions for a symbol across processes, not just Python threads.
+            # Serialize all account decisions across processes. New exposure
+            # remains blocked by every pending order; a durable close may bypass
+            # only orders on other symbols and other position IDs.
             conn.execute(
                 text("SELECT pg_advisory_xact_lock(hashtextextended(:lock,0))"),
                 {"lock": account},
@@ -371,7 +379,9 @@ class ExecutionStore:
             row = (
                 conn.execute(
                     text(
-                        "SELECT * FROM bot_order_intents WHERE account_key=:a AND ((NOT finalized) OR (decision_key=:key AND :key IS NOT NULL)) ORDER BY finalized LIMIT 1"
+                        """SELECT * FROM bot_order_intents WHERE account_key=:a AND
+                        ((NOT finalized AND (NOT :independent OR symbol=:symbol OR position_id=:pid))
+                        OR (decision_key=:key AND :key IS NOT NULL)) ORDER BY finalized LIMIT 1"""
                     ),
                     params,
                 )
@@ -380,7 +390,6 @@ class ExecutionStore:
             )
             if row:
                 return dict(row)
-            batch = context.get('close_batch') if settle == 'CLOSE' else None
             if batch:
                 saved = conn.execute(text("""SELECT batch_id,payload FROM bot_close_batches
                     WHERE account_key=:a AND symbol=:symbol AND NOT completed"""), params).mappings().first()
@@ -397,6 +406,9 @@ class ExecutionStore:
                 target = next((p for p in batch['positions'] if str(p['positionId']) == params['pid']), None)
                 if target is None:
                     raise ExecutionError("Position is not a close batch target")
+                self._validate_close_positions(symbol, batch, batch['positions'])
+                if side != ('SELL' if target['side'] == 'BUY' else 'BUY'):
+                    raise ExecutionError('Close order direction does not reduce target')
                 closed = conn.execute(text("""SELECT COALESCE(sum(f.size),0)
                     FROM bot_execution_fills f JOIN bot_order_intents i USING(client_order_id)
                     WHERE f.account_key=:a AND i.account_key=:a AND f.position_id=:pid

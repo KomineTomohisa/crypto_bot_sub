@@ -5,7 +5,6 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import hashlib
 import os
-import time
 import uuid
 from copy import deepcopy
 from strategy_recording import record_bot_event
@@ -184,22 +183,28 @@ class LiveExecutionMixin:
                     str(exc) if isinstance(exc, ExecutionError) else "details suppressed",
                 )
         self._queue_close_alerts()
-        now = time.monotonic()
-        if now >= getattr(self, "_next_fee_sync", 0):
-            self._next_fee_sync = now + 3600
-            try:
-                today = (
-                    datetime.now(timezone.utc) + timedelta(hours=9) - timedelta(hours=6)
-                ).date()
-                service.sync_fees(today)
-            except ExchangeMaintenance:
-                self._next_fee_sync = 0  # Retry promptly after explicit OPEN, not an hour later.
-                raise
-            except Exception as exc:
-                self.logger.error(
-                    "Daily exchange fees not confirmed (%s): %s", type(exc).__name__,
-                    str(exc) if isinstance(exc, ExecutionError) else "details suppressed"
-                )
+        self._queue_fee_sync()
+
+    def _queue_fee_sync(self):
+        if (getattr(self, 'is_backtest', False) or
+                not (getattr(self, 'exchange_settings_gmo', {}) or {}).get('live_trade', False) or
+                getattr(self, '_fee_sync_stopped', False)):
+            return
+        try:
+            from fee_sync import FeeSyncWorker
+            worker = getattr(self, '_fee_sync_worker', None)
+            if worker is None or not worker.thread.is_alive():
+                worker = FeeSyncWorker(self._execution(), self.logger)
+                self._fee_sync_worker = worker
+            worker.wake()  # No DB or exchange reads on the monitoring thread.
+        except Exception as exc:
+            self.logger.error('Fee sync worker unavailable (%s)', type(exc).__name__)
+
+    def _stop_fee_sync(self):
+        self._fee_sync_stopped = True
+        worker = getattr(self, '_fee_sync_worker', None)
+        if worker is not None:
+            worker.close(1)
 
     def _queue_close_alerts(self):
         settings = getattr(self, 'notification_settings', {}) or {}
@@ -371,6 +376,7 @@ class LiveExecutionMixin:
                     self.entry_times[sym] = None
                     self.position_ids[sym] = None
                     self.entry_scores[sym] = {}
+                    getattr(self, 'position_policies', {}).pop(sym, None)
                     self.short_profit_lock_armed[sym] = False
                     self._reset_exit_adjustments(sym)
                     getattr(self, "_exit_position_ids", {}).pop(sym, None)
@@ -424,6 +430,17 @@ class LiveExecutionMixin:
                 context = service.store.position_context(
                     service.account, rows[0]["positionId"]
                 )
+                from strategy_policy import policy, BASELINE
+                contexts = [context] + [service.store.position_context(service.account, r['positionId']) for r in rows[1:]]
+                try:
+                    policies = [policy(c.get('strategy_policy')) for c in contexts]
+                    selected = policies[0] if all(p == policies[0] for p in policies) else BASELINE
+                except (ValueError, TypeError):
+                    selected = BASELINE  # Unknown/mixed provenance cannot disable protection.
+                    self.logger.error('%s: invalid position policy; retaining legacy profit protection', sym)
+                if not hasattr(self, 'position_policies'):
+                    self.position_policies = {}
+                self.position_policies[sym] = selected.snapshot()
                 self.entry_scores[sym] = context.get(
                     "scores", self.entry_scores.get(sym, {})
                 )
@@ -499,6 +516,16 @@ class LiveExecutionMixin:
             "feature_snapshot": getattr(self, "_feature_event_refs", {}).get(symbol),
             "notification_delivery": self._notification_preferences(),
         }
+        from strategy_policy import active_policy
+        selected = active_policy(self)
+        confirmation = getattr(self, '_entry_notification_context', {}).get(symbol, {})
+        if selected.entry_adx_min and (
+            confirmation.get('strategy_policy') != selected.snapshot()
+            or confirmation.get('direction') != ('long' if side == 'BUY' else 'short')
+            or confirmation.get('decision_bar') != str(bar)
+        ):
+            return {'success': False, 'error': 'Candidate entry lacks matching closed-bar policy evidence'}
+        context['strategy_policy'] = selected.snapshot()
         try:
             context['notification'] = entry_snapshot(getattr(self, '_entry_decision_snapshot', None), kwargs)
         except Exception as exc:
@@ -656,10 +683,17 @@ class LiveExecutionMixin:
             "purpose": "close" if intent["settle_type"] == "CLOSE" else "entry",
             "side": intent["side"], "reason": context.get("exit_reason"),
             "requested_size": intent["size"], "decision_bar": context.get("decision_bar"),
+            "strategy_policy": context.get('strategy_policy'),
             "feature_snapshot": context.get("feature_snapshot"),
             "result": {key: result.get(key) for key in ("success", "status", "finalized", "executed_size", "execution_price", "executed_at", "position_ids", "client_order_id")},
-            "trades": [{key: trade.get(key) for key in ("entry_price", "exit_price", "size", "pnl", "entry_fee", "exit_fee", "net_pnl_before_carry", "cost_status")} for trade in result.get("trades", [])],
+            "trades": [{key: trade.get(key) for key in ("trade_id", "entry_price", "exit_price", "size", "pnl", "entry_fee", "exit_fee", "net_pnl_before_carry", "cost_status")} for trade in result.get("trades", [])],
         }
+        shadow = getattr(self, '_shadow_worker', None)
+        if shadow is not None:
+            try:
+                shadow.offer('actual', deepcopy(payload))
+            except Exception as exc:
+                self.logger.warning('Shadow execution receipt unavailable (%s)', type(exc).__name__)
         if record_bot_event(self, "order_result", payload):
             self._recorded_order_results.add(event_id)
             return True
@@ -700,8 +734,12 @@ class LiveExecutionMixin:
             service.account, self.symbol_mapping[batch['symbol']], batch
         )
         symbol, side, reason = batch["symbol"], batch["side"], batch["reason"]
-        pending = service.store.pending(service.account)
-        if pending:
+        target_ids = set(batch.get('target_ids') or [str(p['positionId']) for p in batch.get('positions') or []])
+        def blocking_pending():
+            return [intent for intent in service.store.pending(service.account)
+                    if intent['symbol'] == self.symbol_mapping[symbol]
+                    or str(intent.get('position_id')) in target_ids]
+        if blocking_pending():
             self.logger.warning(
                 "%s: waiting for existing order reconciliation before another close",
                 symbol,
@@ -754,7 +792,7 @@ class LiveExecutionMixin:
         # Stats are refreshed from committed records, never incremented on a retry.
         if stats is not None:
             self._refresh_live_stats(stats)
-        complete = not service.store.pending(service.account) and not any(service.store.close_batch_remaining(service.account, batch).values())
+        complete = not blocking_pending() and not any(service.store.close_batch_remaining(service.account, batch).values())
         if complete:
             service.store.finish_close_batch(service.account, batch)
         if results:

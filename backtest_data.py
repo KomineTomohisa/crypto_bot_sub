@@ -92,6 +92,8 @@ def backtest_state(bot):
         "_exit_quote_failures": {},
         "_entry_notification_context": {},
         "short_profit_lock_armed": {},
+        "position_policies": {},
+        "strategy_policy": getattr(bot, 'strategy_policy', None),
         "total_profit": bot.total_profit,
         "_backtest_period": None,
         "_backtest_summary": None,

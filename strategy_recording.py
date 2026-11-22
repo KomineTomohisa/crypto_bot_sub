@@ -25,6 +25,8 @@ SOURCE_FILES = (
     "crypto_bot_sub.py",
     "signal_scoring.py",
     "strategy_decisions.py",
+    "strategy_policy.py",
+    "strategy_shadow.py",
     "strategy_inputs.py",
     "strategy_recording.py",
     "live_execution.py",
@@ -32,11 +34,13 @@ SOURCE_FILES = (
     "trade_notifications.py",
     "exchange_availability.py",
     "notification_outbox.py",
+    "fee_sync.py",
     "exit_protection.py",
     "market_quotes.py",
     "trading_execution.py",
     "execution_store.py",
     "backtest_data.py",
+    "backtest_costs.py",
     "db.py",
 )
 FORBIDDEN_KEYS = {
@@ -117,6 +121,7 @@ def runtime_versions():
 
 
 def signal_config(bot):
+    from strategy_policy import active_policy
     # Explicit fields only. Never serialize exchange_settings_gmo or __dict__.
     return json_value(
         {
@@ -124,6 +129,7 @@ def signal_config(bot):
                 getattr(bot, "exchange_settings_gmo", {}).get("live_trade", False)
             ),
             "is_backtest": bool(getattr(bot, "is_backtest", False)),
+            "strategy_policy": active_policy(bot).snapshot(),
             "entry_thresholds": getattr(bot, "entry_thresholds", {}),
             "trade_size": getattr(bot, "TRADE_SIZE", None),
             "initial_capital": getattr(bot, "initial_capital", None),

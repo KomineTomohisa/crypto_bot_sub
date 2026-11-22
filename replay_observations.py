@@ -145,6 +145,7 @@ def verify_session(path, source_file=None):
                 payload["previous"],
                 event["observed_at"],
                 payload["blocked_until"],
+                policy=payload.get('strategy_policy'),
             )
             if direction != payload["direction"]:
                 raise RecordingError(

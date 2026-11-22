@@ -24,7 +24,7 @@ def bot_for(svc):
     bot.notification_settings = {'send_on_exit': False}
     bot._ceil_to_next_15min = next_entry_time
     bot.send_notification = lambda *a, **kw: None
-    bot._next_fee_sync = float('inf')
+    bot._queue_fee_sync = lambda: None  # Recovery tests isolate fee-history I/O.
     return bot
 
 
