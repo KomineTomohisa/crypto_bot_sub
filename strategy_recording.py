@@ -37,6 +37,7 @@ SOURCE_FILES = (
     "fee_sync.py",
     "exit_protection.py",
     "market_quotes.py",
+    "position_monitor.py",
     "trading_execution.py",
     "execution_store.py",
     "backtest_data.py",

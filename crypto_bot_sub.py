@@ -2810,8 +2810,13 @@ class CryptoTradingBot(LiveExecutionMixin):
         if not has_positions:
             self.logger.info("現在ポジションはありません")
 
-    def get_current_price(self, symbol, *, with_timestamp=False):
+    def get_current_price(self, symbol, *, with_timestamp=False, max_attempts=3, request_timeout=10):
         from market_quotes import QuoteUnavailable, parse_ticker
+        if type(max_attempts) is not int or not 1 <= max_attempts <= 3:
+            raise ValueError('Invalid quote attempt budget')
+        if (isinstance(request_timeout, bool) or not isinstance(request_timeout, (int, float))
+                or not np.isfinite(request_timeout) or not 0 < request_timeout <= 10):
+            raise ValueError('Invalid quote timeout budget')
         availability = getattr(getattr(self, 'gmo_api', None), 'availability', None)
         if availability is not None:
             availability.require_available()
@@ -2822,12 +2827,12 @@ class CryptoTradingBot(LiveExecutionMixin):
             time.sleep(self.rate_limit_delay - elapsed)
         last_reason = 'request_failed'
         # Retry GET only. Invalid snapshots are not prices, including after retry.
-        for attempt in range(3):
+        for attempt in range(max_attempts):
             response = None
             try:
                 if availability is not None:
                     availability.require_available()
-                response = HTTP_SESSION.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
+                response = HTTP_SESSION.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=request_timeout)
                 self.last_api_call = time.time()
                 data = response.json()
                 if availability is not None:
@@ -2852,7 +2857,7 @@ class CryptoTradingBot(LiveExecutionMixin):
                     'symbol': symbol, 'source': 'gmo_ticker', 'attempt': attempt + 1,
                     'reason': last_reason, 'error_type': type(exc).__name__,
                 }, now_jst())
-                if attempt < 2:
+                if attempt < max_attempts - 1:
                     time.sleep((1.2 if _is_dns_temp_failure(exc) else 0.6) * (attempt + 1))
             finally:
                 try:
@@ -2864,6 +2869,10 @@ class CryptoTradingBot(LiveExecutionMixin):
 
     def _get_exit_quote(self, symbol):
         return self.get_current_price(symbol, with_timestamp=True)
+
+    def _get_monitor_exit_quote(self, symbol):
+        # One short GET attempt; no retry/backoff can monopolize the wait scan.
+        return self.get_current_price(symbol, with_timestamp=True, max_attempts=1, request_timeout=2)
 
     
     def create_backup(self):
@@ -6670,7 +6679,7 @@ class CryptoTradingBot(LiveExecutionMixin):
                     except Exception as exc:
                         self.logger.warning('Position summary unavailable (%s); retaining position monitoring', type(exc).__name__)
                     
-                    # メインループサイクル間のスリープ（5分間隔）
+                    # Keep the analysis cadence separate from quote-based protection.
                     elapsed_time = (now_jst() - loop_start_time).total_seconds()
                     sleep_time = max(28 - elapsed_time, 1)  # 少なくとも1秒は待機
                     self.logger.info(f"次のサイクルまで{sleep_time:.1f}秒待機します")
@@ -6680,17 +6689,7 @@ class CryptoTradingBot(LiveExecutionMixin):
                     error_states['consecutive_data_errors'] = 0
                     error_states['last_successful_cycle'] = now_jst()
                     
-                    # スリープ中に1分ごとにキーボード割り込みをチェック
-                    sleep_interval = min(60, sleep_time)
-                    sleep_count = int(sleep_time / sleep_interval)
-                    
-                    for _ in range(sleep_count):
-                        time.sleep(sleep_interval)
-                    
-                    # 残りの時間を待機
-                    remain = sleep_time - (sleep_interval * sleep_count)
-                    if remain > 0:
-                        time.sleep(remain)
+                    self._wait_with_position_monitoring(sleep_time, stats, trade_logs)
                     
                 except ExchangeMaintenance:
                     self._queue_close_alerts()
@@ -6714,11 +6713,11 @@ class CryptoTradingBot(LiveExecutionMixin):
                         # より長い待機時間を設定（徐々に増加）
                         wait_time = min(300 * error_states['consecutive_api_errors'], 1800)  # 最大30分
                         self.logger.info(f"APIエラー発生のため{wait_time}秒待機します")
-                        time.sleep(wait_time)
+                        self._wait_with_position_monitoring(wait_time, stats, trade_logs)
                     else:
                         # 通常の待機
                         self.logger.info("APIエラー発生のため30秒待機します")
-                        time.sleep(30)
+                        self._wait_with_position_monitoring(30, stats, trade_logs)
                 
                 except Exception as e:
                     # その他の一般的なエラー
@@ -6741,7 +6740,7 @@ class CryptoTradingBot(LiveExecutionMixin):
                         # より長い待機時間を設定
                         wait_time = min(120 * error_states['consecutive_data_errors'], 900)  # 最大15分
                         self.logger.info(f"エラー発生のため{wait_time}秒待機します")
-                        time.sleep(wait_time)
+                        self._wait_with_position_monitoring(wait_time, stats, trade_logs)
                         
                         # 連続エラーが10回以上発生した場合は安全のため一時停止
                         if error_states['consecutive_data_errors'] >= 10:
@@ -6758,7 +6757,7 @@ class CryptoTradingBot(LiveExecutionMixin):
                     else:
                         # 通常の待機
                         self.logger.info("エラー発生のため60秒待機します")
-                        time.sleep(60)
+                        self._wait_with_position_monitoring(60, stats, trade_logs)
                         
                     # 最後の成功から3時間以上経過している場合は通知
                     time_since_last_success = (now_jst() - error_states['last_successful_cycle']).total_seconds() / 3600
@@ -6876,6 +6875,10 @@ class CryptoTradingBot(LiveExecutionMixin):
         
         if not has_positions:
             self.logger.info("現在ポジションはありません")
+
+    def _wait_with_position_monitoring(self, seconds, stats, trade_logs):
+        from position_monitor import wait_with_position_monitoring
+        return wait_with_position_monitoring(self, seconds, stats, trade_logs)
 
     def _prepare_live_inputs(self, symbol, stats, trade_logs):
         """Data failures block entries while quote-based position protection continues."""
@@ -7625,7 +7628,7 @@ class CryptoTradingBot(LiveExecutionMixin):
         }, observed_at)
         return decision
 
-    def _check_exit_conditions(self, symbol, stats, trade_logs, df_5min):
+    def _check_exit_conditions(self, symbol, stats, trade_logs, df_5min, *, monitor_only=False):
         """イグジット条件をチェックし、必要に応じて決済を実行する（backtest関数と整合性あり）
         
         Parameters:
@@ -7654,6 +7657,8 @@ class CryptoTradingBot(LiveExecutionMixin):
             reason = None
             try:
                 source = getattr(self, '_get_exit_quote', self.get_current_price)
+                if monitor_only:
+                    source = getattr(self, '_get_monitor_exit_quote', source)
                 candidate = source(symbol)
                 price = (checked_quote(candidate, now_jst()).price if isinstance(candidate, MarketQuote)
                          else price_value(candidate))
@@ -7684,7 +7689,7 @@ class CryptoTradingBot(LiveExecutionMixin):
                 symbol, df_5min, position, entry_price, entry_time, observed_at, current_price
             )
         # 近接時の価格観測も、同じ判定関数へ入れる。閾値での架空約定はしない。
-        if decision.reason is None and current_price:
+        if not monitor_only and decision.reason is None and current_price:
             band = 0.0005
             near = any(abs(float(current_price) - level) <= level * band
                        for level in (decision.take_profit, decision.stop_loss))

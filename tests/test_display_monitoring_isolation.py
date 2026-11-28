@@ -105,6 +105,9 @@ def wire_live_loop(bot, *, cycles=2):
     run,ns=method(BOT,'run_live');ns['now_jst']=now
     ns['dt']=SimpleNamespace(datetime=SimpleNamespace(now=lambda tz:now()))
     ns['time']=SimpleNamespace(time=lambda:clock['seconds'],sleep=sleep)
+    # These tests isolate summaries and full-cycle behavior. The interval
+    # scheduler itself is exercised through run_live in test_position_monitor.
+    bot._wait_with_position_monitoring=lambda seconds,*args:sleep(seconds)
     def no_record(*a):bot._record_inputs=False  # No files, HTTP, SMTP or real bot startup.
     ns['record_bot_event']=no_record;ns['close_recorder']=lambda *a:None
     return lambda:run(bot),actions,waits
