@@ -109,14 +109,14 @@ def make_bot(frames, start, end, *, symbols=None, prepare=None):
 
 class DailyDecisionCache:
     """Causal closed-row cache; no forming indicators are supplied to entries."""
-    def __init__(self, frames):
+    def __init__(self, frames, *, cache_dir=None):
         self.frames = frames
         self.days = {}
         self.bot = offline_signal_bot({'live_trade':False,'is_backtest':True,'entry_thresholds':{}})
         self.bot.logger = logging.getLogger('cached-features')
         self.bot.logger.addHandler(logging.NullHandler()); self.bot.logger.propagate = False
         self.bot._record_inputs = False
-        self.cache_dir = ROOT/'outputs/backtests/search_20261122/feature_cache'
+        self.cache_dir = Path(cache_dir) if cache_dir is not None else ROOT/'outputs/backtests/search_20261122/feature_cache'
         self.cache_dir.mkdir(parents=True,exist_ok=True)
         self.fingerprint = str(code_fingerprint(ROOT))
         self.adapter_hash = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()

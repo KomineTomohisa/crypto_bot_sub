@@ -1,5 +1,6 @@
 """Research event loop: shared strategy decisions/costs, certified against source."""
 import heapq
+import math
 from copy import deepcopy
 
 import numpy as np
@@ -15,29 +16,44 @@ BASELINE = dict(direction='both', adx_min=0, exit_profile='baseline')
 
 
 def install_case(bot, case):
+    tp_multiplier = case.get('tp_multiplier', 1.)
+    sl_multiplier = case.get('sl_multiplier', 1.)
+    for value in (tp_multiplier, sl_multiplier):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not .5 <= value <= 1.5:
+            raise ValueError('Research exit multiplier must be finite and between 0.5 and 1.5')
     if case['exit_profile']=='no_short_lock':
         bot._apply_short_profit_lock = lambda symbol,position,entry_price,current_price,stop_loss_price: float(stop_loss_price)
     elif case['exit_profile']=='short_lock_1pct':
         bot.SHORT_PROFIT_LOCK_TRIGGER_PCT = 1.
         bot.strategy_policy = StrategyPolicy(lock_trigger=1.)
     elif case['exit_profile']=='tp_120pct':
+        tp_multiplier *= 1.2
+    elif case['exit_profile']!='baseline':
+        raise ValueError('Unknown exit profile')
+    if tp_multiplier != 1 or sl_multiplier != 1:
         original = bot.calculate_dynamic_exit_levels
         def levels(symbol, history, side, entry):
             result = dict(original(symbol,history,side,entry))
-            result['take_profit_price'] = entry + (result['take_profit_price']-entry)*1.2
+            for key, multiplier in (('take_profit_price', tp_multiplier), ('stop_loss_price', sl_multiplier)):
+                result[key] = entry + (result[key]-entry)*multiplier
+            result['take_profit_ratio'] = result['take_profit_price']/entry
+            result['stop_loss_ratio'] = result['stop_loss_price']/entry
+            loss = abs(result['stop_loss_price']-entry)
+            result['risk_reward_ratio'] = abs(result['take_profit_price']-entry)/loss if loss else float('inf')
             return result
         bot.calculate_dynamic_exit_levels = levels
-    elif case['exit_profile']!='baseline':
-        raise ValueError('Unknown exit profile')
 
 
-def filtered_rows(latest, previous, case):
+def filtered_rows(latest, previous, case, observed_at=None):
     rows = [latest.copy(), previous.copy()]
     for row in rows:
         if case['direction']=='short_only':row['sell_signal']=False
         if case['direction']=='long_only':row['buy_signal']=False
         if case['adx_min'] and not float(row.get('ADX',np.nan)) >= case['adx_min']:
             row['buy_signal']=row['sell_signal']=False
+    if any(key in case for key in ('entry_context', 'atr_band', 'session')):
+        from research.regime_filters import gate_pair
+        rows = gate_pair(rows, case, observed_at)
     return rows
 
 
@@ -50,6 +66,12 @@ def case_prepare(cache, case):
             if case['adx_min']:
                 invalid=~result.ADX.ge(case['adx_min'])
                 result.loc[invalid,['buy_signal','sell_signal']]=False
+            if len(result) >= 3 and any(key in case for key in ('entry_context', 'atr_band', 'session')):
+                from research.regime_filters import gate_pair
+                pair = gate_pair([result.iloc[-2].copy(), result.iloc[-3].copy()], case, observed_at)
+                for index, row in zip(result.index[-2::-1][:2], pair):
+                    for column in ('buy_signal', 'sell_signal'):
+                        result.loc[index, column] = bool(row.get(column, False))
         return result,hours
     return prepare
 
@@ -112,7 +134,7 @@ def simulate(frames,start,end,costs,cache,case=None,symbols=None):
                 buy=full.buy_signal.to_numpy();sell=full.sell_signal.to_numpy()
                 if not ((buy[idx-1] and buy[idx-2]) or (sell[idx-1] and sell[idx-2])):
                     continue
-                latest,previous=filtered_rows(full.iloc[idx-1],full.iloc[idx-2],case)
+                latest,previous=filtered_rows(full.iloc[idx-1],full.iloc[idx-2],case,at)
                 direction=entry_side(latest,previous,at,cooldown)
                 if direction is None:continue
                 fill=account.fill_price(row.open,direction)
